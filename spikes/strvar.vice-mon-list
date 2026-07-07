@@ -1,0 +1,31 @@
+al 801 .prog8_program_start
+al 937 .p8_sys_startup
+al 937 .p8_sys_startup:init_system
+al 9a2 .p8_sys_startup:cleanup_at_exit
+al a24 .p8_sys_startup:cleanup_at_exit:_exitcarry
+al a25 .p8_sys_startup:cleanup_at_exit:_exitcode
+al a26 .p8_sys_startup:cleanup_at_exit:_exitcodeX
+al a27 .p8_sys_startup:cleanup_at_exit:_exitcodeY
+al 98a .p8_sys_startup:init_system_phase2
+al a28 .prog8_program_end
+al 9c0 .cbm
+al 9c0 .sys
+al 9c0 .sys:restore_irq
+al a21 .sys:restore_irq:_orig_irqvec
+al 9f1 .prog8_lib
+al 9f1 .prog8_lib:program_startup_clear_bss
+al a23 .prog8_lib:orig_stackpointer
+al a03 .prog8_lib:memset
+al a0d .prog8_lib:memset:_fullpage
+al a17 .prog8_lib:memset:_lastpage
+al a24 .prog8_bss_section_start
+al a28 .prog8_struct_instances_bss
+al a21 .prog8_struct_instances
+al 817 .prog8_entrypoint
+al 828 .p8b_main
+al 828 .p8b_main:p8s_start
+al 92e .p8b_main:prog8_init_vars
+al 9c0 .cx16
+; breakpoint list now follows
+; 0 breakpoints have been defined
+del

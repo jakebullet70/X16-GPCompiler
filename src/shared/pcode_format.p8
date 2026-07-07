@@ -1,0 +1,176 @@
+; pcode_format.p8 -- the P-code instruction-set contract.
+;
+; This is the single load-bearing definition of the byte encoding, imported by
+; BOTH the compiler's emitter and the runtime VM so the two can never drift.
+; Encoding is byte-aligned: [opcode:1][inline operands, fixed width per opcode].
+; Evaluation is stack based; cells are 16-bit signed words for the integer
+; milestones (M0-M6).
+;
+; Operand-width column below is authoritative. "imm16" = 2 bytes, little-endian.
+
+pcode {
+    ; --- control ---
+    const ubyte OP_END    = 0    ; ()          halt the VM
+    const ubyte OP_JMP    = 1    ; (imm16 pc)  unconditional jump to pcode offset
+    const ubyte OP_JZ     = 2    ; (imm16 pc)  pop; jump if zero
+
+    ; --- stack / values ---
+    const ubyte OP_PUSHI  = 3    ; (imm16 v)   push immediate word
+    const ubyte OP_LOADV  = 4    ; (imm16 slot)push value of variable slot
+    const ubyte OP_STORV  = 5    ; (imm16 slot)pop; store into variable slot
+
+    ; --- arithmetic (pop 2, push result) ---
+    const ubyte OP_ADD    = 6    ; ()
+    const ubyte OP_SUB    = 7    ; ()
+    const ubyte OP_MUL    = 8    ; ()
+    const ubyte OP_DIV    = 9    ; ()
+    const ubyte OP_NEG    = 10   ; ()          unary negate (pop 1, push 1)
+
+    ; --- comparison (pop 2, push 0 / -1) ---
+    const ubyte OP_CMPEQ  = 11   ; ()
+    const ubyte OP_CMPNE  = 12   ; ()
+    const ubyte OP_CMPLT  = 13   ; ()
+    const ubyte OP_CMPGT  = 14   ; ()
+    const ubyte OP_CMPLE  = 15   ; ()
+    const ubyte OP_CMPGE  = 16   ; ()
+
+    ; --- logical: CBM's AND/OR/NOT are BITWISE on the 16-bit integer value, which doubles as logical
+    ;     because BASIC truth is true=-1 ($FFFF), false=0. Operands truncate float->word first. ---
+    const ubyte OP_AND    = 17   ; ()          pop b,a; push (a & b)
+    const ubyte OP_OR     = 18   ; ()          pop b,a; push (a | b)
+    const ubyte OP_NOT    = 19   ; ()          unary: pop a; push ~a  (NOT x == -(x+1))
+
+    ; --- output (items print with no trailing newline; PRINT emits NEWLINE itself) ---
+    const ubyte OP_PRINTI = 20   ; ()          pop int stack; print word as decimal
+    const ubyte OP_PRINTS = 21   ; ()          pop string stack; print the string
+    const ubyte OP_NEWLINE= 22   ; ()          print a newline
+
+    ; --- subroutines (VM keeps a separate call stack) ---
+    const ubyte OP_GOSUB  = 23   ; (imm16 pc)  push return address, jump to pc
+    const ubyte OP_RET    = 24   ; ()          pop return address, jump back
+
+    ; --- FOR/NEXT (VM keeps a stack of loop frames) ---
+    const ubyte OP_FORPUSH= 25   ; (imm16 slot) pop step then limit; open a FOR frame
+    const ubyte OP_FORNEXT= 26   ; ()          step innermost FOR; loop to top or pop frame
+
+    ; --- strings (separate string-value stack + heap in the VM) ---
+    const ubyte OP_PUSHS  = 27   ; (imm16 off)  push litbase+off (offset into the literal pool)
+    const ubyte OP_LOADS  = 28   ; (imm16 slot) push string variable's pointer
+    const ubyte OP_STORS  = 29   ; (imm16 slot) pop string stack; store into string variable
+    const ubyte OP_CONCAT = 30   ; ()          pop b, a; push heap-allocated a+b
+
+    ; --- machine access (M8): direct memory + call, the workhorse "unknown statement" ops ---
+    const ubyte OP_POKE   = 31   ; ()          pop val, addr; write low byte of val to addr
+    const ubyte OP_PEEK   = 32   ; ()          pop addr; push the byte at addr (0..255)
+    const ubyte OP_SYS    = 33   ; ()          pop addr; JSR to it (machine-language call)
+
+    ; --- arrays (N-D numeric): DIM allocates from the VM array heap; index is a slot. The `ndims`
+    ;     byte says how many subscripts were pushed; the element offset is row-major (see below) ---
+    const ubyte OP_DIM    = 34   ; (imm16 slot)(ubyte nd) pop nd max-indices; allocate the array
+    const ubyte OP_ALOAD  = 35   ; (imm16 slot)(ubyte nd) pop nd subscripts; push element (0 if out of range)
+    const ubyte OP_ASTORE = 36   ; (imm16 slot)(ubyte nd) pop value then nd subscripts; store the element
+
+    ; --- INPUT: read a line from the keyboard, parse, store into a variable slot ---
+    const ubyte OP_INPUTV = 37   ; (imm16 slot) read a line, parse as number, store in numeric var
+    const ubyte OP_INPUTS = 38   ; (imm16 slot) read a line, store as-is in string var (heap copy)
+
+    ; --- floats: numeric cells are 5-byte ROM floats; OP_PUSHI still pushes an integer literal ---
+    const ubyte OP_PUSHF  = 39   ; (float5) push a 5-byte float immediate
+
+    ; --- built-in functions: replace top-of-stack x with fn(x); fn selected by the id byte ---
+    const ubyte OP_CALLFN = 40   ; (ubyte fn) apply built-in function `fn` (see FN_* below)
+
+    ; --- string functions: these cross the numeric<->string type boundary, moving a value
+    ;     between the VM's numeric stack and its separate string stack ---
+    const ubyte OP_STRNUM = 41   ; (ubyte id) pop a string, push a number  -- LEN/ASC/VAL
+    const ubyte OP_NUMSTR = 42   ; (ubyte id) pop a number, push a string  -- CHR$/STR$
+    const ubyte OP_LEFTS  = 43   ; ()  pop count, pop string; push the leftmost `count` chars
+    const ubyte OP_RIGHTS = 44   ; ()  pop count, pop string; push the rightmost `count` chars
+    const ubyte OP_MIDS   = 45   ; ()  pop len, pop start (1-based), pop string; push the substring
+
+    ; --- READ / DATA / RESTORE: DATA items are collected (in line order) into a data pool of
+    ;     null-terminated text; a runtime cursor walks it, READ parsing each item on demand ---
+    const ubyte OP_READ    = 46  ; (imm16 slot) read next DATA item, parse as a number -> numeric var
+    const ubyte OP_READS   = 47  ; (imm16 slot) read next DATA item text -> string var (heap copy)
+    const ubyte OP_RESTORE = 48  ; ()           reset the DATA cursor to the first item
+    ; the push-variants let READ target an array element: subscripts, then RD*, then A*STORE (below)
+    const ubyte OP_RDNUM   = 52  ; ()           read next DATA item, parse as a number, push it
+    const ubyte OP_RDSTR   = 53  ; ()           read next DATA item, push its text (points into the pool)
+
+    ; --- string comparison: pop two strings, compare lexicographically, push a numeric truth value.
+    ;     Lets IF A$="YES" / A$<B$ etc. cross from the string stack back to the numeric stack. ---
+    const ubyte OP_SCMP    = 54  ; (ubyte id) pop b,a (strings); push (a <id> b) as -1/0 (id = SC_* below)
+
+    ; --- channel / file I/O (M9): thin wrappers over the KERNAL device API (SETLFS/SETNAM/OPEN/CHKIN/
+    ;     CHKOUT/CHRIN/CHROUT/CLRCHN/CLOSE/READST). A compiled program calls the KERNAL directly (it is
+    ;     always present in ROM), so these all work standalone too. ---
+    const ubyte OP_OPEN    = 55  ; ()  pop sa,dev,lfn (numeric) + name (string); SETNAM/SETLFS/OPEN
+    const ubyte OP_CLOSE   = 56  ; ()  pop lfn (numeric); CLOSE
+    const ubyte OP_GETCH   = 57  ; ()  pop lfn (numeric); CHKIN/CHRIN/CLRCHN; push a 0- or 1-char string (GET#)
+    const ubyte OP_STATUS  = 58  ; ()  push the KERNAL I/O status (READST) as a number -- BASIC's ST
+    const ubyte OP_CHKOUT  = 59  ; ()  pop lfn (numeric); CHKOUT -- redirect the next PRINTs to a channel (PRINT#)
+    const ubyte OP_CHKIN   = 60  ; ()  pop lfn (numeric); CHKIN  -- redirect the next INPUT to a channel (INPUT#)
+    const ubyte OP_CLRCH   = 61  ; ()  CLRCHN -- restore default I/O, ending a PRINT#/INPUT#
+
+    ; --- string arrays (N-D): a separate namespace + heap from numeric arrays; each element is a
+    ;     string pointer (into the string heap / "" when unset), so loads/stores use the string stack ---
+    const ubyte OP_SDIM    = 49  ; (imm16 slot)(ubyte nd) pop nd max-indices; allocate a string array
+    const ubyte OP_SALOAD  = 50  ; (imm16 slot)(ubyte nd) pop nd subscripts; push element string ("" if out of range)
+    const ubyte OP_SASTORE = 51  ; (imm16 slot)(ubyte nd) pop string value then nd subscripts; store the element
+
+    ; --- extended arithmetic + control (phase 2 "core-language gaps") ---
+    const ubyte OP_POW     = 62  ; ()          pop b,a; push a ** b  (float power operator ^)
+    const ubyte OP_WAIT    = 63  ; ()          pop xor,mask,addr; spin until (peek(addr) ^ xor) & mask != 0
+    ; (STOP reuses OP_END; ON..GOTO/GOSUB desugars to LOADV/PUSHI/CMPEQ/JZ + JMP/GOSUB; DEF FN/FN
+    ;  reuse OP_GOSUB/OP_RET with a compiler-side function table -- no new opcodes needed for those.)
+
+    ; Element addressing for both array families is ROW-MAJOR over dimension SIZES s_j = (max index j)+1:
+    ; for subscripts i_0..i_{nd-1}, offset = (((i_0)*s_1 + i_1)*s_2 + i_2)... (Horner). The compiler emits
+    ; the same subscripts for DIM and for access, so the exact layout only has to be self-consistent.
+    const ubyte MAXDIMS = 4      ; at most 4 subscripts per array (DIM A(a,b,c,d)); deeper -> a compile error
+
+    ; built-in function ids (operand of OP_CALLFN); all take one numeric arg, return a number
+    const ubyte FN_SGN = 0       ; sign: -1, 0, or 1
+    const ubyte FN_INT = 1       ; floor toward -infinity (BASIC INT)
+    const ubyte FN_ABS = 2       ; absolute value
+    const ubyte FN_SQR = 3       ; square root
+    const ubyte FN_RND = 4       ; random number
+    const ubyte FN_SIN = 5
+    const ubyte FN_COS = 6
+    const ubyte FN_TAN = 7
+    const ubyte FN_ATN = 8       ; arctangent
+    const ubyte FN_LOG = 9       ; natural logarithm
+    const ubyte FN_EXP = 10      ; e ** x
+
+    ; OP_STRNUM ids (string -> number)
+    const ubyte SN_LEN = 0       ; length of the string
+    const ubyte SN_ASC = 1       ; PETSCII code of the first char (0 if the string is empty)
+    const ubyte SN_VAL = 2       ; parse the leading number out of the string (BASIC VAL)
+    ; OP_NUMSTR ids (number -> string)
+    const ubyte NS_CHR = 0       ; one-character string CHR$(n)
+    const ubyte NS_STR = 1       ; the number's printed form STR$(n)
+    ; OP_SCMP ids (string comparison relation; result is BASIC truth -1/0)
+    const ubyte SC_EQ = 0        ; a = b
+    const ubyte SC_NE = 1        ; a <> b
+    const ubyte SC_LT = 2        ; a < b
+    const ubyte SC_GT = 3        ; a > b
+    const ubyte SC_LE = 4        ; a <= b
+    const ubyte SC_GE = 5        ; a >= b
+
+    ; --- standalone-program memory layout (compiler emits it, runtime consumes it) ---
+    ; A compiled .PRG is:
+    ;     [$0801 runtime code ...] [ @PCODE_BASE: 6-byte header, then P-code, litpool, data pool ]
+    ; The P-code is position-independent (jumps are relative offsets, vars are slot indices); only the
+    ; string-literal pool and the DATA pool need absolute bases, supplied at runtime via vm.litbase /
+    ; vm.database. The 6-byte HEADER at PCODE_BASE is three little-endian words:
+    ;     +0 litpool address   +2 data-pool address   +4 data-pool length (bytes)
+    ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
+    ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
+    const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
+    const uword PCODE_BASE = $4800                    ; runtime finds the compiled program here. Must sit
+                                                      ; ABOVE the bundled runtime's whole memory footprint
+                                                      ; (code + vars + slabs: heap, numeric & string array
+                                                      ; heaps) so its RAM never overlaps the loaded P-code.
+                                                      ; The runtime's slabs end ~$4142 (grew with channel I/O),
+                                                      ; so PCODE_BASE sits above that; leaves ~22 KB for P-code.
+}
