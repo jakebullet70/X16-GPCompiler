@@ -20,9 +20,16 @@ vm {
 
     float[32] stack
     ubyte     sp
+    ; Integer-first arithmetic (Phase 5): istack is a parallel 16-bit-word stack that SHARES `sp` with
+    ; the float `stack`. A given slot holds EITHER a float (stack[sp]) or an int (istack[sp]); which one
+    ; is live is fixed by the compiler's typed opcode stream, so no runtime tag is kept. Coercion opcodes
+    ; (OP_ITOF/ITOF2/FTOI) move a value between the two representations at the same slot.
+    word[32]  istack
     ; variable slots live in a slab (128 floats * 5 bytes = 640 > the 256-byte array cap),
     ; addressed as varsf + slot*5 via peekf/pokef
     uword     varsf = memory("vm_vars", 640, 0)
+    ; integer (`%`) variable slots: their own namespace + storage, 128 words addressed as ivarsf + slot*2
+    uword     ivarsf = memory("vm_ivars", 256, 0)
     word      last_printed        ; most recent PRINTI, truncated to an integer (for headless tests)
 
     uword[16] callstack          ; GOSUB return addresses
@@ -90,7 +97,9 @@ vm {
     ; OP_CALLX scratch: xbuf holds a synthesized tokenized X16-function call handed to frmevl; xargs
     ; holds the argument values popped off the stack (in source order) before they're formatted into
     ; xbuf; xdest is the address of the stack cell the packed FAC1 result is written back into.
-    ubyte[128] xbuf
+    ; 256 bytes: op_callxs also reuses xbuf to copy a string RESULT off-heap, and RPT$(byte,count) can
+    ; return up to 255 bytes (the synthesized-call input is far shorter and fully consumed by then).
+    ubyte[256] xbuf
     float[pcode.MAX_XARGS] xargs
     uword xdest
     ubyte xslen                  ; OP_CALLXS: length of the string result frmevl returned
@@ -104,14 +113,19 @@ vm {
         csp = 0
         forsp = 0
         ssp = 0
-        ; place BASIC's string var table / arrays / heap in the free RAM above the loaded image.
-        ; In-process that's above the resident compiler (progend); standalone it's above the P-code
-        ; and its pools (datatop). bstr grows the var table up and the string heap down from MEMTOP.
-        uword image_top = sys.progend()
-        if datatop > image_top
-            image_top = datatop
-        bstr.init(image_top)
+        ; place BASIC's string var table + heap just above the pools (datatop). NOT above progend:
+        ; in-process progend is the top of ALL slabs (near MEMTOP -> no room), but the compiler's
+        ; name-table slabs between datatop and varsf are DEAD during the run, so the heap may use them.
+        ; bstr grows the var table up from datatop and the heap DOWN from a ceiling capped just below
+        ; varsf -- the lowest LIVE runtime slab (varsf/ivarsf/arrheap...) -- so a big string can't corrupt
+        ; numeric-var storage. Standalone: datatop is above the P-code and varsf is far below it (heap
+        ; runs all the way to MEMTOP, since the cap `varsf < datatop` is ignored).
+        uword image_top = datatop
+        if image_top == 0                ; a hand-built run (VM selftest) leaves datatop unset -> use progend
+            image_top = sys.progend()
+        bstr.init(image_top, varsf)
         sys.memset(varsf, 640, 0)        ; all-zero bytes == float 0.0 (BASIC vars start at 0)
+        sys.memset(ivarsf, 256, 0)       ; integer (`%`) vars start at 0 too
         arr_top = 0
         sys.memset(&arr_len, 64, 0)      ; 32 words -> 64 bytes: all numeric arrays undimensioned
         sys.memset(&sarr_len, 64, 0)     ; all string arrays undimensioned too
@@ -130,9 +144,9 @@ _next:
             bne  +
             inc  p8b_vm.p8v_pc+1
 +
-            cmp  #67                       ; unknown opcode -> ignore (parity with when no-match)
+            cmp  #77                       ; unknown opcode -> ignore (parity with when no-match)
             bcs  _next
-            asl  a                         ; *2 for the word table (0..66 -> 0..132)
+            asl  a                         ; *2 for the word table (0..76 -> 0..152)
             tax
             jmp  (_optab,x)
 _after:
@@ -140,7 +154,7 @@ _after:
             beq  _next
             jmp  _end
 _optab:
-            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66
+            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66, _t67, _t68, _t69, _t70, _t71, _t72, _t73, _t74, _t75, _t76
 _t0:                                    ; OP_END -> leave the interpreter loop
             jmp  _end
 _t1:                                    ; OP_JMP -> pc = target word at pcbase+pc
@@ -372,6 +386,36 @@ _t65:
 _t66:
             jsr  p8b_vm.p8s_op_callxs
             jmp  _after
+_t67:
+            jsr  p8b_vm.p8s_op_ipushi
+            jmp  _after
+_t68:
+            jsr  p8b_vm.p8s_op_iloadv
+            jmp  _after
+_t69:
+            jsr  p8b_vm.p8s_op_istorv
+            jmp  _after
+_t70:
+            jsr  p8b_vm.p8s_op_iadd
+            jmp  _after
+_t71:
+            jsr  p8b_vm.p8s_op_isub
+            jmp  _after
+_t72:
+            jsr  p8b_vm.p8s_op_imul
+            jmp  _after
+_t73:
+            jsr  p8b_vm.p8s_op_ineg
+            jmp  _after
+_t74:
+            jsr  p8b_vm.p8s_op_itof
+            jmp  _after
+_t75:
+            jsr  p8b_vm.p8s_op_itof2
+            jmp  _after
+_t76:
+            jsr  p8b_vm.p8s_op_ftoi
+            jmp  _after
 _end:
         }}
     }
@@ -447,6 +491,54 @@ _end:
                 }
     sub op_not() {                        ; bitwise complement (NOT x == -(x+1))
                     stack[sp-1] = ((~ as_bits(stack[sp-1])) as word) as float
+                }
+
+    ; --- integer-first arithmetic (Phase 5): the compiler emits these for integer-typed subexpressions,
+    ;     keeping values in istack[] (16-bit signed, shares sp with stack[]) to skip the ROM float path.
+    ;     Arithmetic wraps at 16 bits (the `%` opt-in). Coercion ops bridge to/from float. ---
+    sub op_ipushi() {
+                    istack[sp] = mkword(@(pcbase + pc + 1), @(pcbase + pc)) as word
+                    pc += 2
+                    sp++
+                }
+    sub op_iloadv() {
+                    istack[sp] = peekw(ivarsf + (@(pcbase + pc) as uword) * 2) as word
+                    pc += 2
+                    sp++
+                }
+    sub op_istorv() {
+                    sp--
+                    pokew(ivarsf + (@(pcbase + pc) as uword) * 2, istack[sp] as uword)
+                    pc += 2
+                }
+    sub op_iadd() {
+                    sp--
+                    istack[sp-1] += istack[sp]
+                }
+    sub op_isub() {
+                    sp--
+                    istack[sp-1] -= istack[sp]
+                }
+    sub op_imul() {
+                    sp--
+                    istack[sp-1] *= istack[sp]
+                }
+    sub op_ineg() {
+                    istack[sp-1] = -istack[sp-1]
+                }
+    sub op_itof() {                       ; coerce the TOP cell int -> float
+                    stack[sp-1] = istack[sp-1] as float
+                }
+    sub op_itof2() {                      ; coerce the SECOND-from-top cell int -> float (mixed a<op>b)
+                    stack[sp-2] = istack[sp-2] as float
+                }
+    sub op_ftoi() {                       ; coerce the TOP cell float -> int, truncating toward zero
+                    ; `as word` rounds; CBM `%` assignment truncates toward zero (A%=7.9 -> 7, -7.9 -> -7)
+                    float x = stack[sp-1]
+                    if x < 0.0
+                        istack[sp-1] = - (floats.floor(-x) as word)
+                    else
+                        istack[sp-1] = floats.floor(x) as word
                 }
     sub op_printi() {
                     sp--
@@ -976,11 +1068,12 @@ _end:
         sp++                                              ; the result now occupies the cell at xdest
     }
 
-    ; OP_CALLXS: a string-returning X16 function (HEX$/BIN$). Same synthesized call as op_callx, but
-    ; frmevl leaves a STRING result. We call the ROM's `frestr` ($DE0E) -- it verifies the value is a
-    ; string, frees the BASIC temp descriptor, and returns len in A + the heap body pointer in X/Y. The
-    ; body is still intact (freeing only pops the descriptor and moves fretop), so we copy it off-heap
-    ; into xbuf (its synthesized-call input already consumed), then adopt it into a GPC string temp via
+    ; OP_CALLXS: a string-returning X16 function (HEX$/BIN$/RPT$). Same synthesized call as op_callx
+    ; (xbuild formats the 1-or-2 numeric args), but frmevl leaves a STRING result. We call the ROM's
+    ; `frestr` ($DE0E) -- it verifies the value is a string, frees the BASIC temp descriptor, and returns
+    ; len in A + the heap body pointer in X/Y. The body is still intact (freeing only pops the descriptor
+    ; and moves fretop), so we copy it off-heap into xbuf (its synthesized-call input already consumed;
+    ; xbuf is sized 256 so RPT$'s up-to-255-byte result fits), then adopt it into a GPC string temp via
     ; bstr.mem_to_temp -- exactly how STR$/CHR$ (op_numstr) turn a ROM-produced string into a GPC temp.
     sub op_callxs() {
         xbuild()

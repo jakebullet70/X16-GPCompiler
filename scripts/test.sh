@@ -201,6 +201,46 @@ bash "$DIR/check-basic.sh" '10 IF HEX$(255)="FF" THEN PRINT 7' 0400=7 || fail=1
 bash "$DIR/check-standalone.sh" out '10 PRINT HEX$(4660)' "1234" || fail=1
 
 echo
+echo "== X16 string function RPT\$(byte,count): repeat a byte N times, via ROM frmevl (OP_CALLXS, 2 args) =="
+# RPT$ takes TWO numeric args (byte value, repeat count); xbuild formats both into the synthesized call
+bash "$DIR/check-out.sh" '10 PRINT RPT$(65,3)'             "AAA"   || fail=1   # byte 65='A' repeated 3x
+# LEN of the result is the count (robust: does not depend on how a raw byte renders)
+bash "$DIR/check-basic.sh" '10 PRINT LEN(RPT$(65,10))'     0400=0a || fail=1
+# variable args -- both evaluated by GPC and passed by value (not in BASIC's var table)
+bash "$DIR/check-out.sh" '10 A=66:B=4:PRINT RPT$(A,B)'     "BBBB"  || fail=1
+# result flows into the GPC string machinery: assignment then LEN
+bash "$DIR/check-basic.sh" '10 A$=RPT$(65,5):PRINT LEN(A$)' 0400=5 || fail=1
+# concatenation keeps two live string temps straight
+bash "$DIR/check-out.sh" '10 PRINT RPT$(65,2)+RPT$(66,2)'  "AABB"  || fail=1
+# a 200-byte result exercises the 256-byte xbuf -- a 128-byte buffer would overflow on the result copy
+bash "$DIR/check-basic.sh" '10 PRINT LEN(RPT$(88,200))'    0400=c8 || fail=1
+# arity is enforced at compile time -> SYNTAX (1): RPT$ needs 2 args, HEX$ needs 1
+bash "$DIR/check-basic.sh" '20 PRINT RPT$(65)'             0403=1  || fail=1
+bash "$DIR/check-basic.sh" '20 A$=HEX$(1,2):PRINT A$'      0403=1  || fail=1
+# standalone: the 200-byte result works with no compiler present (buffer fix in the bundled runtime)
+bash "$DIR/check-standalone.sh" mail '10 PRINT LEN(RPT$(88,200))' 0400=c8 || fail=1
+
+echo
+echo "== Integer-first arithmetic (Phase 5): % integer variables compile to native 16-bit opcodes =="
+# integer accumulation: S%=S%+I% loop, all integer ops (ILOADV/IADD/ISTORV, no ROM float): 1+..+10 = 55
+bash "$DIR/check-basic.sh" '10 S%=0:I%=1\n20 S%=S%+I%:I%=I%+1\n30 IF I%<=10 THEN GOTO 20\n40 PRINT S%' 0400=37 || fail=1
+# integer multiply and subtract; a negative integer result
+bash "$DIR/check-basic.sh" '10 A%=7:B%=6:PRINT A%*B%'        0400=2a || fail=1     # 42
+bash "$DIR/check-out.sh"   '10 A%=100:PRINT A%-150'          "-50"   || fail=1
+# an integer literal combines with a % var as an integer op; X%*X%+X% = 9+3 = 12
+bash "$DIR/check-basic.sh" '10 X%=3:PRINT X%*X%+X%'          0400=0c || fail=1
+# mixed int/float: '/' is always float, so A%/4 keeps the fraction
+bash "$DIR/check-out.sh"   '10 A%=10:PRINT A%/4'            "2.5"   || fail=1
+# a float RHS truncates TOWARD ZERO into a % var (CBM semantics): 7/2 -> 3, not 4
+bash "$DIR/check-basic.sh" '10 A%=7/2:PRINT A%'             0400=3  || fail=1
+# A (float) and A% (integer) are SEPARATE variables; they compose in a mixed expression -> 5+9 = 14
+bash "$DIR/check-basic.sh" '10 A=5:A%=9:PRINT A+A%'         0400=0e || fail=1
+# documented divergence: integer arithmetic is 16-bit and WRAPS (the % opt-in). 30000+30000 -> -5536
+bash "$DIR/check-out.sh"   '10 A%=30000:PRINT A%+30000'     "-5536" || fail=1
+# standalone: an integer-accumulation loop bundled and run with no compiler present -> 2*100 = 200
+bash "$DIR/check-standalone.sh" mail '10 S%=0\n20 FOR I=1 TO 100\n30 S%=S%+2\n40 NEXT\n50 PRINT S%' 0400=c8 || fail=1
+
+echo
 echo "== Channel / file I/O (OPEN / CLOSE / PRINT# / GET# / ST, via the KERNAL device API) =="
 # round-trip: write "AB" to a file with PRINT#, read it back a byte at a time with GET#, count to EOF (ST)
 CIO='10 OPEN 1,8,1,"CIO,S,W"\n20 PRINT#1,"AB";\n30 CLOSE 1\n40 OPEN 1,8,0,"CIO"\n50 GET#1,A$:N=N+1:IF ST=0 GOTO 50\n70 PRINT N\n80 CLOSE 1'

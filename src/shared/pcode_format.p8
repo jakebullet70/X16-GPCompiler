@@ -148,6 +148,25 @@ pcode {
     ;     pushing it on the string stack. `subtok` is the $CE sub-token ($D5=HEX$, $D6=BIN$). ---
     const ubyte OP_CALLXS = 66   ; (ubyte subtok)(ubyte nargs) call a string-returning X16 ROM function
 
+    ; --- integer-first arithmetic (Phase 5): Blitz-style COMPILE-TIME integer typing. The compiler
+    ;     tracks the type (INT vs FLOAT) of every subexpression and emits these integer opcodes for
+    ;     integer-typed work, avoiding the ROM float round-trip. Integers are 16-bit SIGNED and WRAP on
+    ;     overflow (the `%`-variable opt-in -- documented divergence from float's unbounded range). The
+    ;     runtime keeps a parallel `istack` of 16-bit words that SHARES the numeric stack pointer `sp`:
+    ;     a given stack slot holds EITHER a float (in `stack[sp]`) or an int (in `istack[sp]`), and which
+    ;     one is live is fixed at compile time by the opcode stream -- so no runtime type tag is needed.
+    ;     Coercion opcodes bridge the two representations at the boundaries the compiler inserts them. ---
+    const ubyte OP_IPUSHI = 67   ; (imm16 v)    push a 16-bit integer immediate onto istack
+    const ubyte OP_ILOADV = 68   ; (imm16 slot) push integer variable slot (own namespace from floats)
+    const ubyte OP_ISTORV = 69   ; (imm16 slot) pop int; store into integer variable slot
+    const ubyte OP_IADD   = 70   ; ()           pop b,a (int); push a+b   (16-bit, wraps)
+    const ubyte OP_ISUB   = 71   ; ()           pop b,a (int); push a-b   (16-bit, wraps)
+    const ubyte OP_IMUL   = 72   ; ()           pop b,a (int); push a*b   (low 16 bits, wraps)
+    const ubyte OP_INEG   = 73   ; ()           unary: pop a (int); push -a
+    const ubyte OP_ITOF   = 74   ; ()           coerce the TOP cell int->float (istack[sp-1] -> stack[sp-1])
+    const ubyte OP_ITOF2  = 75   ; ()           coerce the SECOND-from-top cell int->float (for mixed a<op>b)
+    const ubyte OP_FTOI   = 76   ; ()           coerce the TOP cell float->int, truncating toward zero
+
     ; Element addressing for both array families is ROW-MAJOR over dimension SIZES s_j = (max index j)+1:
     ; for subscripts i_0..i_{nd-1}, offset = (((i_0)*s_1 + i_1)*s_2 + i_2)... (Horner). The compiler emits
     ; the same subscripts for DIM and for access, so the exact layout only has to be self-consistent.
@@ -193,11 +212,11 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $4C00                    ; runtime finds the compiled program here. Must sit
+    const uword PCODE_BASE = $5000                    ; runtime finds the compiled program here. Must sit
                                                       ; ABOVE the bundled runtime's whole memory footprint
                                                       ; (code + vars + slabs: heap, numeric & string array
                                                       ; heaps) so its RAM never overlaps the loaded P-code.
-                                                      ; The runtime's slabs end ~$4900 (grew with the X16
-                                                      ; function/pass-through buffers + the ZP-swap buffer),
-                                                      ; so PCODE_BASE sits above that; leaves ~21 KB for P-code.
+                                                      ; The runtime's slabs end ~$4CE0 (grew with the X16
+                                                      ; function buffers + the integer istack/ivars slabs),
+                                                      ; so PCODE_BASE sits above that; leaves ~20 KB for P-code.
 }

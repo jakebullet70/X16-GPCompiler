@@ -35,6 +35,8 @@ bstr {
     const ubyte TEMPST = $d6             ; base of the 3-slot temp descriptor stack (ZP)
 
     uword svartab                        ; base of the NVARS*7 scalar string-var table
+    uword htmp                           ; scratch: KERNAL MEMTOP read during init()
+    uword htmp2                          ; scratch: computed heap ceiling during init()
     uword[NSARR] sarr_hdr                ; BASIC array-header address per string-array slot (0 = none)
     ubyte gsbank                         ; scratch: saved ROM bank across a getspa call
     bool  err_toolong                    ; set on a >255 concat (?STRING TOO LONG)
@@ -42,10 +44,13 @@ bstr {
     ubyte[256] cbuf                      ; scratch null-terminated copy of a body (for VAL/parse)
 
     ; --- set up an empty BASIC string environment with the var table at `image_top` ---
-    ; [image_top .. MEMTOP] must be free RAM: var table grows up from image_top, then string
-    ; arrays, then the string heap grows down from MEMTOP; getspa's STREND-vs-FRETOP check yields
-    ; ?OUT OF MEMORY when they meet.
-    sub init(uword image_top) {
+    ; [image_top .. heap ceiling] must be free RAM: var table grows up from image_top, then string
+    ; arrays, then the string heap grows down from the ceiling; getspa's STREND-vs-FRETOP check yields
+    ; ?OUT OF MEMORY when they meet. The ceiling is KERNAL MEMTOP, but `cap` lowers it below any LIVE
+    ; RAM that sits above image_top -- in-process, the runtime's own high slabs (varsf/arrheap/...) live
+    ; up there, so the heap must stop below them (else it silently corrupts numeric vars). Pass the
+    ; lowest such slab (varsf) as `cap`; standalone, varsf is BELOW image_top so `cap` is ignored.
+    sub init(uword image_top, uword cap) {
         err_toolong = false
         err_complex = false
         svartab = image_top
@@ -69,19 +74,37 @@ bstr {
         pokew(ARYTAB, tabend)                    ; string arrays extend from here
         pokew(STREND, tabend)                    ; heap floor (moves up as arrays are DIMmed)
         @(TEMPPT) = TEMPST                        ; empty temp stack
+        htmp = 0
         %asm {{
             lda  $01
             pha
             stz  $01                             ; KERNAL bank for MEMTOP
             sec
-            jsr  $ff99                           ; MEMTOP -> X=lo, Y=hi
+            jsr  $ff99                           ; C=1: read MEMTOP -> X=lo, Y=hi
             pla
             sta  $01
-            stx  $03e9                           ; memsiz
-            sty  $03ea
-            stx  $03e7                           ; fretop = memsiz (empty heap)
-            sty  $03e8
+            stx  p8v_htmp                        ; htmp = MEMTOP
+            sty  p8v_htmp+1
         }}
+        htmp2 = htmp                              ; ceiling = KERNAL MEMTOP, unless a live slab is below it
+        if cap > image_top and cap < htmp2 {
+            htmp2 = cap
+            ; lower KERNAL MEMTOP to the cap so the ROM collector (garba2), which re-reads MEMTOP
+            ; itself, also honours it -- otherwise a GC would relocate strings above the cap.
+            %asm {{
+                lda  $01
+                pha
+                stz  $01
+                clc                             ; C=0: SET MEMTOP from X=lo, Y=hi
+                ldx  p8v_htmp2
+                ldy  p8v_htmp2+1
+                jsr  $ff99
+                pla
+                sta  $01
+            }}
+        }
+        pokew(MEMSIZ, htmp2)
+        pokew(FRETOP, htmp2)                       ; fretop = memsiz (empty heap)
     }
 
     ; allocate `n` bytes on the BASIC string heap (GCs on collision); returns the body pointer.

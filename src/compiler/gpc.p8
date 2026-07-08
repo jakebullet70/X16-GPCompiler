@@ -75,14 +75,14 @@ main {
 
     ; --- string-literal pool; OP_PUSHS stores pool-relative offsets (vm.litbase resolves
     ;     them), so the same P-code works in-process and in a standalone out.prg ---
-    const uword LIT_SIZE = 1024
+    const uword LIT_SIZE = 768            ; trimmed from 1024 to fit the Phase-5 integer-typing code under MEMTOP
     uword litpool_ptr = memory("gpc_lit", LIT_SIZE, 0)
     uword lit_len
     ubyte[64] tokstr               ; string-literal text when tok == T_STRLIT (also DATA-item text)
 
     ; --- DATA pool: item texts (null-terminated, in line order) that READ walks at run time.
     ;     Bundled after the literal pool in a standalone out.prg; resolved via vm.database. ---
-    const uword DATA_SIZE = 1024
+    const uword DATA_SIZE = 768           ; trimmed from 1024 to fit the Phase-5 integer-typing code under MEMTOP
     uword datapool_ptr = memory("gpc_data", DATA_SIZE, 0)
     uword data_len
 
@@ -117,6 +117,12 @@ main {
     const ubyte SCRATCH_SLOT = 127       ; top numeric slot reserved for the compiler (ON selector temp)
     uword varnames_ptr = memory("gpc_varnames", 1024, 0)     ; 128 * 8
     ubyte nvars
+
+    ; --- integer (`%`) variables: own namespace + VM storage (vm.ivarsf), Phase 5. Kept modest to fit
+    ;     the self-hosted compiler under MEMTOP $9f00; could move to banked RAM later if more are needed. ---
+    const ubyte MAXIVARS = 48
+    uword ivarnames_ptr = memory("gpc_ivarnames", 384, 0)    ; 48 * 8 (names include the '%')
+    ubyte niv
 
     ; --- DEF FN user functions: name -> (pcode entry offset, parameter var slot). Reuses OP_GOSUB/
     ;     OP_RET at runtime; a call emits STORV param + GOSUB entry. DEF must precede use (textually). ---
@@ -225,6 +231,7 @@ main {
     const ubyte T_POW     = 63     ; ^  power operator        (binds tighter than * /)
     const ubyte T_XFUNC   = 64     ; X16 escape function (numeric): VPEEK/JOY/MX/... ($CE sub-token in tok_funcid)
     const ubyte T_XSFUNC  = 65     ; X16 escape function (string-returning): HEX$/BIN$ ($CE sub-token in tok_funcid)
+    const ubyte T_IVAR    = 66     ; integer variable A% (name incl. '%' in tokname; own namespace, Phase 5)
     const ubyte T_BAD     = 255
 
     ; sub-ids for T_STRSLICE (compiler-only; each maps to its own VM opcode)
@@ -358,6 +365,7 @@ main {
         lit_len = 0
         data_len = 0
         nvars = 0
+        niv = 0
         nsvars = 0
         narr = 0
         nsarr = 0
@@ -367,6 +375,9 @@ main {
         for_depth = 0
         opsp = 0                                 ; operator + frame stacks empty (a prior aborted
         fr_sp = 0                                ; compile may have left them mid-expression)
+        tsp = 0                                  ; type stack empty
+        expr_depth = 0
+        expr_keep_int = false
         had_error = false
         err_code = 0
         err_line = 0
@@ -600,6 +611,7 @@ main {
             }
             T_IDENT -> parse_assign()
             T_STRVAR -> parse_assign()
+            T_IVAR -> parse_assign()
             T_GOTO -> parse_goto()
             T_IF -> parse_if()
             T_FOR -> parse_for()
@@ -1312,6 +1324,7 @@ main {
             }
             T_IDENT -> parse_assign()
             T_STRVAR -> parse_assign()
+            T_IVAR -> parse_assign()
             T_RETURN -> {
                 emit_byte(pcode.OP_RET)
                 next_token()
@@ -1481,8 +1494,38 @@ main {
         }
     }
 
-    ; assignment: numeric  ident "=" expr   or   string  ident$ "=" string_expr
+    ; assignment: numeric  ident "=" expr   or   string  ident$ "=" string_expr   or  int  ident% "=" expr
     sub parse_assign() {
+        if tok == T_IVAR {                          ; integer (`%`) variable assignment (Phase 5)
+            void strings.copy(&tokname, &pend_name)
+            next_token()
+            if tok == T_LPAREN {                    ; A%(..) integer arrays not supported yet
+                error(E_SYNTAX)
+                return
+            }
+            void strings.copy(&pend_name, &tokname)
+            ubyte islot = intern_ivar()
+            if tok != T_EQ {
+                error(E_SYNTAX)
+                return
+            }
+            next_token()
+            uword ibefore = code_len
+            expr_keep_int = true                    ; keep the RHS's raw type; coerce below if it's float
+            parse_expr()
+            if code_len == ibefore {                ; empty RHS: a string value is a type error, else syntax
+                if is_str_start(tok)
+                    error(E_TYPE)
+                else
+                    error(E_SYNTAX)
+                return
+            }
+            if expr_type == TY_FLOAT
+                emit_byte(pcode.OP_FTOI)            ; a float RHS truncates toward zero into the int var
+            emit_byte(pcode.OP_ISTORV)
+            emit_imm16(islot as uword)
+            return
+        }
         if tok == T_STRVAR {
             ; peek past the name: 'A$(' is a string-array element store, plain 'A$' is a scalar
             void strings.copy(&tokname, &pend_name)
@@ -1642,6 +1685,7 @@ main {
                     emit_byte(pcode.OP_SALOAD)
                     emit_imm16(slslot as uword)
                     emit_byte(slnd)
+                    type_popn(slnd)                 ; consumed slnd numeric subscripts (string result)
                 } else {
                     void strings.copy(&pend_name, &tokname)   ; restore for the scalar case
                     emit_byte(pcode.OP_LOADS)
@@ -1672,13 +1716,18 @@ main {
                 next_token()                    ; consume ')'
                 emit_byte(pcode.OP_NUMSTR)
                 emit_byte(nsid)
+                type_popn(1)                    ; consumed one numeric arg (string result)
             }
-            T_XSFUNC -> {                       ; HEX$(n) / BIN$(n): numeric arg -> string via ROM frmevl
+            T_XSFUNC -> {                       ; HEX$(n)/BIN$(n) (1 arg) or RPT$(byte,count) (2 args) -> string
+                ; All args are numeric; GPC evaluates each here and the runtime formats the computed
+                ; values into a synthesized frmevl call (op_callxs). Mirrors the numeric T_XFUNC list
+                ; parse: hold the sub-token + a running count on the frame stack across the nested parses.
                 if fr_sp == EXPRNEST {
                     error(E_COMPLEX)
                     return
                 }
-                fr_id[fr_sp] = tok_funcid       ; the $CE sub-token ($D5/$D6), held across the nested parse
+                fr_id[fr_sp] = tok_funcid       ; the $CE sub-token ($D5/$D6/$DA)
+                fr_nd[fr_sp] = 0                ; argument count
                 fr_sp++
                 next_token()                    ; consume the function keyword
                 if tok != T_LPAREN {
@@ -1686,17 +1735,39 @@ main {
                     return
                 }
                 next_token()                    ; consume '('
-                parse_index()                   ; the numeric argument, stops at ')' (re-enters parse_expr)
-                ubyte xssub = fr_id[fr_sp - 1]
+                repeat {
+                    parse_index()               ; one numeric arg; stops at ',' or ')' (re-enters parse_expr)
+                    fr_nd[fr_sp-1]++
+                    if had_error
+                        return
+                    if tok != T_COMMA
+                        break
+                    next_token()
+                }
                 fr_sp--
+                ubyte xssub = fr_id[fr_sp]
+                ubyte xsn = fr_nd[fr_sp]
                 if tok != T_RPAREN {
                     error(E_SYNTAX)
                     return
                 }
                 next_token()                    ; consume ')'
+                ; arity: RPT$ ($DA) needs exactly 2 args; HEX$/BIN$ exactly 1
+                if xssub == $da {
+                    if xsn != 2 {
+                        error(E_SYNTAX)
+                        return
+                    }
+                } else {
+                    if xsn != 1 {
+                        error(E_SYNTAX)
+                        return
+                    }
+                }
                 emit_byte(pcode.OP_CALLXS)
                 emit_byte(xssub)
-                emit_byte(1)                    ; HEX$/BIN$ take one numeric arg
+                emit_byte(xsn)
+                type_popn(xsn)                  ; consumed xsn numeric args (string result)
             }
             T_STRSLICE -> emit_slice()          ; LEFT$/RIGHT$/MID$
             else -> error(E_TYPE)
@@ -1735,6 +1806,7 @@ main {
             } else {
                 emit_byte(pcode.OP_PUSHI)       ; 2-arg MID$: default length = rest of string
                 emit_imm16(255)
+                type_push(TY_FLOAT)             ; keep the type stack mirrored (a numeric value was pushed)
             }
         }
         ubyte slid = fr_id[fr_sp - 1]
@@ -1744,10 +1816,11 @@ main {
             return
         }
         next_token()                            ; consume ')'
+        ; each slice op consumes its numeric args (the string source is balanced by parse_string_expr)
         when slid {
-            SL_LEFT  -> emit_byte(pcode.OP_LEFTS)
-            SL_RIGHT -> emit_byte(pcode.OP_RIGHTS)
-            SL_MID   -> emit_byte(pcode.OP_MIDS)
+            SL_LEFT  -> { emit_byte(pcode.OP_LEFTS)  type_popn(1) }
+            SL_RIGHT -> { emit_byte(pcode.OP_RIGHTS) type_popn(1) }
+            SL_MID   -> { emit_byte(pcode.OP_MIDS)   type_popn(2) }
         }
     }
 
@@ -1808,6 +1881,52 @@ main {
 
     sub name_ptr(ubyte idx) -> uword {
         return varnames_ptr + (idx as uword) * NAMELEN
+    }
+
+    ; slot for the integer (`%`) variable in `tokname` (name incl. '%'; its own namespace + VM storage)
+    sub intern_ivar() -> ubyte {
+        ubyte i = 0
+        while i < niv {
+            if strings.compare(&tokname, iname_ptr(i)) == 0
+                return i
+            i++
+        }
+        if niv == MAXIVARS {
+            error(E_MEM)
+            return 0
+        }
+        void strings.copy(&tokname, iname_ptr(niv))
+        niv++
+        return niv - 1
+    }
+
+    sub iname_ptr(ubyte idx) -> uword {
+        return ivarnames_ptr + (idx as uword) * NAMELEN
+    }
+
+    ; --- compile-time type stack helpers (Phase 5 integer typing) ---
+    sub is_intish(ubyte t) -> bool {
+        return t == TY_INT or t == TY_ILIT
+    }
+    sub type_push(ubyte t) {
+        if tsp == TSTACK_SIZE {
+            error(E_COMPLEX)
+            return
+        }
+        tstack[tsp] = t
+        tsp++
+    }
+    sub type_pop() -> ubyte {
+        if tsp == 0
+            return TY_FLOAT                      ; defensive: desync -> treat as float (never on valid input)
+        tsp--
+        return tstack[tsp]
+    }
+    sub type_popn(ubyte n) {                     ; drop n operand types (an atom that consumes n values)
+        while n != 0 and tsp != 0 {
+            tsp--
+            n--
+        }
     }
 
     ; array slot for the identifier in `tokname` (separate namespace from scalars/strings)
@@ -1874,6 +1993,21 @@ main {
     ubyte[EXPRNEST] fr_nd                        ; running subscript count of an array access
     ubyte fr_sp                                  ; frame-stack pointer
 
+    ; --- integer-first arithmetic (Phase 5): a compile-time TYPE STACK that mirrors the runtime numeric
+    ;     stack. Each value atom pushes its type; emit_op pops operand types, decides integer vs float
+    ;     opcodes, inserts coercions, and pushes the result type. TY_ILIT (integer literal <=32767) and
+    ;     TY_INT (a `%` variable) are the two integer flavours; an integer op fires only when a real INT
+    ;     is involved, so any program without `%` variables emits the same float semantics as before. ---
+    const ubyte TY_FLOAT = 0                     ; value lives in the float stack cell
+    const ubyte TY_INT   = 1                     ; value lives in the int cell, from a `%` variable
+    const ubyte TY_ILIT  = 2                     ; integer literal (int cell) that may still go either way
+    const ubyte TSTACK_SIZE = 32
+    ubyte[TSTACK_SIZE] tstack                    ; type of each pending numeric value (mirrors the VM stack)
+    ubyte tsp                                    ; type-stack height
+    ubyte expr_type                              ; type of parse_expr's result (set at its exit)
+    bool  expr_keep_int                          ; one-shot: caller wants the raw (maybe int) result, no auto-ITOF
+    ubyte expr_depth                             ; parse_expr nesting depth (0 at a top-level call -> reset tsp)
+
     ; Shunting-yard expression parser. Iterative (Prog8 has no call stack, so no recursive
     ; descent): numbers emit PUSHI immediately, operators wait on the operator stack until a
     ; lower/equal-precedence operator or ')' flushes them. The postfix order this produces is
@@ -1881,24 +2015,55 @@ main {
     sub parse_expr() {
         bool stop_rp = expr_stop_rparen             ; one-shot: stop at a top-level ')'
         expr_stop_rparen = false
+        ; --- type-stack bookkeeping (Phase 5). A top-level call (depth 0) resets the type stack; nested
+        ;     calls build on top. keep_int captures the caller's one-shot "don't auto-coerce" request. ---
+        if expr_depth == 0
+            tsp = 0
+        expr_depth++
+        ubyte tbase = tsp                           ; this expression's single result will land here
+        bool keep_int = expr_keep_int
+        expr_keep_int = false                       ; one-shot
         ubyte mybase = opsp                         ; my operators live at opstack[mybase..]
         bool expect_value = true                    ; true when a value/'('/unary-op may come next
         repeat {
             when tok {
                 T_NUM -> {
-                    emit_byte(pcode.OP_PUSHI)
-                    emit_imm16(tok_num as uword)
+                    if tok_num >= 0 {                ; 0..32767: an integer literal (may combine with %)
+                        emit_byte(pcode.OP_IPUSHI)
+                        emit_imm16(tok_num as uword)
+                        type_push(TY_ILIT)
+                    } else {                         ; 32768..65535 (word wrapped -ve): keep a float literal
+                        emit_byte(pcode.OP_PUSHI)
+                        emit_imm16(tok_num as uword)
+                        type_push(TY_FLOAT)
+                    }
                     expect_value = false
                     next_token()
                 }
                 T_FLOAT -> {
                     emit_byte(pcode.OP_PUSHF)
                     emit_float(tok_fnum)
+                    type_push(TY_FLOAT)
                     expect_value = false
                     next_token()
                 }
+                T_IVAR -> {                          ; integer (`%`) variable: scalar load -> INT (Phase 5)
+                    void strings.copy(&tokname, &pend_name)
+                    next_token()
+                    if tok == T_LPAREN {             ; A%(..) integer arrays not supported yet
+                        error(E_SYNTAX)
+                        return
+                    }
+                    void strings.copy(&pend_name, &tokname)
+                    emit_byte(pcode.OP_ILOADV)
+                    emit_imm16(intern_ivar() as uword)
+                    type_push(TY_INT)
+                    expect_value = false
+                    ; tok already advanced past the identifier
+                }
                 T_ST -> {                            ; ST: the KERNAL I/O status word (a read-only number)
                     emit_byte(pcode.OP_STATUS)
+                    type_push(TY_FLOAT)
                     expect_value = false
                     next_token()
                 }
@@ -1943,11 +2108,14 @@ main {
                         emit_byte(pcode.OP_ALOAD)
                         emit_imm16(aslot as uword)
                         emit_byte(ndim)
+                        type_popn(ndim)                           ; ALOAD consumes ndim subscripts,
+                        type_push(TY_FLOAT)                       ; pushes one float element
                         expect_value = false
                     } else {
                         void strings.copy(&pend_name, &tokname)   ; restore name for intern
                         emit_byte(pcode.OP_LOADV)
                         emit_imm16(intern_var() as uword)
+                        type_push(TY_FLOAT)
                         expect_value = false
                         ; tok already advanced past the identifier
                     }
@@ -2016,6 +2184,7 @@ main {
                     next_token()                     ; consume ')'
                     emit_byte(pcode.OP_STRNUM)
                     emit_byte(snid)
+                    type_push(TY_FLOAT)              ; string arg is balanced by parse_string_expr; result is numeric
                     expect_value = false             ; a value now sits on the numeric stack
                 }
                 T_FN -> {                            ; FN name(arg): call a DEF FN user function
@@ -2064,6 +2233,8 @@ main {
                     emit_imm16(fn_param[f2] as uword)
                     emit_byte(pcode.OP_GOSUB)        ; run the body; RET leaves its result on the stack
                     emit_imm16(fn_entry[f2])
+                    type_popn(1)                     ; STORV consumed the numeric arg; GOSUB result...
+                    type_push(TY_FLOAT)              ; ...is a float on the stack
                     expect_value = false
                 }
                 T_XFUNC -> {                         ; X16 escape function: VPEEK/JOY/MX/... -> ROM at run time
@@ -2117,6 +2288,8 @@ main {
                     emit_byte(pcode.OP_CALLX)
                     emit_byte(xsub)
                     emit_byte(xn)
+                    type_popn(xn)                    ; CALLX consumed xn numeric args...
+                    type_push(TY_FLOAT)              ; ...and left one float result
                     expect_value = false             ; a numeric value now sits on the stack
                 }
                 T_LPAREN -> {
@@ -2201,6 +2374,7 @@ main {
                     stop_rp = fr_stoprp[fr_sp]
                     emit_byte(pcode.OP_SCMP)
                     emit_byte(fr_id[fr_sp])
+                    type_push(TY_FLOAT)             ; SCMP consumes two strings; result is a numeric truth value
                     expect_value = false            ; a numeric truth value now sits on the stack
                 }
             }
@@ -2213,30 +2387,99 @@ main {
             }
             emit_op(opstack[opsp], opslot[opsp])
         }
+        ; --- type-stack epilogue (Phase 5): the result is the top of the type stack. Auto-coerce it to
+        ;     float unless the caller wants the raw type (integer-variable assignment). Then collapse to a
+        ;     single entry at tbase -- defensive against a miscount leaking across statements. ---
+        if tsp > tbase
+            expr_type = tstack[tsp-1]
+        else
+            expr_type = TY_FLOAT
+        if not keep_int and is_intish(expr_type) {
+            emit_byte(pcode.OP_ITOF)
+            expr_type = TY_FLOAT
+        }
+        tstack[tbase] = expr_type
+        tsp = tbase + 1
+        expr_depth--
     }
 
+    ; Emit one operator, choosing integer or float opcodes from the operand types on the compile-time
+    ; type stack (Phase 5). Integer +,-,*,unary- fire only when a real INT (`%` var) is involved; two
+    ; integer LITERALS fall to float, so `%`-free code is byte-for-byte value-identical to before. Any
+    ; int operand feeding a float op is coerced (ITOF top / ITOF2 second-from-top) before the op.
     sub emit_op(ubyte op, ubyte slot) {
+        ubyte t1                                   ; operand types (Prog8 locals are sub-scoped, declare once)
+        ubyte t2
         when op {
-            T_PLUS  -> emit_byte(pcode.OP_ADD)
-            T_MINUS -> emit_byte(pcode.OP_SUB)
-            T_STAR  -> emit_byte(pcode.OP_MUL)
-            T_SLASH -> emit_byte(pcode.OP_DIV)
-            T_POW   -> emit_byte(pcode.OP_POW)
-            T_NEG   -> emit_byte(pcode.OP_NEG)
-            T_PEEK  -> emit_byte(pcode.OP_PEEK)
-            T_FUNC  -> {                            ; built-in function: OP_CALLFN <fn id>
+            T_PLUS, T_MINUS, T_STAR -> {           ; integer-capable binary arithmetic
+                t2 = type_pop()                    ; right operand (stack top)
+                t1 = type_pop()                    ; left operand (second-from-top)
+                if is_intish(t1) and is_intish(t2) and (t1 == TY_INT or t2 == TY_INT) {
+                    when op {
+                        T_PLUS  -> emit_byte(pcode.OP_IADD)
+                        T_MINUS -> emit_byte(pcode.OP_ISUB)
+                        T_STAR  -> emit_byte(pcode.OP_IMUL)
+                    }
+                    type_push(TY_INT)
+                } else {
+                    if is_intish(t1)  emit_byte(pcode.OP_ITOF2)   ; coerce left
+                    if is_intish(t2)  emit_byte(pcode.OP_ITOF)    ; coerce right
+                    when op {
+                        T_PLUS  -> emit_byte(pcode.OP_ADD)
+                        T_MINUS -> emit_byte(pcode.OP_SUB)
+                        T_STAR  -> emit_byte(pcode.OP_MUL)
+                    }
+                    type_push(TY_FLOAT)
+                }
+            }
+            T_NEG -> {                             ; unary negate: stays integer if the operand is
+                t1 = type_pop()
+                if is_intish(t1) {
+                    emit_byte(pcode.OP_INEG)
+                    type_push(t1)
+                } else {
+                    emit_byte(pcode.OP_NEG)
+                    type_push(TY_FLOAT)
+                }
+            }
+            T_PEEK -> {                            ; unary float ops: coerce an int operand first
+                t1 = type_pop()
+                if is_intish(t1)  emit_byte(pcode.OP_ITOF)
+                emit_byte(pcode.OP_PEEK)
+                type_push(TY_FLOAT)
+            }
+            T_FUNC -> {
+                t1 = type_pop()
+                if is_intish(t1)  emit_byte(pcode.OP_ITOF)
                 emit_byte(pcode.OP_CALLFN)
                 emit_byte(slot)
+                type_push(TY_FLOAT)
             }
-            T_EQ    -> emit_byte(pcode.OP_CMPEQ)
-            T_LT    -> emit_byte(pcode.OP_CMPLT)
-            T_GT    -> emit_byte(pcode.OP_CMPGT)
-            T_LE    -> emit_byte(pcode.OP_CMPLE)
-            T_GE    -> emit_byte(pcode.OP_CMPGE)
-            T_NE    -> emit_byte(pcode.OP_CMPNE)
-            T_AND   -> emit_byte(pcode.OP_AND)
-            T_OR    -> emit_byte(pcode.OP_OR)
-            T_NOT   -> emit_byte(pcode.OP_NOT)
+            T_NOT -> {
+                t1 = type_pop()
+                if is_intish(t1)  emit_byte(pcode.OP_ITOF)
+                emit_byte(pcode.OP_NOT)
+                type_push(TY_FLOAT)
+            }
+            else -> {                              ; binary float ops: /, ^, comparisons, AND, OR
+                t2 = type_pop()
+                t1 = type_pop()
+                if is_intish(t1)  emit_byte(pcode.OP_ITOF2)
+                if is_intish(t2)  emit_byte(pcode.OP_ITOF)
+                when op {
+                    T_SLASH -> emit_byte(pcode.OP_DIV)
+                    T_POW   -> emit_byte(pcode.OP_POW)
+                    T_EQ    -> emit_byte(pcode.OP_CMPEQ)
+                    T_LT    -> emit_byte(pcode.OP_CMPLT)
+                    T_GT    -> emit_byte(pcode.OP_CMPGT)
+                    T_LE    -> emit_byte(pcode.OP_CMPLE)
+                    T_GE    -> emit_byte(pcode.OP_CMPGE)
+                    T_NE    -> emit_byte(pcode.OP_CMPNE)
+                    T_AND   -> emit_byte(pcode.OP_AND)
+                    T_OR    -> emit_byte(pcode.OP_OR)
+                }
+                type_push(TY_FLOAT)
+            }
         }
     }
 
@@ -2472,6 +2715,16 @@ main {
                 tok = T_STRVAR
                 return
             }
+            if c == '%' {                       ; '%' suffix -> integer variable (Phase 5)
+                if nlen < NAMELEN-1 {
+                    tokname[nlen] = c
+                    nlen++
+                }
+                sptr++
+                tokname[nlen] = 0
+                tok = T_IVAR
+                return
+            }
             tokname[nlen] = 0
             if nlen == 2 and tokname[0] == $53 and tokname[1] == $54 {
                 tok = T_ST                      ; "ST" is reserved: the KERNAL I/O status word
@@ -2590,10 +2843,11 @@ main {
     }
 
     ; classify a $CE sub-token as a supported STRING-returning X16 function: HEX$($D5) / BIN$($D6),
-    ; each taking one numeric arg. RPT$($DA) is excluded (it takes a string arg, which the synthesized-
-    ; call path can't embed yet). These route through the string-expression parser -> OP_CALLXS.
+    ; each taking one numeric arg, and RPT$($DA) = RPT$(<byte>,<count>) which repeats <byte> <count>
+    ; times (two numeric args -- no string argument, per the ROM). All route through the string-
+    ; expression parser -> OP_CALLXS, whose xbuild already formats N comma-separated numeric args.
     sub is_xsfunc(ubyte s) -> bool {
-        return s == $d5 or s == $d6
+        return s == $d5 or s == $d6 or s == $da
     }
 
     sub single_char_op(ubyte c) -> ubyte {
