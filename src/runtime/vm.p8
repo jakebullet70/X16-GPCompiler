@@ -23,7 +23,7 @@ vm {
     ; the float `stack`. A given slot holds EITHER a float (stack[sp]) or an int (istack[sp]); which one
     ; is live is fixed by the compiler's typed opcode stream, so no runtime tag is kept. Coercion opcodes
     ; (OP_ITOF/ITOF2/FTOI) move a value between the two representations at the same slot.
-    word[32]  istack
+    word[32]  @shared istack     ; @shared: referenced only from hand-asm handlers (prog8 can't see those)
     ; variable slots live in a slab (128 floats * 5 bytes = 640 > the 256-byte array cap),
     ; addressed as varsf + slot*5 via peekf/pokef
     uword     varsf = memory("vm_vars", 640, 0)
@@ -42,8 +42,9 @@ vm {
     ubyte[8]  for_var            ; FOR loop frames (innermost on top)
     float[8]  for_limit
     float[8]  for_step
-    word[8]   for_ilimit         ; integer FOR (FOR I%=..): 16-bit limit + step, and for_var holds an
-    word[8]   for_istep          ; ivarsf slot. A frame uses EITHER the float or the int pair -- which is
+    word[8]   @shared for_ilimit ; integer FOR (FOR I%=..): 16-bit limit + step, and for_var holds an
+    word[8]   @shared for_istep  ; ivarsf slot. A frame uses EITHER the float or the int pair -- which is
+                                 ; @shared: now referenced only from hand-asm op_iforpush/op_ifornext
                                  ; fixed by the opcode (OP_FORNEXT vs OP_IFORNEXT), so no per-frame tag.
     uword[8]  for_top            ; pcode offset of the loop body's first instruction
     ubyte     forsp
@@ -549,36 +550,163 @@ _end:
     ; --- integer-first arithmetic (Phase 5): the compiler emits these for integer-typed subexpressions,
     ;     keeping values in istack[] (16-bit signed, shares sp with stack[]) to skip the ROM float path.
     ;     Arithmetic wraps at 16 bits (the `%` opt-in). Coercion ops bridge to/from float. ---
-    sub op_ipushi() {
-                    istack[sp] = mkword(@(pcbase + pc + 1), @(pcbase + pc)) as word
-                    pc += 2
-                    sp++
-                }
-    sub op_iloadv() {
-                    istack[sp] = peekw(ivarsf + (@(pcbase + pc) as uword) * 2) as word
-                    pc += 2
-                    sp++
-                }
-    sub op_istorv() {
-                    sp--
-                    pokew(ivarsf + (@(pcbase + pc) as uword) * 2, istack[sp] as uword)
-                    pc += 2
-                }
-    sub op_iadd() {
-                    sp--
-                    istack[sp-1] += istack[sp]
-                }
-    sub op_isub() {
-                    sp--
-                    istack[sp-1] -= istack[sp]
-                }
-    sub op_imul() {
-                    sp--
-                    istack[sp-1] *= istack[sp]
-                }
-    sub op_ineg() {
-                    istack[sp-1] = -istack[sp-1]
-                }
+    asmsub op_ipushi() {
+        %asm {{
+            lda  p8b_vm.p8v_pcbase                ; W1 = pcbase + pc
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldx  p8b_vm.p8v_sp
+            lda  (P8ZP_SCRATCH_W1)                ; imm lo
+            sta  p8b_vm.p8v_istack_lsb,x
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W1),y              ; imm hi
+            sta  p8b_vm.p8v_istack_msb,x
+            lda  p8b_vm.p8v_pc                    ; pc += 2
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           inc  p8b_vm.p8v_sp                    ; sp++
+            rts
+        }}
+    }
+    asmsub op_iloadv() {
+        %asm {{
+            lda  p8b_vm.p8v_pcbase                ; W1 = pcbase + pc
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)                ; slot byte
+            ldy  #0                               ; W2 = ivarsf + slot*2
+            asl  a
+            bcc  +
+            iny
++           clc
+            adc  p8b_vm.p8v_ivarsf
+            sta  P8ZP_SCRATCH_W2
+            tya
+            adc  p8b_vm.p8v_ivarsf+1
+            sta  P8ZP_SCRATCH_W2+1
+            ldx  p8b_vm.p8v_sp
+            lda  (P8ZP_SCRATCH_W2)                ; var lo
+            sta  p8b_vm.p8v_istack_lsb,x
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W2),y              ; var hi
+            sta  p8b_vm.p8v_istack_msb,x
+            lda  p8b_vm.p8v_pc                    ; pc += 2
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           inc  p8b_vm.p8v_sp                    ; sp++
+            rts
+        }}
+    }
+    asmsub op_istorv() {
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_pcbase                ; W1 = pcbase + pc
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)                ; slot byte
+            ldy  #0                               ; W2 = ivarsf + slot*2
+            asl  a
+            bcc  +
+            iny
++           clc
+            adc  p8b_vm.p8v_ivarsf
+            sta  P8ZP_SCRATCH_W2
+            tya
+            adc  p8b_vm.p8v_ivarsf+1
+            sta  P8ZP_SCRATCH_W2+1
+            ldx  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb,x          ; store istack[sp] -> var
+            sta  (P8ZP_SCRATCH_W2)
+            lda  p8b_vm.p8v_istack_msb,x
+            ldy  #1
+            sta  (P8ZP_SCRATCH_W2),y
+            lda  p8b_vm.p8v_pc                    ; pc += 2
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           rts
+        }}
+    }
+    asmsub op_iadd() {
+        %asm {{
+            dec  p8b_vm.p8v_sp                    ; sp--
+            ldy  p8b_vm.p8v_sp                    ; y = sp -> istack[sp]; istack[sp-1] via base-1,y
+            clc
+            lda  p8b_vm.p8v_istack_lsb-1,y
+            adc  p8b_vm.p8v_istack_lsb,y
+            sta  p8b_vm.p8v_istack_lsb-1,y
+            lda  p8b_vm.p8v_istack_msb-1,y
+            adc  p8b_vm.p8v_istack_msb,y
+            sta  p8b_vm.p8v_istack_msb-1,y
+            rts
+        }}
+    }
+    asmsub op_isub() {
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldy  p8b_vm.p8v_sp
+            sec
+            lda  p8b_vm.p8v_istack_lsb-1,y
+            sbc  p8b_vm.p8v_istack_lsb,y
+            sta  p8b_vm.p8v_istack_lsb-1,y
+            lda  p8b_vm.p8v_istack_msb-1,y
+            sbc  p8b_vm.p8v_istack_msb,y
+            sta  p8b_vm.p8v_istack_msb-1,y
+            rts
+        }}
+    }
+    asmsub op_imul() {
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb,x          ; multiplier = istack[sp]
+            sta  prog8_math.multiply_words.multiplier
+            lda  p8b_vm.p8v_istack_msb,x
+            sta  prog8_math.multiply_words.multiplier+1
+            lda  p8b_vm.p8v_istack_lsb-1,x        ; A/Y = istack[sp-1]
+            ldy  p8b_vm.p8v_istack_msb-1,x
+            jsr  prog8_math.multiply_words        ; result A=lo, Y=hi (wraps at 16 bits)
+            ldx  p8b_vm.p8v_sp                    ; reload (multiply may clobber X)
+            sta  p8b_vm.p8v_istack_lsb-1,x
+            tya
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_ineg() {
+        %asm {{
+            ldy  p8b_vm.p8v_sp
+            dey                                   ; y = sp-1 (top)
+            sec
+            lda  #0
+            sbc  p8b_vm.p8v_istack_lsb,y
+            sta  p8b_vm.p8v_istack_lsb,y
+            lda  #0
+            sbc  p8b_vm.p8v_istack_msb,y
+            sta  p8b_vm.p8v_istack_msb,y
+            rts
+        }}
+    }
     sub op_itof() {                       ; coerce the TOP cell int -> float
                     stack[sp-1] = istack[sp-1] as float
                 }
@@ -595,48 +723,194 @@ _end:
                 }
     ; --- integer comparison / logic / branch (Phase 5 increment 2): all operate on istack[] (16-bit
     ;     signed), pushing the CBM truth value -1/0; they skip the ROM float compare entirely. ---
-    sub op_icmpeq() {
-                    sp--
-                    if istack[sp-1] == istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
-                }
-    sub op_icmpne() {
-                    sp--
-                    if istack[sp-1] != istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
-                }
-    sub op_icmplt() {
-                    sp--
-                    if istack[sp-1] < istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
-                }
-    sub op_icmpgt() {
-                    sp--
-                    if istack[sp-1] > istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
-                }
-    sub op_icmple() {
-                    sp--
-                    if istack[sp-1] <= istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
-                }
-    sub op_icmpge() {
-                    sp--
-                    if istack[sp-1] >= istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
-                }
-    sub op_ijz() {                        ; pop int; branch to the operand offset if it is zero
-                    sp--
-                    if istack[sp] == 0
-                        pc = mkword(@(pcbase + pc + 1), @(pcbase + pc))   ; take the branch (absolute offset)
-                    else
-                        pc += 2                                          ; fall through, skip the 2-byte target
-                }
-    sub op_iand() {                       ; bitwise AND of the two 16-bit ints (== logical, truth is -1/0)
-                    sp--
-                    istack[sp-1] = (istack[sp-1] as uword & istack[sp] as uword) as word
-                }
-    sub op_ior() {                        ; bitwise OR
-                    sp--
-                    istack[sp-1] = (istack[sp-1] as uword | istack[sp] as uword) as word
-                }
-    sub op_inot() {                       ; bitwise complement (NOT x == -(x+1))
-                    istack[sp-1] = (~ (istack[sp-1] as uword)) as word
-                }
+    asmsub op_icmpeq() {
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb-1,x
+            cmp  p8b_vm.p8v_istack_lsb,x
+            bne  _eqf
+            lda  p8b_vm.p8v_istack_msb-1,x
+            cmp  p8b_vm.p8v_istack_msb,x
+            bne  _eqf
+            lda  #$ff
+            bne  _eqs                             ; $ff != 0 -> always: store true
+_eqf:       lda  #0
+_eqs:       sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_icmpne() {
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb-1,x
+            cmp  p8b_vm.p8v_istack_lsb,x
+            bne  _net
+            lda  p8b_vm.p8v_istack_msb-1,x
+            cmp  p8b_vm.p8v_istack_msb,x
+            bne  _net
+            lda  #0                               ; equal -> false
+            beq  _nes
+_net:       lda  #$ff
+_nes:       sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_icmplt() {
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp                    ; x = sp
+            sec                                   ; signed 16-bit istack[sp-1] < istack[sp] via N eor V
+            lda  p8b_vm.p8v_istack_lsb-1,x
+            sbc  p8b_vm.p8v_istack_lsb,x
+            lda  p8b_vm.p8v_istack_msb-1,x
+            sbc  p8b_vm.p8v_istack_msb,x
+            bvc  +
+            eor  #$80
++           bmi  _true                            ; N set (corrected) -> A < B
+            lda  #0                               ; false -> 0
+            sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+_true:      lda  #$ff                             ; true -> -1 (CBM truth)
+            sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_icmpgt() {                          ; A>B  <=>  B<A (signed)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            sec
+            lda  p8b_vm.p8v_istack_lsb,x          ; B_lo
+            sbc  p8b_vm.p8v_istack_lsb-1,x        ; - A_lo
+            lda  p8b_vm.p8v_istack_msb,x          ; B_hi
+            sbc  p8b_vm.p8v_istack_msb-1,x        ; - A_hi
+            bvc  +
+            eor  #$80
++           bmi  _gtt                             ; B<A -> A>B true
+            lda  #0
+            beq  _gts
+_gtt:       lda  #$ff
+_gts:       sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_icmple() {                          ; A<=B  <=>  not(B<A)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            sec
+            lda  p8b_vm.p8v_istack_lsb,x          ; B_lo
+            sbc  p8b_vm.p8v_istack_lsb-1,x        ; - A_lo
+            lda  p8b_vm.p8v_istack_msb,x
+            sbc  p8b_vm.p8v_istack_msb-1,x
+            bvc  +
+            eor  #$80
++           bmi  _lef                             ; B<A -> A<=B false
+            lda  #$ff
+            bne  _les
+_lef:       lda  #0
+_les:       sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_icmpge() {                          ; A>=B  <=>  not(A<B)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            sec
+            lda  p8b_vm.p8v_istack_lsb-1,x        ; A_lo
+            sbc  p8b_vm.p8v_istack_lsb,x          ; - B_lo
+            lda  p8b_vm.p8v_istack_msb-1,x
+            sbc  p8b_vm.p8v_istack_msb,x
+            bvc  +
+            eor  #$80
++           bmi  _gef                             ; A<B -> A>=B false
+            lda  #$ff
+            bne  _ges
+_gef:       lda  #0
+_ges:       sta  p8b_vm.p8v_istack_lsb-1,x
+            sta  p8b_vm.p8v_istack_msb-1,x
+            rts
+        }}
+    }
+    asmsub op_ijz() {                             ; pop int; branch to the operand target if it is zero
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb,x
+            ora  p8b_vm.p8v_istack_msb,x
+            bne  _ijznt                           ; nonzero -> fall through, skip the 2-byte target
+            lda  p8b_vm.p8v_pcbase                ; zero -> pc = target word (LE at pcbase+pc)
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W1),y              ; target hi
+            pha
+            lda  (P8ZP_SCRATCH_W1)                ; target lo
+            sta  p8b_vm.p8v_pc
+            pla
+            sta  p8b_vm.p8v_pc+1
+            rts
+_ijznt:     lda  p8b_vm.p8v_pc                    ; pc += 2
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           rts
+        }}
+    }
+    asmsub op_iand() {                            ; bitwise AND of the two 16-bit ints (truth -1/0)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldy  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb-1,y
+            and  p8b_vm.p8v_istack_lsb,y
+            sta  p8b_vm.p8v_istack_lsb-1,y
+            lda  p8b_vm.p8v_istack_msb-1,y
+            and  p8b_vm.p8v_istack_msb,y
+            sta  p8b_vm.p8v_istack_msb-1,y
+            rts
+        }}
+    }
+    asmsub op_ior() {                             ; bitwise OR
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            ldy  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_istack_lsb-1,y
+            ora  p8b_vm.p8v_istack_lsb,y
+            sta  p8b_vm.p8v_istack_lsb-1,y
+            lda  p8b_vm.p8v_istack_msb-1,y
+            ora  p8b_vm.p8v_istack_msb,y
+            sta  p8b_vm.p8v_istack_msb-1,y
+            rts
+        }}
+    }
+    asmsub op_inot() {                            ; bitwise complement (NOT x == -(x+1))
+        %asm {{
+            ldy  p8b_vm.p8v_sp
+            dey                                   ; y = sp-1 (top, unary)
+            lda  p8b_vm.p8v_istack_lsb,y
+            eor  #$ff
+            sta  p8b_vm.p8v_istack_lsb,y
+            lda  p8b_vm.p8v_istack_msb,y
+            eor  #$ff
+            sta  p8b_vm.p8v_istack_msb,y
+            rts
+        }}
+    }
     sub op_printi() {
                     sp--
                     float pv = stack[sp]
@@ -701,33 +975,111 @@ _end:
                     else
                         forsp--                  ; loop finished; pop the frame
                 }
-    sub op_iforpush() {                   ; FOR I%=start TO limit STEP step -- open an integer loop frame
-                    ubyte slot = @(pcbase + pc)    ; ivarsf slot (< 128, fits a byte)
-                    pc += 2
-                    sp--
-                    word istepv = istack[sp]     ; step was pushed last
-                    sp--
-                    for_var[forsp] = slot
-                    for_ilimit[forsp] = istack[sp]  ; then limit
-                    for_istep[forsp] = istepv
-                    for_top[forsp] = pc          ; body starts right after this opcode
-                    forsp++
-                }
-    sub op_ifornext() {                   ; step the innermost integer FOR (16-bit, wraps like other % ops)
-                    ubyte top = forsp - 1
-                    uword vaddr = ivarsf + (for_var[top] as uword) * 2
-                    word nv = (peekw(vaddr) as word) + for_istep[top]
-                    pokew(vaddr, nv as uword)
-                    bool cont
-                    if for_istep[top] >= 0
-                        cont = nv <= for_ilimit[top]
-                    else
-                        cont = nv >= for_ilimit[top]
-                    if cont
-                        pc = for_top[top]
-                    else
-                        forsp--                  ; loop finished; pop the frame
-                }
+    asmsub op_iforpush() {                        ; FOR I%=start TO limit STEP step -- open an integer frame
+        %asm {{
+            lda  p8b_vm.p8v_pcbase                ; slot = @(pcbase+pc)
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            pha                                   ; save slot
+            lda  p8b_vm.p8v_pc                    ; pc += 2 (body starts here)
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           dec  p8b_vm.p8v_sp                    ; sp-- (step index) ; sp-- (limit index)
+            dec  p8b_vm.p8v_sp
+            ldy  p8b_vm.p8v_forsp
+            pla                                   ; slot -> for_var[forsp]
+            sta  p8b_vm.p8v_for_var,y
+            ldx  p8b_vm.p8v_sp                    ; istack[sp] = limit
+            lda  p8b_vm.p8v_istack_lsb,x
+            sta  p8b_vm.p8v_for_ilimit_lsb,y
+            lda  p8b_vm.p8v_istack_msb,x
+            sta  p8b_vm.p8v_for_ilimit_msb,y
+            inx                                   ; istack[sp+1] = step
+            lda  p8b_vm.p8v_istack_lsb,x
+            sta  p8b_vm.p8v_for_istep_lsb,y
+            lda  p8b_vm.p8v_istack_msb,x
+            sta  p8b_vm.p8v_for_istep_msb,y
+            lda  p8b_vm.p8v_pc                    ; for_top[forsp] = pc
+            sta  p8b_vm.p8v_for_top_lsb,y
+            lda  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_for_top_msb,y
+            inc  p8b_vm.p8v_forsp
+            rts
+        }}
+    }
+    asmsub op_ifornext() {                        ; step the innermost integer FOR (16-bit, wraps)
+        %asm {{
+            lda  p8b_vm.p8v_forsp                 ; top = forsp-1 -> B1
+            sec
+            sbc  #1
+            sta  P8ZP_SCRATCH_B1
+            tay
+            lda  p8b_vm.p8v_for_var,y             ; vaddr = ivarsf + for_var[top]*2 -> W2
+            ldx  #0
+            asl  a
+            bcc  +
+            ldx  #1
++           clc
+            adc  p8b_vm.p8v_ivarsf
+            sta  P8ZP_SCRATCH_W2
+            txa
+            adc  p8b_vm.p8v_ivarsf+1
+            sta  P8ZP_SCRATCH_W2+1
+            ldy  #0                               ; nv = peekw(vaddr) + for_istep[top]
+            lda  (P8ZP_SCRATCH_W2),y
+            ldy  P8ZP_SCRATCH_B1
+            clc
+            adc  p8b_vm.p8v_for_istep_lsb,y
+            sta  P8ZP_SCRATCH_W1
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W2),y
+            ldy  P8ZP_SCRATCH_B1
+            adc  p8b_vm.p8v_for_istep_msb,y
+            sta  P8ZP_SCRATCH_W1+1
+            lda  P8ZP_SCRATCH_W1                  ; store nv back to the loop var
+            ldy  #0
+            sta  (P8ZP_SCRATCH_W2),y
+            lda  P8ZP_SCRATCH_W1+1
+            ldy  #1
+            sta  (P8ZP_SCRATCH_W2),y
+            ldy  P8ZP_SCRATCH_B1
+            lda  p8b_vm.p8v_for_istep_msb,y       ; step sign -> ascending/descending
+            bmi  _ifndn
+            sec                                   ; ascending: stop if limit < nv (signed)
+            lda  p8b_vm.p8v_for_ilimit_lsb,y
+            sbc  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_for_ilimit_msb,y
+            sbc  P8ZP_SCRATCH_W1+1
+            bvc  +
+            eor  #$80
++           bmi  _ifnstop                         ; limit<nv -> nv>limit -> stop
+            bpl  _ifncont
+_ifndn:     sec                                   ; descending: stop if nv < limit (signed)
+            lda  P8ZP_SCRATCH_W1
+            sbc  p8b_vm.p8v_for_ilimit_lsb,y
+            lda  P8ZP_SCRATCH_W1+1
+            sbc  p8b_vm.p8v_for_ilimit_msb,y
+            bvc  +
+            eor  #$80
++           bmi  _ifnstop                         ; nv<limit -> stop
+_ifncont:   ldy  P8ZP_SCRATCH_B1                  ; continue: pc = for_top[top]
+            lda  p8b_vm.p8v_for_top_lsb,y
+            sta  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_for_top_msb,y
+            sta  p8b_vm.p8v_pc+1
+            rts
+_ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
+            rts
+        }}
+    }
     sub op_pushs() {
                     ; operand is an offset into the literal pool; litbase makes it absolute. Literal
                     ; bodies are off-heap (program text) -> a scratch descriptor over them, which the
