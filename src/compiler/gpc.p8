@@ -2945,6 +2945,7 @@ main {
             $ba -> return pcode.FN_SQR
             $bb -> return pcode.FN_RND
             $bc -> return pcode.FN_LOG
+            $bd -> return pcode.FN_EXP
             $be -> return pcode.FN_COS
             $bf -> return pcode.FN_SIN
             $c0 -> return pcode.FN_TAN

@@ -397,6 +397,13 @@ bash "$DIR/check-out.sh" "10 PRINT SGN(0)"       "0"   || fail=1
 bash "$DIR/check-out.sh" "10 PRINT SQR(9)"       "3"   || fail=1
 bash "$DIR/check-out.sh" "10 PRINT SIN(0)"       "0"   || fail=1
 bash "$DIR/check-out.sh" "10 PRINT COS(0)"       "1"   || fail=1
+bash "$DIR/check-out.sh" "10 PRINT TAN(0)"       "0"   || fail=1
+bash "$DIR/check-out.sh" "10 PRINT ATN(0)"       "0"   || fail=1
+bash "$DIR/check-out.sh" "10 PRINT LOG(1)"       "0"   || fail=1
+# EXP: was silently unmapped in the compiler's func_id (skipped $bd LOG->COS) -> parsed as 0.
+bash "$DIR/check-out.sh" "10 PRINT EXP(0)"       "1"   || fail=1
+bash "$DIR/check-basic.sh" "10 PRINT INT(EXP(2))"       0400=7 || fail=1  # e^2=7.389
+bash "$DIR/check-basic.sh" "10 PRINT INT(LOG(EXP(3)))"  0400=3 || fail=1  # LOG.EXP round-trip
 # functions nest and compose in expressions
 bash "$DIR/check-out.sh" "10 PRINT INT(SQR(50))" "7"   || fail=1
 bash "$DIR/check-out.sh" "10 PRINT ABS(-2)*3"    "6"   || fail=1

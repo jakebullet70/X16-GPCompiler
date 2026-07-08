@@ -36,7 +36,7 @@ vm {
     ; OFF and each main enables it only in its TESTBENCH build (vm.host_echo = TESTBENCH before vm.run).
     bool      host_echo = false
 
-    uword[16] callstack          ; GOSUB return addresses
+    uword[16] @shared callstack  ; GOSUB return addresses (referenced only from asm op_gosub/op_ret)
     ubyte     csp
 
     ubyte[8]  @shared for_var    ; FOR loop frames (innermost on top); @shared: all FOR handlers are now asm
@@ -600,6 +600,7 @@ _end:
         }}
     }
     float @shared c_negone = -1.0           ; MFLPT constant for the CBM 'true' compare result (-1.0)
+    float @shared c_one = 1.0               ; MFLPT 1.0 -- positive RND arg (op_callfn: fresh random 0..1)
 
     asmsub st_cmpfalse() {                  ; stack[sp-1] = 0.0
         %asm {{
@@ -1229,17 +1230,51 @@ _ijznt:     lda  p8b_vm.p8v_pc                    ; pc += 2
     sub op_newline() {
                     emit_char(13)                         ; CR to screen, LF to host console
                 }
-    sub op_gosub() {
-                    uword target = mkword(@(pcbase + pc + 1), @(pcbase + pc))
-                    pc += 2
-                    callstack[csp] = pc          ; return here
-                    csp++
-                    pc = target
-                }
-    sub op_ret() {
-                    csp--
-                    pc = callstack[csp]
-                }
+    asmsub op_gosub() {                      ; push return addr, jump to the little-endian word operand
+        %asm {{
+            lda  p8b_vm.p8v_pcbase           ; W1 = pcbase + pc  (points at the 2-byte target operand)
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  #0                           ; target (lo,hi) -> W2
+            lda  (P8ZP_SCRATCH_W1),y
+            sta  P8ZP_SCRATCH_W2
+            iny
+            lda  (P8ZP_SCRATCH_W1),y
+            sta  P8ZP_SCRATCH_W2+1
+            lda  p8b_vm.p8v_pc               ; pc += 2  (return address = byte after the operand)
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  _gsnoc
+            inc  p8b_vm.p8v_pc+1
+_gsnoc:     ldy  p8b_vm.p8v_csp              ; callstack[csp] = pc ; csp++
+            lda  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_callstack_lsb,y
+            lda  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_callstack_msb,y
+            inc  p8b_vm.p8v_csp
+            lda  P8ZP_SCRATCH_W2             ; pc = target
+            sta  p8b_vm.p8v_pc
+            lda  P8ZP_SCRATCH_W2+1
+            sta  p8b_vm.p8v_pc+1
+            rts
+        }}
+    }
+    asmsub op_ret() {                        ; pop return addr off the GOSUB callstack
+        %asm {{
+            dec  p8b_vm.p8v_csp
+            ldy  p8b_vm.p8v_csp
+            lda  p8b_vm.p8v_callstack_lsb,y
+            sta  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_callstack_msb,y
+            sta  p8b_vm.p8v_pc+1
+            rts
+        }}
+    }
     asmsub op_forpush() {                    ; FOR var=start TO limit STEP step -- open a float loop frame
         %asm {{
             lda  p8b_vm.p8v_pcbase
@@ -1613,11 +1648,51 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
             rts
         }}
     }
-    sub op_callfn() {
-                    ubyte fnid = @(pcbase + pc)
-                    pc++
-                    stack[sp-1] = apply_fn(fnid, stack[sp-1])
-                }
+    asmsub op_callfn() {                     ; stack[sp-1] = FN(stack[sp-1]) -- dispatch fnid to a ROM float fn
+        %asm {{
+            lda  p8b_vm.p8v_pcbase           ; fnid = @(pcbase+pc)
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            pha                              ; stash fnid
+            inc  p8b_vm.p8v_pc               ; pc++
+            bne  _cfnopc
+            inc  p8b_vm.p8v_pc+1
+_cfnopc:    lda  p8b_vm.p8v_sp               ; FAC = stack[sp-1]  (the argument)
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM
+            pla
+            tax                              ; X = fnid
+            cpx  #4                          ; FN_RND: ignore arg, use FAC = 1.0 (positive -> fresh random)
+            bne  _cfgo
+            lda  #<p8b_vm.p8v_c_one
+            ldy  #>p8b_vm.p8v_c_one
+            jsr  $fe63                       ; MOVFM  FAC = 1.0
+            ldx  #4                          ; MOVFM may clobber X; restore the RND index
+_cfgo:      lda  _cffnlo,x                   ; vector = ROM entry for this fnid
+            sta  P8ZP_SCRATCH_W2
+            lda  _cffnhi,x
+            sta  P8ZP_SCRATCH_W2+1
+            jsr  _cfvec                      ; FAC = fn(FAC)   (ROM rts returns here)
+            lda  p8b_vm.p8v_sp               ; stack[sp-1] = FAC
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF
+            rts
+_cfvec:     jmp  (P8ZP_SCRATCH_W2)
+            ; ROM float-function entry points, indexed by FN_* id (0..10):
+            ;  SGN  INT  ABS  SQR  RND  SIN  COS  TAN  ATN  LOG  EXP
+_cffnlo:    .byte <$fe84, <$fe2d, <$fe4e, <$fe30, <$fe57, <$fe42, <$fe3f, <$fe45, <$fe48, <$fe2a, <$fe3c
+_cffnhi:    .byte >$fe84, >$fe2d, >$fe4e, >$fe30, >$fe57, >$fe42, >$fe3f, >$fe45, >$fe48, >$fe2a, >$fe3c
+            ; !notreached!  (the two .byte rows above are the jump-vector data, not code)
+        }}
+    }
     sub op_strnum() {                     ; LEN/ASC/VAL: pop string, push number
                     ubyte snid = @(pcbase + pc)
                     pc++
@@ -2125,23 +2200,8 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
         return (f as word) as uword
     }
 
-    ; apply a built-in function to x. Most delegate to the ROM Math library (via Prog8's
-    ; floats module / float builtins); INT is floor, SGN returns -1/0/1.
-    sub apply_fn(ubyte fnid, float x) -> float {
-        when fnid {
-            pcode.FN_SGN -> return sgn(x) as float
-            pcode.FN_INT -> return floats.floor(x)
-            pcode.FN_ABS -> return abs(x)
-            pcode.FN_SQR -> return sqrt(x)
-            pcode.FN_RND -> return floats.rnd()      ; a fresh random 0..1 (arg ignored)
-            pcode.FN_SIN -> return floats.sin(x)
-            pcode.FN_COS -> return floats.cos(x)
-            pcode.FN_TAN -> return floats.tan(x)
-            pcode.FN_ATN -> return floats.atan(x)
-            pcode.FN_LOG -> return floats.ln(x)
-        }
-        return x
-    }
+    ; (op_callfn dispatches FN_* straight to the ROM float jump table in hand-asm; the old Prog8
+    ;  apply_fn -- and with it floats.sin/cos/tan/atan/ln/rnd + sgn/sqrt -- is no longer needed.)
 
     ; Set up an N-D array descriptor from `nd` max-index subscripts sitting on top of the numeric
     ; stack (which it pops). Writes the per-dimension sizes s_j = idx_j+1 into dims_ptr for `slot`,
