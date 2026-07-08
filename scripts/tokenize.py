@@ -33,6 +33,27 @@ TOKENS = {
 OPS = {'+': 0xaa, '-': 0xab, '*': 0xac, '/': 0xad, '^': 0xae, '>': 0xb1, '=': 0xb2, '<': 0xb3}
 KW = sorted(TOKENS, key=len, reverse=True)   # greedy longest-match, like CBM
 
+# X16 escape statements: tokenized as $CE <sub> where sub = $80 + the index in the ROM's
+# stmdsp2 / reslst2+reslst3 tables (basic/tokens.s, token2.s). GPC doesn't compile these; its
+# OP_PASSTHRU hands the tokenized statement to the ROM interpreter at run time. Text/order are
+# authoritative from the R49 ROM source (VPOKE = $CE $84, verified by spikes/passthru_vpoke.p8).
+ESC_STMT = ['MON','DOS','OLD','GEOS','VPOKE','VLOAD','SCREEN','PSET','LINE','FRAME','RECT','CHAR',
+    'MOUSE','COLOR','TEST','RESET','CLS','CODEX','LOCATE','BOOT','KEYMAP','BLOAD','BVLOAD','BVERIFY',
+    'BANK','FMINIT','FMNOTE','FMDRUM','FMINST','FMVIB','FMFREQ','FMVOL','FMPAN','FMPLAY','FMCHORD',
+    'FMPOKE','PSGINIT','PSGNOTE','PSGVOL','PSGWAV','PSGFREQ','PSGPAN','PSGPLAY','PSGCHORD','REBOOT',
+    'POWEROFF','I2CPOKE','SLEEP','BSAVE','MENU','REN','LINPUT#','LINPUT','BINPUT#','HELP','BANNER',
+    'EXEC','TILE','EDIT','SPRITE','SPRMEM','MOVSPR','BASLOAD','OVAL','RING','HBLOAD']
+# X16 escape FUNCTIONS (used in expressions, tokenized $CE <sub> like the statements). The ROM's
+# crunch forces the function block to start at $CE $D0 regardless of how many statements precede it
+# (basic/code2.s: `adc #($d0 - num_esc_statements - 1)` with carry set -> +$8E), leaving a gap after
+# the $80..$C5 statement tokens. Order is authoritative from tokens.s `ptrfunc`; HEX$/BIN$/RPT$ carry
+# the trailing '$'. GPC compiles the numeric-result ones via OP_CALLX (see gpc.p8 is_xfunc).
+ESC_FUNC = ['VPEEK','MX','MY','MB','JOY','HEX$','BIN$','I2CPEEK','POINTER','STRPTR','RPT$','MWHEEL',
+    'TDATA','TATTR','MOD']
+ESC = {k: 0x80 + i for i, k in enumerate(ESC_STMT)}
+ESC.update({k: 0xD0 + j for j, k in enumerate(ESC_FUNC)})   # functions live at $D0.. (see above)
+ESC_KW = sorted(ESC, key=len, reverse=True)   # greedy longest-match, checked AFTER the core keywords
+
 
 def tokenize_line(text):
     out = bytearray()
@@ -66,7 +87,8 @@ def tokenize_line(text):
             i += 1
             continue
         up = text[i:].upper()
-        for k in KW:
+        matched = False
+        for k in KW:                       # core keywords first (matches ROM reslst precedence)
             if up.startswith(k):
                 out.append(TOKENS[k])
                 i += len(k)
@@ -74,8 +96,17 @@ def tokenize_line(text):
                     in_rem = True
                 elif k == 'DATA':
                     in_data = True
+                matched = True
                 break
-        else:
+        if not matched:
+            for k in ESC_KW:               # then X16 escape statements -> $CE <sub>
+                if up.startswith(k):
+                    out.append(0xce)
+                    out.append(ESC[k])
+                    i += len(k)
+                    matched = True
+                    break
+        if not matched:
             if c in OPS:
                 out.append(OPS[c])
             elif c.isalpha():

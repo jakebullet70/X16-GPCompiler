@@ -124,10 +124,36 @@ pcode {
     ; (STOP reuses OP_END; ON..GOTO/GOSUB desugars to LOADV/PUSHI/CMPEQ/JZ + JMP/GOSUB; DEF FN/FN
     ;  reuse OP_GOSUB/OP_RET with a compiler-side function table -- no new opcodes needed for those.)
 
+    ; --- command pass-through (Phase 3): hand a tokenized BASIC statement to the ROM interpreter.
+    ;     The runtime copies the bytes into a low-RAM buffer (prefixed with a ':' the ROM CHRGET skips,
+    ;     suffixed with $00), points TXTPTR at it, pages in BASIC ROM (bank 4), and JSRs `gone3`; the
+    ;     leaf/extension handler (VERA/sound/graphics/disk -- the $CE-escape keywords) runs and RTSes
+    ;     back. This gives a compiled program all of X16 BASIC's statements GPC doesn't compile itself. ---
+    const ubyte OP_PASSTHRU = 64 ; (ubyte len)(len tokenized bytes) run the statement via ROM BASIC
+
+    ; --- X16 expression functions (VPEEK/JOY/MX/...): the expression-context companion to OP_PASSTHRU.
+    ;     The compiler evaluates each argument itself (GPC's own vars aren't in BASIC's table, so a
+    ;     whole sub-expression can't just be handed to frmevl) and leaves the computed numeric values on
+    ;     the stack. At run time OP_CALLX pops them, formats them as ASCII decimal into a synthesized
+    ;     tokenized call [$CE][subtok]("("arg0","arg1...")"), points TXTPTR at it, pages in BASIC ROM and
+    ;     JSRs frmevl -- the ROM function handler runs and returns a numeric result in FAC1, which MOVMF
+    ;     packs back onto the stack. `subtok` is the $CE escape sub-token ($D0=VPEEK..$DE=MOD); `nargs`
+    ;     is how many argument values were pushed (0 for the no-paren mouse functions MX/MY/MB/MWHEEL). ---
+    const ubyte OP_CALLX = 65    ; (ubyte subtok)(ubyte nargs) call an X16 ROM function via frmevl
+
+    ; --- string-returning X16 functions (HEX$/BIN$): like OP_CALLX but frmevl leaves a STRING result.
+    ;     Same synthesized-call setup (numeric args formatted into the tokenized call); afterwards the
+    ;     runtime calls the ROM's `frestr` to fetch the result descriptor (len + heap body) and free the
+    ;     BASIC temp, copies the body off-heap, and adopts it into a GPC string temp (bstr.mem_to_temp),
+    ;     pushing it on the string stack. `subtok` is the $CE sub-token ($D5=HEX$, $D6=BIN$). ---
+    const ubyte OP_CALLXS = 66   ; (ubyte subtok)(ubyte nargs) call a string-returning X16 ROM function
+
     ; Element addressing for both array families is ROW-MAJOR over dimension SIZES s_j = (max index j)+1:
     ; for subscripts i_0..i_{nd-1}, offset = (((i_0)*s_1 + i_1)*s_2 + i_2)... (Horner). The compiler emits
     ; the same subscripts for DIM and for access, so the exact layout only has to be self-consistent.
     const ubyte MAXDIMS = 4      ; at most 4 subscripts per array (DIM A(a,b,c,d)); deeper -> a compile error
+    const ubyte MAX_XARGS = 4    ; at most 4 arguments to an X16 escape function (OP_CALLX); the runtime's
+                                 ; xargs buffer holds this many. Real X16 functions take <= 2-3.
 
     ; built-in function ids (operand of OP_CALLFN); all take one numeric arg, return a number
     const ubyte FN_SGN = 0       ; sign: -1, 0, or 1
@@ -167,10 +193,11 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $4800                    ; runtime finds the compiled program here. Must sit
+    const uword PCODE_BASE = $4C00                    ; runtime finds the compiled program here. Must sit
                                                       ; ABOVE the bundled runtime's whole memory footprint
                                                       ; (code + vars + slabs: heap, numeric & string array
                                                       ; heaps) so its RAM never overlaps the loaded P-code.
-                                                      ; The runtime's slabs end ~$4142 (grew with channel I/O),
-                                                      ; so PCODE_BASE sits above that; leaves ~22 KB for P-code.
+                                                      ; The runtime's slabs end ~$4900 (grew with the X16
+                                                      ; function/pass-through buffers + the ZP-swap buffer),
+                                                      ; so PCODE_BASE sits above that; leaves ~21 KB for P-code.
 }

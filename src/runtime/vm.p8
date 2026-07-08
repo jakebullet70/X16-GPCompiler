@@ -13,6 +13,7 @@
 %import strings
 %import floats
 %import pcode_format
+%import bstr
 
 vm {
     const uword EMU_CHROUT = $9fbb        ; x16emu: writing here echoes a char to the host console
@@ -33,17 +34,23 @@ vm {
     uword[8]  for_top            ; pcode offset of the loop body's first instruction
     ubyte     forsp
 
-    uword[16]  sstack            ; string-value stack (holds pointers)
+    ; --- strings (BASIC-format, collected by the ROM garbage collector via the bstr module) ---
+    ; sstack holds descriptor ADDRESSES (into bstr's var table / temp stack / string-array data, or
+    ; a scratch cell in sdesc for off-heap literals & DATA). A string VALUE is a 3-byte descriptor
+    ; [len][ptr_lo][ptr_hi]; bstr owns allocation (ROM getspa) and rooting (BASIC's own tables), so
+    ; the VM keeps no private string heap and runs no collector of its own.
+    ; --- interpreter dispatch state (module-level so the hand-asm jump-table loop in run() and the
+    ;     per-opcode handler subs share them) ---
+    uword      pcbase            ; base address of the P-code blob
+    uword      pc                ; program counter: offset into the blob
+    bool       halt              ; a handler sets this to end run() (OP_END / a fatal string error)
+
+    uword[16]  sstack            ; string-value stack (holds descriptor addresses)
     ubyte      ssp
-    uword[64]  svars             ; string variable pointers (max 64 string variables)
-    ; string heap (concat/slice/CHR$/INPUT/READ results), bump-allocated. A slab (not a 256-byte
-    ; array) so string arrays -- which can hold many strings at once -- have real room to work in.
-    const uword HEAP_SIZE = 1024
-    uword      heap = memory("vm_heap", HEAP_SIZE, 0)
-    uword      heap_top
-    str        empty_str = ""    ; shared value for unset string variables
-    str        heap_full_msg = "?OUT OF MEMORY"   ; string heap still full after a compaction
-    str        str_long_msg  = "?STRING TOO LONG" ; a concat would exceed BASIC's 255-char limit
+    ubyte[48]  sdesc             ; per-slot scratch descriptors for off-heap literals/DATA (16 * 3)
+    str        str_long_msg  = "?STRING TOO LONG"     ; a concat would exceed BASIC's 255-char limit
+    str        formula_msg   = "?FORMULA TOO COMPLEX" ; > 3 live string temporaries (BASIC's limit)
+    str        empty_c       = ""                     ; off-heap "" for out-of-data READ results
     uword      litbase           ; base address of the string-literal pool (set by the host
                                  ; before run(): &litpool in-process, from the header standalone)
     uword      sys_target        ; OP_SYS call target (indirection cell for the JSR trick)
@@ -66,140 +73,408 @@ vm {
     uword      arr_dims = memory("vm_arrdims", 32 * pcode.MAXDIMS * 2, 0)
     uword      arr_top            ; bump pointer into arrheap (bytes)
 
-    ; --- string arrays (DIM A$(...)): same shape as numeric arrays, but each element is a 2-byte
-    ;     string pointer (into the string heap, or &empty_str when unset) held in its own heap ---
-    const uword SARRHEAP_SIZE = 512          ; 256 element pointers shared across all string arrays
-    uword      sarrheap = memory("vm_sarrheap", SARRHEAP_SIZE, 0)
-    uword[32]  sarr_base          ; byte offset of each string array within sarrheap
-    uword[32]  sarr_len           ; total element count (0 = undimensioned/unusable)
+    ; --- string arrays (DIM A$(...)): real BASIC arrays built by bstr in the ARYTAB..STREND region;
+    ;     each element is a 3-byte descriptor the ROM collector walks. The VM keeps only the per-array
+    ;     dimension metadata (for row-major index math); bstr owns the element storage + rooting. ---
+    const uword SARR_MAXELEM = 8192          ; cap on a string array's element count (dim_setup guard)
+    uword[32]  sarr_len          ; total element count (0 = undimensioned/unusable)
     ubyte[32]  sarr_ndims
     uword      sarr_dims = memory("vm_sarrdims", 32 * pcode.MAXDIMS * 2, 0)
-    uword      sarr_top           ; bump pointer into sarrheap (bytes)
 
     ubyte[16]  inbuf              ; one line of INPUT text (null-terminated)
+    ; OP_PASSTHRU scratch: a low-RAM copy of one tokenized statement handed to ROM BASIC. Low RAM (not
+    ; the banked P-code) so TXTPTR/CHRGET reach it regardless of the current RAM bank. Layout the ROM
+    ; expects: [':' the first CHRGET steps over][statement tokens...][$00 end-of-line]. 256 = dummy +
+    ; up to 254 tokenized bytes (the compiler caps the operand there) + the terminator.
+    ubyte[256] passbuf
+    ; OP_CALLX scratch: xbuf holds a synthesized tokenized X16-function call handed to frmevl; xargs
+    ; holds the argument values popped off the stack (in source order) before they're formatted into
+    ; xbuf; xdest is the address of the stack cell the packed FAC1 result is written back into.
+    ubyte[128] xbuf
+    float[pcode.MAX_XARGS] xargs
+    uword xdest
+    ubyte xslen                  ; OP_CALLXS: length of the string result frmevl returned
+    uword xsptr                  ; OP_CALLXS: heap address of that result's body
 
     sub run(uword base) {
-        uword pc = 0
+        pcbase = base
+        pc = 0
+        halt = false
         sp = 0
         csp = 0
         forsp = 0
         ssp = 0
-        heap_top = 0
+        ; place BASIC's string var table / arrays / heap in the free RAM above the loaded image.
+        ; In-process that's above the resident compiler (progend); standalone it's above the P-code
+        ; and its pools (datatop). bstr grows the var table up and the string heap down from MEMTOP.
+        uword image_top = sys.progend()
+        if datatop > image_top
+            image_top = datatop
+        bstr.init(image_top)
         sys.memset(varsf, 640, 0)        ; all-zero bytes == float 0.0 (BASIC vars start at 0)
         arr_top = 0
         sys.memset(&arr_len, 64, 0)      ; 32 words -> 64 bytes: all numeric arrays undimensioned
-        sarr_top = 0
         sys.memset(&sarr_len, 64, 0)     ; all string arrays undimensioned too
         dataptr = database               ; READ starts at the first DATA item
-        ubyte si
-        for si in 0 to 63 {
-            svars[si] = &empty_str       ; unset string variables read as ""
-        }
-        repeat {
-            ubyte op = @(base + pc)
-            pc++
-            when op {
-                pcode.OP_PUSHI -> {
-                    stack[sp] = mkword(@(base + pc + 1), @(base + pc)) as float
+        %asm {{
+_next:
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)         ; A = opcode at pcbase+pc
+            inc  p8b_vm.p8v_pc             ; pc++ (16-bit)
+            bne  +
+            inc  p8b_vm.p8v_pc+1
++
+            cmp  #67                       ; unknown opcode -> ignore (parity with when no-match)
+            bcs  _next
+            asl  a                         ; *2 for the word table (0..66 -> 0..132)
+            tax
+            jmp  (_optab,x)
+_after:
+            lda  p8b_vm.p8v_halt
+            beq  _next
+            jmp  _end
+_optab:
+            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66
+_t0:                                    ; OP_END -> leave the interpreter loop
+            jmp  _end
+_t1:                                    ; OP_JMP -> pc = target word at pcbase+pc
+            jmp  _setpc
+_t2:                                    ; OP_JZ -> sp--; if stack[sp]==0.0 take the branch
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            asl  a
+            asl  a
+            clc
+            adc  p8b_vm.p8v_sp          ; A = sp*5 (float-cell byte offset)
+            tax
+            lda  p8b_vm.p8v_stack,x     ; MFLPT exponent byte: $00 iff the value is 0.0
+            beq  _setpc                 ; zero -> branch taken
+            lda  p8b_vm.p8v_pc          ; nonzero -> skip the 2-byte target operand
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  _jzdone
+            inc  p8b_vm.p8v_pc+1
+_jzdone:
+            jmp  _next
+_setpc:                                 ; pc = word at pcbase+pc  (shared by JMP and JZ-taken)
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W1),y    ; target hi
+            pha
+            dey
+            lda  (P8ZP_SCRATCH_W1),y    ; target lo
+            sta  p8b_vm.p8v_pc
+            pla
+            sta  p8b_vm.p8v_pc+1
+            jmp  _next
+_t3:
+            jsr  p8b_vm.p8s_op_pushi
+            jmp  _after
+_t4:
+            jsr  p8b_vm.p8s_op_loadv
+            jmp  _after
+_t5:
+            jsr  p8b_vm.p8s_op_storv
+            jmp  _after
+_t6:
+            jsr  p8b_vm.p8s_op_add
+            jmp  _after
+_t7:
+            jsr  p8b_vm.p8s_op_sub
+            jmp  _after
+_t8:
+            jsr  p8b_vm.p8s_op_mul
+            jmp  _after
+_t9:
+            jsr  p8b_vm.p8s_op_div
+            jmp  _after
+_t10:
+            jsr  p8b_vm.p8s_op_neg
+            jmp  _after
+_t11:
+            jsr  p8b_vm.p8s_op_cmpeq
+            jmp  _after
+_t12:
+            jsr  p8b_vm.p8s_op_cmpne
+            jmp  _after
+_t13:
+            jsr  p8b_vm.p8s_op_cmplt
+            jmp  _after
+_t14:
+            jsr  p8b_vm.p8s_op_cmpgt
+            jmp  _after
+_t15:
+            jsr  p8b_vm.p8s_op_cmple
+            jmp  _after
+_t16:
+            jsr  p8b_vm.p8s_op_cmpge
+            jmp  _after
+_t17:
+            jsr  p8b_vm.p8s_op_and
+            jmp  _after
+_t18:
+            jsr  p8b_vm.p8s_op_or
+            jmp  _after
+_t19:
+            jsr  p8b_vm.p8s_op_not
+            jmp  _after
+_t20:
+            jsr  p8b_vm.p8s_op_printi
+            jmp  _after
+_t21:
+            jsr  p8b_vm.p8s_op_prints
+            jmp  _after
+_t22:
+            jsr  p8b_vm.p8s_op_newline
+            jmp  _after
+_t23:
+            jsr  p8b_vm.p8s_op_gosub
+            jmp  _after
+_t24:
+            jsr  p8b_vm.p8s_op_ret
+            jmp  _after
+_t25:
+            jsr  p8b_vm.p8s_op_forpush
+            jmp  _after
+_t26:
+            jsr  p8b_vm.p8s_op_fornext
+            jmp  _after
+_t27:
+            jsr  p8b_vm.p8s_op_pushs
+            jmp  _after
+_t28:
+            jsr  p8b_vm.p8s_op_loads
+            jmp  _after
+_t29:
+            jsr  p8b_vm.p8s_op_stors
+            jmp  _after
+_t30:
+            jsr  p8b_vm.p8s_op_concat
+            jmp  _after
+_t31:
+            jsr  p8b_vm.p8s_op_poke
+            jmp  _after
+_t32:
+            jsr  p8b_vm.p8s_op_peek
+            jmp  _after
+_t33:
+            jsr  p8b_vm.p8s_op_sys
+            jmp  _after
+_t34:
+            jsr  p8b_vm.p8s_op_dim
+            jmp  _after
+_t35:
+            jsr  p8b_vm.p8s_op_aload
+            jmp  _after
+_t36:
+            jsr  p8b_vm.p8s_op_astore
+            jmp  _after
+_t37:
+            jsr  p8b_vm.p8s_op_inputv
+            jmp  _after
+_t38:
+            jsr  p8b_vm.p8s_op_inputs
+            jmp  _after
+_t39:
+            jsr  p8b_vm.p8s_op_pushf
+            jmp  _after
+_t40:
+            jsr  p8b_vm.p8s_op_callfn
+            jmp  _after
+_t41:
+            jsr  p8b_vm.p8s_op_strnum
+            jmp  _after
+_t42:
+            jsr  p8b_vm.p8s_op_numstr
+            jmp  _after
+_t43:
+            jsr  p8b_vm.p8s_op_lefts
+            jmp  _after
+_t44:
+            jsr  p8b_vm.p8s_op_rights
+            jmp  _after
+_t45:
+            jsr  p8b_vm.p8s_op_mids
+            jmp  _after
+_t46:
+            jsr  p8b_vm.p8s_op_read
+            jmp  _after
+_t47:
+            jsr  p8b_vm.p8s_op_reads
+            jmp  _after
+_t48:
+            jsr  p8b_vm.p8s_op_restore
+            jmp  _after
+_t49:
+            jsr  p8b_vm.p8s_op_sdim
+            jmp  _after
+_t50:
+            jsr  p8b_vm.p8s_op_saload
+            jmp  _after
+_t51:
+            jsr  p8b_vm.p8s_op_sastore
+            jmp  _after
+_t52:
+            jsr  p8b_vm.p8s_op_rdnum
+            jmp  _after
+_t53:
+            jsr  p8b_vm.p8s_op_rdstr
+            jmp  _after
+_t54:
+            jsr  p8b_vm.p8s_op_scmp
+            jmp  _after
+_t55:
+            jsr  p8b_vm.p8s_op_open
+            jmp  _after
+_t56:
+            jsr  p8b_vm.p8s_op_close
+            jmp  _after
+_t57:
+            jsr  p8b_vm.p8s_op_getch
+            jmp  _after
+_t58:
+            jsr  p8b_vm.p8s_op_status
+            jmp  _after
+_t59:
+            jsr  p8b_vm.p8s_op_chkout
+            jmp  _after
+_t60:
+            jsr  p8b_vm.p8s_op_chkin
+            jmp  _after
+_t61:
+            jsr  p8b_vm.p8s_op_clrch
+            jmp  _after
+_t62:
+            jsr  p8b_vm.p8s_op_pow
+            jmp  _after
+_t63:
+            jsr  p8b_vm.p8s_op_wait
+            jmp  _after
+_t64:
+            jsr  p8b_vm.p8s_op_passthru
+            jmp  _after
+_t65:
+            jsr  p8b_vm.p8s_op_callx
+            jmp  _after
+_t66:
+            jsr  p8b_vm.p8s_op_callxs
+            jmp  _after
+_end:
+        }}
+    }
+
+    ; OP_END / OP_JMP / OP_JZ (opcodes 0/1/2) are handled inline in run()'s asm dispatch
+    ; (_t0/_t1/_t2): END exits the loop, JMP/JZ set pc directly, JZ tests the MFLPT exponent
+    ; byte instead of a ROM float-compare. No Prog8 handler subs are needed for them.
+    sub op_pushi() {
+                    stack[sp] = mkword(@(pcbase + pc + 1), @(pcbase + pc)) as float
                     pc += 2
                     sp++
                 }
-                pcode.OP_PUSHF -> {
-                    stack[sp] = peekf(base + pc)         ; 5-byte float immediate
-                    pc += 5
-                    sp++
-                }
-                pcode.OP_LOADV -> {
-                    stack[sp] = peekf(varsf + (@(base + pc) as uword) * 5)
+    sub op_loadv() {
+                    stack[sp] = peekf(varsf + (@(pcbase + pc) as uword) * 5)
                     pc += 2
                     sp++
                 }
-                pcode.OP_STORV -> {
+    sub op_storv() {
                     sp--
-                    pokef(varsf + (@(base + pc) as uword) * 5, stack[sp])
+                    pokef(varsf + (@(pcbase + pc) as uword) * 5, stack[sp])
                     pc += 2
                 }
-                pcode.OP_ADD -> {
+    sub op_add() {
                     sp--
                     stack[sp-1] += stack[sp]
                 }
-                pcode.OP_SUB -> {
+    sub op_sub() {
                     sp--
                     stack[sp-1] -= stack[sp]
                 }
-                pcode.OP_MUL -> {
+    sub op_mul() {
                     sp--
                     stack[sp-1] *= stack[sp]
                 }
-                pcode.OP_DIV -> {
+    sub op_div() {
                     sp--
                     stack[sp-1] /= stack[sp]
                 }
-                pcode.OP_POW -> {                    ; a ^ b  (float power via ROM's FPWR)
-                    sp--
-                    stack[sp-1] = floats.pow(stack[sp-1], stack[sp])
-                }
-                pcode.OP_NEG -> {
+    sub op_neg() {
                     stack[sp-1] = -stack[sp-1]
                 }
-                pcode.OP_CMPEQ -> {
+    sub op_cmpeq() {
                     sp--
                     stack[sp-1] = bool_to_float(stack[sp-1] == stack[sp])
                 }
-                pcode.OP_CMPNE -> {
+    sub op_cmpne() {
                     sp--
                     stack[sp-1] = bool_to_float(stack[sp-1] != stack[sp])
                 }
-                pcode.OP_CMPLT -> {
+    sub op_cmplt() {
                     sp--
                     stack[sp-1] = bool_to_float(stack[sp-1] < stack[sp])
                 }
-                pcode.OP_CMPGT -> {
+    sub op_cmpgt() {
                     sp--
                     stack[sp-1] = bool_to_float(stack[sp-1] > stack[sp])
                 }
-                pcode.OP_CMPLE -> {
+    sub op_cmple() {
                     sp--
                     stack[sp-1] = bool_to_float(stack[sp-1] <= stack[sp])
                 }
-                pcode.OP_CMPGE -> {
+    sub op_cmpge() {
                     sp--
                     stack[sp-1] = bool_to_float(stack[sp-1] >= stack[sp])
                 }
-                pcode.OP_AND -> {                        ; bitwise AND of the two 16-bit values
+    sub op_and() {                        ; bitwise AND of the two 16-bit values
                     sp--
                     stack[sp-1] = ((as_bits(stack[sp-1]) & as_bits(stack[sp])) as word) as float
                 }
-                pcode.OP_OR -> {                         ; bitwise OR
+    sub op_or() {                         ; bitwise OR
                     sp--
                     stack[sp-1] = ((as_bits(stack[sp-1]) | as_bits(stack[sp])) as word) as float
                 }
-                pcode.OP_NOT -> {                        ; bitwise complement (NOT x == -(x+1))
+    sub op_not() {                        ; bitwise complement (NOT x == -(x+1))
                     stack[sp-1] = ((~ as_bits(stack[sp-1])) as word) as float
                 }
-                pcode.OP_JMP -> {
-                    pc = mkword(@(base + pc + 1), @(base + pc))
-                }
-                pcode.OP_JZ -> {
+    sub op_printi() {
                     sp--
-                    if stack[sp] == 0.0
-                        pc = mkword(@(base + pc + 1), @(base + pc))
-                    else
-                        pc += 2
+                    last_printed = stack[sp] as word     ; truncated integer, for the mailbox
+                    print_float(stack[sp])               ; BASIC-formatted, no newline
                 }
-                pcode.OP_GOSUB -> {
-                    uword target = mkword(@(base + pc + 1), @(base + pc))
+    sub op_prints() {
+                    ssp--
+                    uword psd = sstack[ssp]
+                    print_desc(psd)                       ; length-counted (bodies aren't null-terminated)
+                    bstr.free_temp_if_top(psd)            ; a printed temp is done -> reclaim its slot
+                }
+    sub op_newline() {
+                    emit_char(13)                         ; CR to screen, LF to host console
+                }
+    sub op_gosub() {
+                    uword target = mkword(@(pcbase + pc + 1), @(pcbase + pc))
                     pc += 2
                     callstack[csp] = pc          ; return here
                     csp++
                     pc = target
                 }
-                pcode.OP_RET -> {
+    sub op_ret() {
                     csp--
                     pc = callstack[csp]
                 }
-                pcode.OP_FORPUSH -> {
-                    ubyte slot = @(base + pc)    ; slot < 128, fits in a byte
+    sub op_forpush() {
+                    ubyte slot = @(pcbase + pc)    ; slot < 128, fits in a byte
                     pc += 2
                     sp--
                     float stepv = stack[sp]      ; step was pushed last
@@ -210,7 +485,7 @@ vm {
                     for_top[forsp] = pc          ; body starts right after this opcode
                     forsp++
                 }
-                pcode.OP_FORNEXT -> {
+    sub op_fornext() {
                     ubyte top = forsp - 1
                     uword vaddr = varsf + (for_var[top] as uword) * 5
                     float nv = peekf(vaddr) + for_step[top]
@@ -225,67 +500,55 @@ vm {
                     else
                         forsp--                  ; loop finished; pop the frame
                 }
-                pcode.OP_PRINTI -> {
+    sub op_pushs() {
+                    ; operand is an offset into the literal pool; litbase makes it absolute. Literal
+                    ; bodies are off-heap (program text) -> a scratch descriptor over them, which the
+                    ; collector ignores (never rooted, never moved), so the same P-code works both
+                    ; in-process and in a standalone .PRG.
+                    push_cstr(litbase + mkword(@(pcbase + pc + 1), @(pcbase + pc)))
+                    pc += 2
+                }
+    sub op_loads() {
+                    sstack[ssp] = bstr.vdesc(@(pcbase + pc))    ; push the variable's descriptor address
+                    ssp++
+                    pc += 2
+                }
+    sub op_stors() {
+                    ssp--
+                    bstr.store_var(@(pcbase + pc), sstack[ssp]) ; heap-copy / steal-temp assignment
+                    pc += 2
+                }
+    sub op_concat() {
+                    ; result = a + b, produced as a BASIC temp. concat_temp allocates the result body
+                    ; while a/b are still rooted (a GC during getspa relocates them), copies, frees any
+                    ; operand temps top-first, then pushes the result temp. A total > 255 sets
+                    ; err_toolong -> ?STRING TOO LONG (checked by str_error).
+                    uword b = sstack[ssp-1]
+                    uword a = sstack[ssp-2]
+                    uword cres = bstr.concat_temp(a, b)
+                    if str_error()
+                        return
+                    ssp -= 2
+                    sstack[ssp] = cres
+                    ssp++
+                }
+    sub op_poke() {
                     sp--
-                    last_printed = stack[sp] as word     ; truncated integer, for the mailbox
-                    print_float(stack[sp])               ; BASIC-formatted, no newline
+                    ubyte v = lsb(stack[sp] as uword)    ; value (low byte)
+                    sp--
+                    @(stack[sp] as uword) = v            ; ...into the target address
                 }
-                pcode.OP_PRINTS -> {
-                    ssp--
-                    print_cstr(sstack[ssp])
+    sub op_peek() {
+                    stack[sp-1] = @(stack[sp-1] as uword) as float   ; addr -> byte 0..255
                 }
-                pcode.OP_NEWLINE -> {
-                    emit_char(13)                         ; CR to screen, LF to host console
+    sub op_sys() {
+                    sp--
+                    sys_target = stack[sp] as uword
+                    sys_call()                            ; JSR to sys_target, returns here
                 }
-                pcode.OP_PUSHS -> {
-                    ; operand is an offset into the literal pool; litbase makes it absolute,
-                    ; so the same P-code works both in-process and in a standalone .PRG
-                    sstack[ssp] = litbase + mkword(@(base + pc + 1), @(base + pc))
-                    ssp++
-                    pc += 2
-                }
-                pcode.OP_LOADS -> {
-                    sstack[ssp] = svars[@(base + pc)]
-                    ssp++
-                    pc += 2
-                }
-                pcode.OP_STORS -> {
-                    ssp--
-                    svars[@(base + pc)] = sstack[ssp]
-                    pc += 2
-                }
-                pcode.OP_CONCAT -> {
-                    ; BASIC caps strings at 255 chars because the length is one byte -- and our
-                    ; strings.length/copy are ubyte too, so a longer string would wrap and corrupt the
-                    ; heap. Enforce it here (as the ROM does with ?STRING TOO LONG), computing the total
-                    ; in uword so the check itself can't wrap. Both operands are <=255 by induction.
-                    uword ctot = (strings.length(sstack[ssp-1]) as uword) + strings.length(sstack[ssp-2])
-                    if ctot > 255 {
-                        print_cstr(&str_long_msg)
-                        emit_char(13)
-                        return
-                    }
-                    ; reserve while both operands are still on sstack (so a GC keeps + relocates them),
-                    ; then re-read a/b -- gc_ensure may have compacted the heap and moved them.
-                    uword cneed = ctot + 1
-                    if not gc_ensure(cneed)
-                        return
-                    ssp--
-                    uword b = sstack[ssp]
-                    ssp--
-                    uword a = sstack[ssp]
-                    uword dst = heap + heap_top
-                    ubyte la = strings.copy(a, dst)
-                    ubyte lb = strings.copy(b, dst + la)
-                    heap_top += la
-                    heap_top += lb
-                    heap_top++                            ; the terminating null
-                    sstack[ssp] = dst
-                    ssp++
-                }
-                pcode.OP_DIM -> {                        ; DIM A(d0[,d1..]): allocate a numeric array
-                    ubyte adslot = @(base + pc)          ; imm16 slot (low byte; slot < 256)
-                    ubyte adnd = @(base + pc + 2)        ; ndims byte follows the 2-byte slot
+    sub op_dim() {                        ; DIM A(d0[,d1..]): allocate a numeric array
+                    ubyte adslot = @(pcbase + pc)          ; imm16 slot (low byte; slot < 256)
+                    ubyte adnd = @(pcbase + pc + 2)        ; ndims byte follows the 2-byte slot
                     pc += 3
                     uword adtot = dim_setup(arr_dims, adslot, adnd, ARRHEAP_SIZE / 5)
                     if adtot != 0 and arr_top + adtot * 5 <= ARRHEAP_SIZE {
@@ -297,9 +560,9 @@ vm {
                         arr_len[adslot] = 0                  ; too big / out of heap -> unusable
                     }
                 }
-                pcode.OP_ALOAD -> {                      ; A(i[,j..]): push the element (0 if out of range)
-                    ubyte alslot = @(base + pc)
-                    ubyte alnd = @(base + pc + 2)
+    sub op_aload() {                      ; A(i[,j..]): push the element (0 if out of range)
+                    ubyte alslot = @(pcbase + pc)
+                    ubyte alnd = @(pcbase + pc + 2)
                     pc += 3
                     uword aloff = index_of(arr_dims, alslot, alnd, sp - alnd, arr_len[alslot])
                     sp -= alnd
@@ -309,9 +572,9 @@ vm {
                         stack[sp] = 0.0
                     sp++
                 }
-                pcode.OP_ASTORE -> {                     ; A(i[,j..])=v: store into the element (dropped if out of range)
-                    ubyte asslot = @(base + pc)
-                    ubyte asnd = @(base + pc + 2)
+    sub op_astore() {                     ; A(i[,j..])=v: store into the element (dropped if out of range)
+                    ubyte asslot = @(pcbase + pc)
+                    ubyte asnd = @(pcbase + pc + 2)
                     pc += 3
                     sp--
                     float asval = stack[sp]                  ; value was pushed after the subscripts
@@ -320,211 +583,176 @@ vm {
                     if asoff != $ffff
                         pokef(arrheap + arr_base[asslot] + asoff * 5, asval)
                 }
-                pcode.OP_SDIM -> {                       ; DIM A$(...): allocate a string array (elements start "")
-                    ubyte sdslot = @(base + pc)
-                    ubyte sdnd = @(base + pc + 2)
+    sub op_inputv() {
+                    ubyte ivslot = @(pcbase + pc)
+                    pc += 2
+                    read_line()
+                    pokef(varsf + (ivslot as uword) * 5, floats.parse(&inbuf))
+                }
+    sub op_inputs() {
+                    ubyte isslot = @(pcbase + pc)
+                    pc += 2
+                    read_line()
+                    bstr.var_from_mem(isslot, &inbuf, strings.length(&inbuf))   ; heap-copy into the var
+                }
+    sub op_pushf() {
+                    stack[sp] = peekf(pcbase + pc)         ; 5-byte float immediate
+                    pc += 5
+                    sp++
+                }
+    sub op_callfn() {
+                    ubyte fnid = @(pcbase + pc)
+                    pc++
+                    stack[sp-1] = apply_fn(fnid, stack[sp-1])
+                }
+    sub op_strnum() {                     ; LEN/ASC/VAL: pop string, push number
+                    ubyte snid = @(pcbase + pc)
+                    pc++
+                    ssp--
+                    uword snd = sstack[ssp]
+                    when snid {
+                        pcode.SN_LEN -> stack[sp] = bstr.dlen(snd) as float
+                        pcode.SN_ASC -> {
+                            if bstr.dlen(snd) == 0
+                                stack[sp] = 0.0                          ; ASC("") -> 0 (as the ported VM did)
+                            else
+                                stack[sp] = @(bstr.dptr(snd)) as float    ; PETSCII of the first char
+                        }
+                        pcode.SN_VAL -> stack[sp] = floats.parse(bstr.to_cbuf(snd))   ; parse needs a null
+                    }
+                    sp++
+                    bstr.free_temp_if_top(snd)               ; the consumed string temp is done
+                }
+    sub op_numstr() {                     ; CHR$/STR$: pop number, push a string temp
+                    ubyte nsid = @(pcbase + pc)
+                    pc++
+                    sp--
+                    uword nsres = 0
+                    when nsid {
+                        pcode.NS_CHR -> nsres = bstr.chr_temp(lsb(stack[sp] as uword))   ; one PETSCII char
+                        pcode.NS_STR -> {
+                            uword nssrc = floats.tostr(stack[sp])       ; ROM buffer, off-heap/stable
+                            if @(nssrc) == ' '
+                                nssrc++                                 ; match PRINT: drop FOUT's lead space
+                            nsres = bstr.mem_to_temp(nssrc, strings.length(nssrc))
+                        }
+                    }
+                    if str_error()
+                        return
+                    sstack[ssp] = nsres
+                    ssp++
+                }
+    sub op_lefts() {                      ; LEFT$(s,n): first n chars
+                    sp--
+                    ubyte lfn = clamp_count(stack[sp])
+                    ssp--
+                    uword lfsrc = sstack[ssp]
+                    uword lfres = bstr.substr_temp(lfsrc, 0, lfn)   ; frees src temp, pushes result temp
+                    if str_error()
+                        return
+                    sstack[ssp] = lfres
+                    ssp++
+                }
+    sub op_rights() {                     ; RIGHT$(s,n): last n chars
+                    sp--
+                    ubyte rtn = clamp_count(stack[sp])
+                    ssp--
+                    uword rtsrc = sstack[ssp]
+                    ubyte rtlen = bstr.dlen(rtsrc)
+                    ubyte rtstart = 0
+                    if rtn < rtlen
+                        rtstart = rtlen - rtn
+                    uword rtres = bstr.substr_temp(rtsrc, rtstart, rtn)
+                    if str_error()
+                        return
+                    sstack[ssp] = rtres
+                    ssp++
+                }
+    sub op_mids() {                       ; MID$(s,start,len): substring, start 1-based
+                    sp--
+                    ubyte mdlen = clamp_count(stack[sp])
+                    sp--
+                    word mdstart = stack[sp] as word
+                    ssp--
+                    uword mdsrc = sstack[ssp]
+                    ubyte mds0 = 0
+                    if mdstart > 256
+                        mds0 = 255                                      ; past end -> empty
+                    else if mdstart >= 1
+                        mds0 = (mdstart - 1) as ubyte
+                    uword mdres = bstr.substr_temp(mdsrc, mds0, mdlen)
+                    if str_error()
+                        return
+                    sstack[ssp] = mdres
+                    ssp++
+                }
+    sub op_read() {                       ; READ into a numeric var: parse the item
+                    ubyte rdslot = @(pcbase + pc)
+                    pc += 2
+                    pokef(varsf + (rdslot as uword) * 5, floats.parse(data_next()))
+                }
+    sub op_reads() {                      ; READ into a string var: heap-copy the item
+                    ubyte rsslot = @(pcbase + pc)
+                    pc += 2
+                    uword rssrc = data_next()            ; DATA-pool text (off-heap, stable)
+                    bstr.var_from_mem(rsslot, rssrc, strings.length(rssrc))
+                }
+    sub op_restore() {                    ; rewind the DATA cursor to the first item
+                    dataptr = database
+                }
+    sub op_sdim() {                       ; DIM A$(...): allocate a BASIC string array
+                    ubyte sdslot = @(pcbase + pc)
+                    ubyte sdnd = @(pcbase + pc + 2)
                     pc += 3
-                    uword sdtot = dim_setup(sarr_dims, sdslot, sdnd, SARRHEAP_SIZE / 2)
-                    if sdtot != 0 and sarr_top + sdtot * 2 <= SARRHEAP_SIZE {
-                        sarr_base[sdslot] = sarr_top
+                    uword sdtot = dim_setup(sarr_dims, sdslot, sdnd, SARR_MAXELEM)
+                    if sdtot != 0 and bstr.sarr_alloc(sdslot, sdtot, sdnd) {
                         sarr_len[sdslot] = sdtot
                         sarr_ndims[sdslot] = sdnd
-                        uword sdp = sarrheap + sarr_top
-                        uword sdi = 0
-                        while sdi < sdtot {
-                            pokew(sdp, &empty_str)           ; unset elements read as ""
-                            sdp += 2
-                            sdi++
-                        }
-                        sarr_top += sdtot * 2
                     } else {
-                        sarr_len[sdslot] = 0
+                        sarr_len[sdslot] = 0                  ; too big / out of memory -> unusable
                     }
                 }
-                pcode.OP_SALOAD -> {                     ; A$(i[,j..]): push the element string ("" if out of range)
-                    ubyte slslot = @(base + pc)
-                    ubyte slnd = @(base + pc + 2)
+    sub op_saload() {                     ; A$(i[,j..]): push the element's descriptor ("" if out of range)
+                    ubyte slslot = @(pcbase + pc)
+                    ubyte slnd = @(pcbase + pc + 2)
                     pc += 3
                     uword sloff = index_of(sarr_dims, slslot, slnd, sp - slnd, sarr_len[slslot])
                     sp -= slnd
-                    if sloff != $ffff
-                        sstack[ssp] = peekw(sarrheap + sarr_base[slslot] + sloff * 2)
-                    else
-                        sstack[ssp] = &empty_str
-                    ssp++
+                    if sloff != $ffff {
+                        sstack[ssp] = bstr.sarr_desc(slslot, sloff)   ; a live, self-relocating GC root
+                        ssp++
+                    } else {
+                        push_empty()                                  ; out of range reads as ""
+                    }
                 }
-                pcode.OP_SASTORE -> {                    ; A$(i[,j..])=v$: store the element (dropped if out of range)
-                    ubyte ssslot = @(base + pc)
-                    ubyte ssnd = @(base + pc + 2)
+    sub op_sastore() {                    ; A$(i[,j..])=v$: store the element (dropped if out of range)
+                    ubyte ssslot = @(pcbase + pc)
+                    ubyte ssnd = @(pcbase + pc + 2)
                     pc += 3
                     ssp--
                     uword ssval = sstack[ssp]                ; the string value, pushed after the subscripts
                     uword ssoff = index_of(sarr_dims, ssslot, ssnd, sp - ssnd, sarr_len[ssslot])
                     sp -= ssnd
                     if ssoff != $ffff
-                        pokew(sarrheap + sarr_base[ssslot] + ssoff * 2, ssval)
+                        bstr.store_desc(bstr.sarr_desc(ssslot, ssoff), ssval)   ; heap-copy / steal-temp
+                    else
+                        bstr.free_temp_if_top(ssval)         ; store dropped, but still free a temp value
                 }
-                pcode.OP_INPUTV -> {
-                    ubyte ivslot = @(base + pc)
-                    pc += 2
-                    read_line()
-                    pokef(varsf + (ivslot as uword) * 5, floats.parse(&inbuf))
-                }
-                pcode.OP_INPUTS -> {
-                    ubyte isslot = @(base + pc)
-                    pc += 2
-                    read_line()
-                    if not gc_ensure(strings.length(&inbuf) as uword + 1)
-                        return
-                    uword idst = heap + heap_top          ; keep the entered text on the string heap
-                    ubyte iln = strings.copy(&inbuf, idst)
-                    heap_top += iln
-                    heap_top++
-                    svars[isslot] = idst
-                }
-                pcode.OP_POKE -> {
-                    sp--
-                    ubyte v = lsb(stack[sp] as uword)    ; value (low byte)
-                    sp--
-                    @(stack[sp] as uword) = v            ; ...into the target address
-                }
-                pcode.OP_PEEK -> {
-                    stack[sp-1] = @(stack[sp-1] as uword) as float   ; addr -> byte 0..255
-                }
-                pcode.OP_WAIT -> {                   ; WAIT addr,mask,xor: spin until (peek(addr) ^ xor) & mask
-                    sp--
-                    ubyte wxor = lsb(stack[sp] as uword)
-                    sp--
-                    ubyte wmask = lsb(stack[sp] as uword)
-                    sp--
-                    uword waddr = stack[sp] as uword
-                    while ((@(waddr) ^ wxor) & wmask) == 0 {
-                        ; spin until the masked bits (after the XOR flip) go nonzero
-                    }
-                }
-                pcode.OP_CALLFN -> {
-                    ubyte fnid = @(base + pc)
-                    pc++
-                    stack[sp-1] = apply_fn(fnid, stack[sp-1])
-                }
-                pcode.OP_STRNUM -> {                     ; LEN/ASC/VAL: pop string, push number
-                    ubyte snid = @(base + pc)
-                    pc++
-                    ssp--
-                    uword snstr = sstack[ssp]
-                    when snid {
-                        pcode.SN_LEN -> stack[sp] = strings.length(snstr) as float
-                        pcode.SN_ASC -> stack[sp] = @(snstr) as float   ; first byte (0 if empty)
-                        pcode.SN_VAL -> stack[sp] = floats.parse(snstr)
-                    }
-                    sp++
-                }
-                pcode.OP_NUMSTR -> {                     ; CHR$/STR$: pop number, push heap string
-                    ubyte nsid = @(base + pc)
-                    pc++
-                    sp--
-                    uword nsdst = 0                                     ; assigned in each branch after its GC
-                    when nsid {
-                        pcode.NS_CHR -> {
-                            if not gc_ensure(2)
-                                return
-                            nsdst = heap + heap_top                     ; derive AFTER a possible GC
-                            @(nsdst) = lsb(stack[sp] as uword)          ; one PETSCII char
-                            @(nsdst + 1) = 0
-                            heap_top += 2
-                        }
-                        pcode.NS_STR -> {
-                            uword nssrc = floats.tostr(stack[sp])       ; ROM buffer, stable across a GC
-                            if @(nssrc) == ' '
-                                nssrc++                                 ; match PRINT: drop FOUT's lead space
-                            if not gc_ensure(strings.length(nssrc) as uword + 1)
-                                return
-                            nsdst = heap + heap_top
-                            ubyte nsn = strings.copy(nssrc, nsdst)
-                            heap_top += nsn
-                            heap_top++
-                        }
-                    }
-                    sstack[ssp] = nsdst
-                    ssp++
-                }
-                pcode.OP_LEFTS -> {                      ; LEFT$(s,n): first n chars
-                    sp--
-                    ubyte lfn = clamp_count(stack[sp])
-                    if not gc_ensure(lfn as uword + 1)   ; src still on sstack -> protected across a GC
-                        return
-                    ssp--
-                    uword lfsrc = sstack[ssp]            ; re-read: gc_ensure may have compacted the heap
-                    sstack[ssp] = substr(lfsrc, 0, lfn)
-                    ssp++
-                }
-                pcode.OP_RIGHTS -> {                     ; RIGHT$(s,n): last n chars
-                    sp--
-                    ubyte rtn = clamp_count(stack[sp])
-                    if not gc_ensure(rtn as uword + 1)
-                        return
-                    ssp--
-                    uword rtsrc = sstack[ssp]            ; re-read: gc_ensure may have compacted the heap
-                    ubyte rtlen = strings.length(rtsrc)
-                    ubyte rtstart = 0
-                    if rtn < rtlen
-                        rtstart = rtlen - rtn
-                    sstack[ssp] = substr(rtsrc, rtstart, rtn)
-                    ssp++
-                }
-                pcode.OP_MIDS -> {                       ; MID$(s,start,len): substring, start 1-based
-                    sp--
-                    ubyte mdlen = clamp_count(stack[sp])
-                    sp--
-                    word mdstart = stack[sp] as word
-                    if not gc_ensure(mdlen as uword + 1)
-                        return
-                    ssp--
-                    uword mdsrc = sstack[ssp]            ; re-read: gc_ensure may have compacted the heap
-                    ubyte mds0 = 0
-                    if mdstart > 256
-                        mds0 = 255                                      ; past end -> empty
-                    else if mdstart >= 1
-                        mds0 = (mdstart - 1) as ubyte
-                    sstack[ssp] = substr(mdsrc, mds0, mdlen)
-                    ssp++
-                }
-                pcode.OP_READ -> {                       ; READ into a numeric var: parse the item
-                    ubyte rdslot = @(base + pc)
-                    pc += 2
-                    pokef(varsf + (rdslot as uword) * 5, floats.parse(data_next()))
-                }
-                pcode.OP_READS -> {                      ; READ into a string var: heap-copy the item
-                    ubyte rsslot = @(base + pc)
-                    pc += 2
-                    uword rssrc = data_next()            ; DATA-pool text (stable across a GC)
-                    if not gc_ensure(strings.length(rssrc) as uword + 1)
-                        return
-                    uword rsdst = heap + heap_top
-                    ubyte rsn = strings.copy(rssrc, rsdst)
-                    heap_top += rsn
-                    heap_top++
-                    svars[rsslot] = rsdst
-                }
-                pcode.OP_RESTORE -> {                    ; rewind the DATA cursor to the first item
-                    dataptr = database
-                }
-                pcode.OP_RDNUM -> {                      ; READ into an array element: push the item as a number
+    sub op_rdnum() {                      ; READ into an array element: push the item as a number
                     stack[sp] = floats.parse(data_next())
                     sp++
                 }
-                pcode.OP_RDSTR -> {                      ; READ into a string-array element: push the item text
-                    sstack[ssp] = data_next()            ; the pool text persists all run -> no heap copy needed
-                    ssp++
+    sub op_rdstr() {                      ; READ into a string-array element: push the item text
+                    push_cstr(data_next())               ; off-heap DATA text -> scratch descriptor
                 }
-                pcode.OP_SCMP -> {                       ; compare two strings -> numeric truth (-1/0)
-                    ubyte scid = @(base + pc)
+    sub op_scmp() {                       ; compare two strings -> numeric truth (-1/0)
+                    ubyte scid = @(pcbase + pc)
                     pc++
                     ssp--
                     uword scb = sstack[ssp]              ; right operand (pushed last)
                     ssp--
                     uword sca = sstack[ssp]              ; left operand
-                    byte rel = strings.compare(sca, scb) ; -1 if a<b, 0 if equal, 1 if a>b
+                    byte rel = bstr.bcompare(sca, scb)   ; -1 if a<b, 0 if equal, 1 if a>b (length-counted)
                     bool scres = false
                     when scid {
                         pcode.SC_EQ -> scres = rel == 0
@@ -536,13 +764,10 @@ vm {
                     }
                     stack[sp] = bool_to_float(scres)
                     sp++
+                    bstr.free_temp_if_top(scb)           ; free operand temps top-first
+                    bstr.free_temp_if_top(sca)
                 }
-                pcode.OP_SYS -> {
-                    sp--
-                    sys_target = stack[sp] as uword
-                    sys_call()                            ; JSR to sys_target, returns here
-                }
-                pcode.OP_OPEN -> {                        ; OPEN lfn,dev,sa,"name"
+    sub op_open() {                        ; OPEN lfn,dev,sa,"name"
                     sp--
                     ubyte o_sa  = lsb(stack[sp] as uword)
                     sp--
@@ -551,129 +776,301 @@ vm {
                     ubyte o_lfn = lsb(stack[sp] as uword)
                     ssp--
                     uword o_name = sstack[ssp]
-                    cbm.SETNAM(strings.length(o_name), o_name)
+                    cbm.SETNAM(bstr.dlen(o_name), bstr.dptr(o_name))
                     cbm.SETLFS(o_lfn, o_dev, o_sa)
                     void cbm.OPEN()
+                    bstr.free_temp_if_top(o_name)
                 }
-                pcode.OP_CLOSE -> {                       ; CLOSE lfn
+    sub op_close() {                       ; CLOSE lfn
                     sp--
                     cbm.CLOSE(lsb(stack[sp] as uword))
                 }
-                pcode.OP_GETCH -> {                       ; GET#lfn,v$ : one byte -> a 0/1-char heap string
+    sub op_getch() {                       ; GET#lfn,v$ : one byte -> a 0/1-char string
                     sp--
                     void cbm.CHKIN(lsb(stack[sp] as uword))
                     ubyte g_ch = cbm.CHRIN()
                     cbm.CLRCHN()
-                    if not gc_ensure(2)                   ; g_ch is a local -> stable across a GC
-                        return
-                    uword g_dst = heap + heap_top
-                    @(g_dst) = g_ch                       ; g_ch==0 -> "" (empty), else a 1-char string
-                    @(g_dst + 1) = 0
-                    heap_top += 2
-                    sstack[ssp] = g_dst
-                    ssp++
+                    if g_ch == 0 {
+                        push_empty()                      ; no byte available -> ""
+                    } else {
+                        uword g_res = bstr.chr_temp(g_ch) ; a 1-char temp
+                        if str_error()
+                            return
+                        sstack[ssp] = g_res
+                        ssp++
+                    }
                 }
-                pcode.OP_STATUS -> {                      ; ST : the KERNAL I/O status word
+    sub op_status() {                      ; ST : the KERNAL I/O status word
                     stack[sp] = cbm.READST() as float
                     sp++
                 }
-                pcode.OP_CHKOUT -> {                      ; PRINT#lfn : redirect the following PRINTs
+    sub op_chkout() {                      ; PRINT#lfn : redirect the following PRINTs
                     sp--
                     cbm.CHKOUT(lsb(stack[sp] as uword))
                 }
-                pcode.OP_CHKIN -> {                       ; INPUT#lfn : redirect the following INPUT
+    sub op_chkin() {                       ; INPUT#lfn : redirect the following INPUT
                     sp--
                     void cbm.CHKIN(lsb(stack[sp] as uword))
                 }
-                pcode.OP_CLRCH -> {                       ; end a PRINT#/INPUT#, restore default I/O
+    sub op_clrch() {                       ; end a PRINT#/INPUT#, restore default I/O
                     cbm.CLRCHN()
                 }
-                pcode.OP_END -> {
-                    return
+    sub op_pow() {                    ; a ^ b  (float power via ROM's FPWR)
+                    sp--
+                    stack[sp-1] = floats.pow(stack[sp-1], stack[sp])
                 }
+    sub op_wait() {                   ; WAIT addr,mask,xor: spin until (peek(addr) ^ xor) & mask
+                    sp--
+                    ubyte wxor = lsb(stack[sp] as uword)
+                    sp--
+                    ubyte wmask = lsb(stack[sp] as uword)
+                    sp--
+                    uword waddr = stack[sp] as uword
+                    while ((@(waddr) ^ wxor) & wmask) == 0 {
+                        ; spin until the masked bits (after the XOR flip) go nonzero
+                    }
+                }
+
+    ; OP_PASSTHRU: hand one tokenized BASIC statement to the ROM interpreter (leaf/extension
+    ; statements -- VERA/sound/graphics/disk -- that run and RTS back). The operand is a length byte
+    ; then that many (marker-encoded) tokenized bytes; we expand them into low-RAM passbuf framed as
+    ; [':'][bytes][$00], point TXTPTR at it, page in BASIC ROM, prime CHRGET, and JSR gone3. Banks are
+    ; saved/restored so a statement that touches banking (or the in-process banked P-code) is safe.
+    ;
+    ; A $01<slot> marker is a scalar GPC numeric variable the compiler couldn't leave as a name (the ROM
+    ; would look it up in BASIC's variable table, where GPC's vars don't live -- see parse_passthru). We
+    ; splice in the variable's current value as ASCII decimal, so a statement like `VPOKE 0,A,V` reaches
+    ; the ROM as `VPOKE 0,4660,66`. Markers are only honoured OUTSIDE quoted strings.
+    sub op_passthru() {
+        ubyte plen = @(pcbase + pc)
+        passbuf[0] = $3a                          ; ':' -- CHRGET pre-increments past it to the first token
+        ubyte w = 1                               ; passbuf write index (byte-sized; bounded < 254 below)
+        ubyte i = 0
+        bool inq = false
+        while i < plen and w < 254 {
+            ubyte ch = @(pcbase + pc + 1 + i)
+            i++
+            if inq {
+                passbuf[w] = ch
+                w++
+                if ch == '"'
+                    inq = false
+            } else if ch == '"' {
+                passbuf[w] = ch
+                w++
+                inq = true
+            } else if ch == $01 {
+                ubyte slot = @(pcbase + pc + 1 + i)   ; variable marker -> splice its value as ASCII decimal
+                i++
+                uword ds = floats.tostr(peekf(varsf + (slot as uword) * 5))
+                if @(ds) == ' '
+                    ds++                          ; drop STR$'s leading sign-space (CHRGET would skip it anyway)
+                while @(ds) != 0 and w < 254 {
+                    passbuf[w] = @(ds)
+                    w++
+                    ds++
+                }
+            } else {
+                passbuf[w] = ch
+                w++
             }
         }
+        passbuf[w] = 0                            ; end-of-line: gone3 runs exactly this one statement
+        pc += (plen as uword) + 1                 ; step past the length byte + the (marker-encoded) bytes
+        %asm {{
+            lda  #<p8b_vm.p8v_passbuf
+            sta  $ee                              ; TXTPTR lo
+            lda  #>p8b_vm.p8v_passbuf
+            sta  $ef                              ; TXTPTR hi
+            stz  $03eb                            ; curlin = 0 (program mode, not $FFxx direct)
+            stz  $03ec
+            lda  $00
+            pha                                   ; save RAM bank (the P-code bank, in-process)
+            lda  $01
+            pha                                   ; save ROM bank
+            lda  #4
+            sta  $01                              ; page in BASIC ROM
+            jsr  $00e7                            ; CHRGET: step past ':', read the first token
+            jsr  $cc63                            ; gone3: dispatch + run the statement, RTS back
+            pla
+            sta  $01                              ; restore ROM bank
+            pla
+            sta  $00                              ; restore RAM bank
+        }}
     }
 
-    ; --- string-heap garbage collection --------------------------------------------------------
-    ; The heap is a bump arena of null-terminated strings; concat/slice/CHR$/INPUT/READ abandon the
-    ; old copies, so it fills with garbage. We mirror the 1986 Blitz exactly: it bump-allocated
-    ; strings downward and only JSR'd the C64 ROM's GARBAG collector *on collision*, then re-checked
-    ; and raised OUT OF MEMORY if that still didn't free enough (BLITZ.prg $1f7a). We can't borrow a
-    ; ROM collector on the X16 (its string internals are undocumented, like SYSPASS), so we compact
-    ; over our own roots instead. gc_ensure() is called at every allocation site with the exact byte
-    ; count needed; it collects only when the fast bump would overflow.
-
-    ; Ensure `need` free bytes on the heap. Fast path: already fits. Else compact and re-check; if it
-    ; still won't fit, print ?OUT OF MEMORY and return false so the caller halts run().
-    sub gc_ensure(uword need) -> bool {
-        if heap_top + need <= HEAP_SIZE
-            return true
-        gc_collect()
-        if heap_top + need <= HEAP_SIZE
-            return true
-        print_cstr(&heap_full_msg)
-        emit_char(13)
-        return false
-    }
-
-    ; Mark-compact: slide every string still reachable from a root down to the bottom of the heap
-    ; (dropping the unreferenced ones) and repoint the roots. Roots = svars, the live sstack, and
-    ; string-array elements (sarrheap). Pointers outside [heap, heap+heap_top) -- literals, DATA,
-    ; &empty_str -- aren't ours and are left alone. Liveness needs no mark bit: it's "some root
-    ; points at this start", tested against the small fixed root set (see gc_referenced).
-    sub gc_collect() {
-        uword rd = heap                       ; read cursor over the existing strings
-        uword wr = heap                       ; write cursor: compacted output, packed from the bottom
-        uword hend = heap + heap_top
-        while rd < hend {
-            uword nextrd = rd                 ; find the terminator, then step one past it
-            while @(nextrd) != 0
-                nextrd++
-            nextrd++
-            uword s = rd                      ; tentatively slide down to wr (wr <= rd -> safe forward copy)
-            uword d = wr
-            while s != nextrd {
-                @(d) = @(s)
-                s++
-                d++
-            }
-            if gc_rewrite(rd, wr)             ; live? repoint roots rd->wr and keep the copy
-                wr += nextrd - rd
-            rd = nextrd                       ; dead: leave wr, so the next string overwrites the copy
+    ; OP_CALLX: evaluate an X16 ROM expression-function (VPEEK/JOY/MX/...) whose numeric arguments GPC
+    ; has already pushed. GPC's own variables aren't in BASIC's table, so a whole VPEEK(0,X) can't just
+    ; be handed to frmevl; instead the compiler emitted code to evaluate each argument, and here we pop
+    ; the computed values, format them as ASCII decimal into a synthesized tokenized call in low-RAM
+    ; xbuf ([$CE][subtok] then '(' arg,arg,... ')'), point TXTPTR at it, page in BASIC ROM, and JSR
+    ; frmevl. The ROM handler runs and leaves a numeric result in FAC1; MOVMF packs it into the stack
+    ; cell the arguments occupied. Banks + curlin are saved/restored exactly as OP_PASSTHRU does. (Zero-
+    ; arg functions -- MX/MY/MB/MWHEEL -- emit no parens: xbuf is just [$CE][subtok].)
+    ; Build the synthesized tokenized X16-function call in xbuf from the OP_CALLX/OP_CALLXS operand:
+    ; read subtok + nargs, pop nargs numeric args off the stack (in SOURCE order -- the stack top is the
+    ; last arg), and format them as ASCII decimal into  $CE subtok [ '(' arg0 ',' arg1 ... ')' ] $00.
+    ; Shared by op_callx (numeric result) and op_callxs (string result).
+    sub xbuild() {
+        ubyte xsub = @(pcbase + pc)
+        ubyte xn   = @(pcbase + pc + 1)
+        pc += 2
+        ubyte k = xn
+        while k != 0 {
+            k--
+            sp--
+            xargs[k] = stack[sp]
         }
-        heap_top = wr - heap
+        xbuf[0] = $ce
+        xbuf[1] = xsub
+        ubyte w = 2                                   ; xbuf index (byte-sized; the compiler caps nargs)
+        if xn != 0 {
+            xbuf[w] = '('
+            w++
+            ubyte a = 0
+            while a < xn {
+                if a != 0 {
+                    xbuf[w] = ','
+                    w++
+                }
+                uword ds = floats.tostr(xargs[a])         ; null-terminated PETSCII; a leading space (for
+                ubyte j = 0                               ; non-negatives) is harmless -- CHRGET skips it
+                while @(ds + j) != 0 {
+                    xbuf[w] = @(ds + j)
+                    w++
+                    j++
+                }
+                a++
+            }
+            xbuf[w] = ')'
+            w++
+        }
+        xbuf[w] = 0
     }
 
-    ; Repoint every root holding `oldp` to `newp`; return true if any did -- which doubles as the
-    ; liveness test the compactor needs, so there's no separate scan. Roots = svars, the live sstack,
-    ; and string-array elements (sarrheap).
-    sub gc_rewrite(uword oldp, uword newp) -> bool {
-        bool found = false
-        ubyte i
-        for i in 0 to 63 {
-            if svars[i] == oldp {
-                svars[i] = newp
-                found = true
-            }
+    sub op_callx() {
+        xbuild()
+        xdest = &stack[sp]                                ; the result goes back where the args were
+        %asm {{
+            lda  #<p8b_vm.p8v_xbuf
+            sta  $ee                                      ; TXTPTR lo -> xbuf (frmevl parses from here)
+            lda  #>p8b_vm.p8v_xbuf
+            sta  $ef                                      ; TXTPTR hi
+            stz  $03eb                                    ; curlin = 0 (program mode, not $FFxx direct)
+            stz  $03ec
+            lda  $00
+            pha                                           ; save RAM bank (the P-code bank, in-process)
+            lda  $01
+            pha                                           ; save ROM bank
+            lda  #4
+            sta  $01                                      ; page in BASIC ROM
+            jsr  $d350                                    ; frmevl: evaluate the call -> result in FAC1
+            ldx  p8b_vm.p8v_xdest
+            ldy  p8b_vm.p8v_xdest+1
+            jsr  $fe66                                    ; MOVMF: pack FAC1 -> [xdest] as a 5-byte MFLPT
+            pla
+            sta  $01                                      ; restore ROM bank
+            pla
+            sta  $00                                      ; restore RAM bank
+        }}
+        sp++                                              ; the result now occupies the cell at xdest
+    }
+
+    ; OP_CALLXS: a string-returning X16 function (HEX$/BIN$). Same synthesized call as op_callx, but
+    ; frmevl leaves a STRING result. We call the ROM's `frestr` ($DE0E) -- it verifies the value is a
+    ; string, frees the BASIC temp descriptor, and returns len in A + the heap body pointer in X/Y. The
+    ; body is still intact (freeing only pops the descriptor and moves fretop), so we copy it off-heap
+    ; into xbuf (its synthesized-call input already consumed), then adopt it into a GPC string temp via
+    ; bstr.mem_to_temp -- exactly how STR$/CHR$ (op_numstr) turn a ROM-produced string into a GPC temp.
+    sub op_callxs() {
+        xbuild()
+        %asm {{
+            lda  #<p8b_vm.p8v_xbuf
+            sta  $ee                                      ; TXTPTR lo -> xbuf
+            lda  #>p8b_vm.p8v_xbuf
+            sta  $ef                                      ; TXTPTR hi
+            stz  $03eb                                    ; curlin = 0
+            stz  $03ec
+            lda  $00
+            pha                                           ; save RAM bank
+            lda  $01
+            pha                                           ; save ROM bank
+            lda  #4
+            sta  $01                                      ; page in BASIC ROM
+            jsr  $d350                                    ; frmevl: evaluate the call -> string result
+            jsr  $de0e                                    ; frestr: A=len, X/Y=body ptr; frees the temp
+            sta  p8b_vm.p8v_xslen
+            stx  p8b_vm.p8v_xsptr
+            sty  p8b_vm.p8v_xsptr+1
+            pla
+            sta  $01                                      ; restore ROM bank
+            pla
+            sta  $00                                      ; restore RAM bank
+        }}
+        ubyte k = 0                                       ; copy the result body off-heap (into xbuf) before
+        while k < xslen {                                 ; mem_to_temp's getspa can reuse the freed space
+            xbuf[k] = @(xsptr + k)
+            k++
         }
-        i = 0
-        while i < ssp {                       ; while-form avoids the ubyte 0-1 wrap when ssp==0
-            if sstack[i] == oldp {
-                sstack[i] = newp
-                found = true
-            }
+        sstack[ssp] = bstr.mem_to_temp(&xbuf, xslen)      ; own copy on the GPC string heap
+        if str_error()
+            return
+        ssp++
+    }
+
+    ; --- string helpers (BASIC-format descriptors; no VM-side collector) -----------------------
+    ; There is no private heap or compactor anymore: bstr allocates via ROM getspa and the ROM
+    ; garbage collector (reached inside getspa) walks BASIC's var/array/temp tables to reclaim and
+    ; relocate. sstack entries are descriptor addresses into those rooted structures (or a scratch
+    ; sdesc cell for off-heap literals/DATA), so nothing here needs to root or move strings.
+
+    ; push a scratch descriptor over an OFF-HEAP null-terminated string (literal pool / DATA pool).
+    ; The body never moves and the collector ignores it, so the scratch cell needs no rooting.
+    sub push_cstr(uword cstr) {
+        uword d = &sdesc + (ssp as uword) * 3
+        @(d)   = strings.length(cstr)
+        @(d+1) = lsb(cstr)
+        @(d+2) = msb(cstr)
+        sstack[ssp] = d
+        ssp++
+    }
+
+    ; push an empty string ("" = a len-0 descriptor); for out-of-range / no-data results.
+    sub push_empty() {
+        uword d = &sdesc + (ssp as uword) * 3
+        @(d) = 0
+        sstack[ssp] = d
+        ssp++
+    }
+
+    ; print the body of descriptor `d`, length-counted (BASIC bodies are NOT null-terminated).
+    sub print_desc(uword d) {
+        ubyte n = bstr.dlen(d)
+        uword p = bstr.dptr(d)
+        ubyte i = 0
+        while i < n {
+            emit_char(@(p + i))
             i++
         }
-        uword e = 0
-        while e < sarr_top {
-            if peekw(sarrheap + e) == oldp {
-                pokew(sarrheap + e, newp)
-                found = true
-            }
-            e += 2
+    }
+
+    ; surface a pending string error (set by bstr) and clear it; returns true if run() must halt.
+    sub str_error() -> bool {
+        if bstr.err_toolong {
+            bstr.err_toolong = false
+            print_cstr(&str_long_msg)
+            emit_char(13)
+            halt = true
+            return true
         }
-        return found
+        if bstr.err_complex {
+            bstr.err_complex = false
+            print_cstr(&formula_msg)
+            emit_char(13)
+            halt = true
+            return true
+        }
+        return false
     }
 
     ; Indirect JSR for OP_SYS: the 65C02 has no "JSR (indirect)", so we JSR into here and
@@ -762,35 +1159,11 @@ vm {
         return off
     }
 
-    ; copy `count` chars starting at byte `start` of `src` onto the string heap, null-terminate,
-    ; and return the new string. Clamps to the source's actual length, so an over-long request or
-    ; a start past the end simply yields a shorter (possibly empty) string -- never a read past it.
-    sub substr(uword src, ubyte start, ubyte count) -> uword {
-        ubyte slen = strings.length(src)
-        if start >= slen {
-            count = 0
-        } else {
-            ubyte avail = slen - start
-            if count > avail
-                count = avail
-        }
-        uword dst = heap + heap_top
-        ubyte k = 0
-        while k < count {
-            @(dst + k) = @(src + start + k)
-            k++
-        }
-        @(dst + count) = 0
-        heap_top += count
-        heap_top++
-        return dst
-    }
-
     ; return the current DATA item's text and advance the cursor past it. Out of data reads as ""
     ; (which parses as 0 for a numeric READ) rather than raising a runtime error.
     sub data_next() -> uword {
         if dataptr >= datatop
-            return &empty_str
+            return &empty_c
         uword item = dataptr
         while @(dataptr) != 0            ; walk to the item's terminating null
             dataptr++

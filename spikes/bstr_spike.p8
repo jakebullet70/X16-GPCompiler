@@ -1,6 +1,8 @@
-; bstr_spike.p8 -- exercise the bstr engine under GC pressure in the real BASIC format.
-; A$="HE"; then A$=A$+"X" x60 in a ~320-byte heap so getspa must GC many times.
-; Assert A$ ends at len 62 with 'H' at [0] and 'X' at [2] -> store/concat/getspa/garba2 all correct.
+; bstr_spike.p8 -- exercise the bstr engine on the REAL VM path under GC pressure.
+; A$="HE"; then A$=A$+"X" x60 compiled the way the VM emits it:
+;   LOADS A$ / PUSHS "X" / CONCAT (concat_temp) / STORS A$ (store_var steals the temp)
+; in a ~320-byte heap so getspa must GC many times. Assert A$ ends at len 62 with 'H' at [0]
+; and 'X' at [2] -> store_var(literal copy + temp steal), concat_temp, getspa, garba2 all correct.
 
 %import bstr
 %zeropage basicsafe
@@ -8,8 +10,8 @@
 main {
     ubyte[2] bodyHE = [$48, $45]             ; raw "HE" (encoding-agnostic)
     ubyte[1] bodyX  = [$58]                  ; raw "X"
-    ubyte[3] dHE
-    ubyte[3] dX
+    ubyte[3] dHE                             ; scratch descriptor over the literal "HE"
+    ubyte[3] dX                              ; scratch descriptor over the literal "X"
 
     sub start() {
         bstr.init($9c00)                     ; tiny heap ($9c00 table, ~320-byte heap to MEMTOP)
@@ -17,7 +19,7 @@ main {
         dHE[0] = 2
         dHE[1] = lsb(&bodyHE)
         dHE[2] = msb(&bodyHE)
-        bstr.store_var(0, &dHE)              ; A$ = "HE"
+        bstr.store_var(0, &dHE)              ; A$ = "HE"  (literal -> owned heap copy)
 
         dX[0] = 1
         dX[1] = lsb(&bodyX)
@@ -25,7 +27,8 @@ main {
 
         ubyte i
         for i in 1 to 60 {
-            bstr.concat_to_var(0, bstr.vdesc(0), &dX)   ; A$ = A$ + "X"
+            uword t = bstr.concat_temp(bstr.vdesc(0), &dX)   ; temp = A$ + "X"
+            bstr.store_var(0, t)                             ; A$ = temp (steal body, pop temp)
         }
 
         uword vd = bstr.vdesc(0)

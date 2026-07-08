@@ -88,6 +88,7 @@ main {
 
     ; --- tokenizer state ---
     uword sptr                     ; cursor into source
+    uword tok_start                ; sptr at the first byte of the current token (for OP_PASSTHRU)
     ubyte tok                      ; current token type
     word  tok_num                  ; value when tok == T_NUM (integer literal)
     float tok_fnum                 ; value when tok == T_FLOAT (has a decimal point)
@@ -222,6 +223,8 @@ main {
     const ubyte T_DEF     = 61     ; DEF FN name(var)=expr    (define a user function)
     const ubyte T_FN      = 62     ; FN name(arg)             (call a user function; in expressions)
     const ubyte T_POW     = 63     ; ^  power operator        (binds tighter than * /)
+    const ubyte T_XFUNC   = 64     ; X16 escape function (numeric): VPEEK/JOY/MX/... ($CE sub-token in tok_funcid)
+    const ubyte T_XSFUNC  = 65     ; X16 escape function (string-returning): HEX$/BIN$ ($CE sub-token in tok_funcid)
     const ubyte T_BAD     = 255
 
     ; sub-ids for T_STRSLICE (compiler-only; each maps to its own VM opcode)
@@ -628,8 +631,113 @@ main {
             T_ON -> parse_on()
             T_WAIT -> parse_wait()
             T_DEF -> parse_def()
-            else -> error(E_SYNTAX)
+            else -> {
+                ; a statement whose first token is a BASIC keyword GPC doesn't compile (the X16
+                ; VERA/sound/graphics/disk extensions, tokenized $CE $8x) -> pass it to ROM BASIC.
+                ; A non-keyword first byte (stray punctuation) is a genuine syntax error.
+                if @(tok_start) >= $80
+                    parse_passthru()
+                else
+                    error(E_SYNTAX)
+            }
         }
+    }
+
+    ; Emit OP_PASSTHRU carrying the current statement's raw tokenized bytes (from its first token to
+    ; the next unquoted ':' or the end of line). At run time the VM hands these to the ROM interpreter.
+    ; Emit a statement GPC doesn't compile (an X16 $CE escape) as OP_PASSTHRU, to be run by the ROM
+    ; interpreter at run time. We copy the tokenized statement bytes verbatim EXCEPT scalar numeric
+    ; variable references: the ROM would look those up in BASIC's variable table, where GPC's variables
+    ; don't live (they sit in the VM's private slab), so `VPOKE 0,A,V` would silently read the ROM's
+    ; undefined A=0. Instead each scalar-numeric-var name is replaced by a $01<slot> marker; the runtime
+    ; splices in the variable's current value as ASCII, so the ROM sees `VPOKE 0,4660,66`. The ROM still
+    ; does all the arithmetic, so `VPOKE 0,B*40,V` works too. NOT substituted (copied verbatim, so still
+    ; unsupported -- but no regression): quoted strings, hex/binary literals ($FF / %1010), string vars
+    ; (A$), integer vars (A%), and array/function arguments (A(I)) -- a name followed by $ % or '('.
+    sub parse_passthru() {
+        uword s = tok_start                     ; first byte of the statement (in low-RAM linebuf)
+        uword e = s
+        bool inq = false
+        repeat {
+            ubyte ch = @(e)
+            if ch == 0
+                break                           ; end of line
+            if ch == '"'
+                inq = not inq
+            else if ch == ':' and not inq
+                break                           ; next statement on the line
+            e++
+        }
+        emit_byte(pcode.OP_PASSTHRU)
+        uword lenpos = code_len                 ; the (marker-encoded) length byte, backpatched below
+        emit_byte(0)
+        uword enc = 0                           ; encoded byte count (markers make it differ from e-s)
+        uword p = s
+        inq = false
+        while p < e {
+            ubyte c = @(p)
+            if inq {
+                emit_byte(c)
+                enc++
+                if c == '"'
+                    inq = false
+                p++
+            } else if c >= $80 {                ; a BASIC keyword/operator token ($CE VPOKE, ...) -- copy
+                emit_byte(c)                    ; verbatim; it can never be a variable (names are ASCII)
+                enc++
+                p++
+            } else if c == '"' {
+                emit_byte(c)
+                enc++
+                inq = true
+                p++
+            } else if c == '$' or c == '%' {    ; hex/binary literal: copy prefix + alnum body verbatim
+                emit_byte(c)                    ; (so A-F digits in $1A2B aren't read as a variable)
+                enc++
+                p++
+                while p < e and (is_alpha(@(p)) or is_digit(@(p))) {
+                    emit_byte(@(p))
+                    enc++
+                    p++
+                }
+            } else if is_alpha(c) {             ; a variable name (keywords are >= $80 tokens, not letters)
+                uword rs = p
+                while p < e and (is_alpha(@(p)) or is_digit(@(p)))
+                    p++
+                ubyte nxt = 0
+                if p < e
+                    nxt = @(p)
+                if nxt == '$' or nxt == '%' or nxt == '(' {
+                    while rs < p {              ; string/integer var or array/fn arg -> copy verbatim
+                        emit_byte(@(rs))
+                        enc++
+                        rs++
+                    }
+                } else {                        ; scalar numeric variable -> $01<slot> marker
+                    ubyte nl = 0
+                    while rs < p and nl < NAMELEN-1 {
+                        tokname[nl] = @(rs)
+                        nl++
+                        rs++
+                    }
+                    tokname[nl] = 0
+                    emit_byte($01)
+                    emit_byte(intern_var())
+                    enc += 2
+                }
+            } else {
+                emit_byte(c)
+                enc++
+                p++
+            }
+            if enc > 254 {                      ; too long for the runtime passbuf (dummy + 254 + $00)
+                error(E_SYNTAX)
+                return
+            }
+        }
+        pc_poke(lenpos, lsb(enc))               ; backpatch the real encoded length
+        sptr = e                                ; resume the lexer at the terminator
+        next_token()                            ; -> T_EOL (':') or T_NEWLINE ($00)
     }
 
     ; POKE addr, val  -- write a byte to memory (stack: addr then val, OP_POKE pops val first)
@@ -1460,7 +1568,7 @@ main {
     ; does this token begin a string-valued expression? (a literal, string var, or a
     ; string-producing function). Used to route PRINT items and to diagnose type errors.
     sub is_str_start(ubyte t) -> bool {
-        return t == T_STRLIT or t == T_STRVAR or t == T_NSFUNC or t == T_STRSLICE
+        return t == T_STRLIT or t == T_STRVAR or t == T_NSFUNC or t == T_STRSLICE or t == T_XSFUNC
     }
 
     ; is this token a relational operator? (used to spot a string comparison: strexpr <cmp> strexpr)
@@ -1564,6 +1672,31 @@ main {
                 next_token()                    ; consume ')'
                 emit_byte(pcode.OP_NUMSTR)
                 emit_byte(nsid)
+            }
+            T_XSFUNC -> {                       ; HEX$(n) / BIN$(n): numeric arg -> string via ROM frmevl
+                if fr_sp == EXPRNEST {
+                    error(E_COMPLEX)
+                    return
+                }
+                fr_id[fr_sp] = tok_funcid       ; the $CE sub-token ($D5/$D6), held across the nested parse
+                fr_sp++
+                next_token()                    ; consume the function keyword
+                if tok != T_LPAREN {
+                    error(E_SYNTAX)
+                    return
+                }
+                next_token()                    ; consume '('
+                parse_index()                   ; the numeric argument, stops at ')' (re-enters parse_expr)
+                ubyte xssub = fr_id[fr_sp - 1]
+                fr_sp--
+                if tok != T_RPAREN {
+                    error(E_SYNTAX)
+                    return
+                }
+                next_token()                    ; consume ')'
+                emit_byte(pcode.OP_CALLXS)
+                emit_byte(xssub)
+                emit_byte(1)                    ; HEX$/BIN$ take one numeric arg
             }
             T_STRSLICE -> emit_slice()          ; LEFT$/RIGHT$/MID$
             else -> error(E_TYPE)
@@ -1933,6 +2066,59 @@ main {
                     emit_imm16(fn_entry[f2])
                     expect_value = false
                 }
+                T_XFUNC -> {                         ; X16 escape function: VPEEK/JOY/MX/... -> ROM at run time
+                    ; Arguments are numeric, passed BY VALUE: GPC evaluates each here (its variables
+                    ; aren't in BASIC's table, so the runtime must hand frmevl the computed values, not
+                    ; the source). Emit each arg, count them, then OP_CALLX <sub-token> <argcount>. Zero
+                    ; args (MX/MY/MB/MWHEEL) come with no parens. Mirrors the array-subscript list parse:
+                    ; each arg re-enters parse_expr, so stash my floor/stop/sub-token/count on the frame.
+                    if not expect_value {
+                        error(E_SYNTAX)
+                        return
+                    }
+                    ubyte xsub = tok_funcid          ; the $CE sub-token byte ($D0..)
+                    next_token()                     ; consume the function token
+                    ubyte xn = 0
+                    if tok == T_LPAREN {
+                        if fr_sp == EXPRNEST {
+                            error(E_COMPLEX)
+                            return
+                        }
+                        fr_base[fr_sp] = mybase
+                        fr_stoprp[fr_sp] = stop_rp
+                        fr_slot[fr_sp] = xsub
+                        fr_nd[fr_sp] = 0
+                        fr_sp++
+                        next_token()                 ; consume '('
+                        repeat {
+                            parse_index()            ; one numeric arg; stops at ',' or ')'
+                            fr_nd[fr_sp-1]++
+                            if had_error
+                                return
+                            if tok != T_COMMA
+                                break
+                            next_token()
+                        }
+                        fr_sp--
+                        mybase = fr_base[fr_sp]
+                        stop_rp = fr_stoprp[fr_sp]
+                        xsub = fr_slot[fr_sp]
+                        xn = fr_nd[fr_sp]
+                        if tok != T_RPAREN {
+                            error(E_SYNTAX)
+                            return
+                        }
+                        next_token()                 ; consume ')'
+                        if xn > pcode.MAX_XARGS {
+                            error(E_COMPLEX)         ; more args than the runtime's xargs buffer holds
+                            return
+                        }
+                    }
+                    emit_byte(pcode.OP_CALLX)
+                    emit_byte(xsub)
+                    emit_byte(xn)
+                    expect_value = false             ; a numeric value now sits on the stack
+                }
                 T_LPAREN -> {
                     if opsp == OPSTK_SIZE {
                         error(E_COMPLEX)
@@ -2145,6 +2331,7 @@ main {
             sptr++
             c = @(sptr)
         }
+        tok_start = sptr                        ; first byte of this token (OP_PASSTHRU copies from here)
         if c == 0 {                             ; $00 terminates the line
             sptr++
             tok = T_NEWLINE
@@ -2160,6 +2347,20 @@ main {
         }
         if c >= $80 {                           ; a BASIC keyword / operator token
             sptr++
+            if c == $ce {                       ; X16 escape token: $CE <sub>. In expression context
+                ubyte esub = @(sptr)            ; only the FUNCTIONS ($D0..) are valid (statements are
+                sptr++                          ; routed to OP_PASSTHRU at statement position instead).
+                if is_xfunc(esub) {
+                    tok = T_XFUNC               ; numeric-result function (VPEEK/JOY/...)
+                    tok_funcid = esub
+                } else if is_xsfunc(esub) {
+                    tok = T_XSFUNC              ; string-returning function (HEX$/BIN$)
+                    tok_funcid = esub
+                } else {
+                    tok = T_BAD                 ; a statement token / unsupported fn where a value is due
+                }
+                return
+            }
             ubyte fid = func_id(c)              ; built-in function? (SGN/INT/ABS/SQR/...)
             if fid != $ff {
                 tok = T_FUNC
@@ -2369,6 +2570,30 @@ main {
             $ca -> return $20 | SL_MID           ; MID$  -> T_STRSLICE
         }
         return $ff
+    }
+
+    ; classify an X16 escape sub-token ($CE <sub>) as a supported expression FUNCTION. We accept only
+    ; the numeric-result functions whose arguments are plain numbers passed by value (or that take no
+    ; arguments), since OP_CALLX evaluates the args itself and reads back a numeric FAC. Deliberately
+    ; NOT accepted: the string-returning HEX$/BIN$/RPT$ ($D5/$D6/$DA), and POINTER/STRPTR ($D8/$D9)
+    ; which need a variable's address rather than its value; and the bannex TDATA/TATTR/MOD ($DC..$DE).
+    ; Anything rejected here becomes T_BAD -> a clean SYNTAX error instead of a wrong-typed result.
+    sub is_xfunc(ubyte s) -> bool {
+        when s {
+            $d0,        ; VPEEK(bank,addr)
+            $d1, $d2, $d3,  ; MX / MY / MB          (no arguments)
+            $d4,        ; JOY(n)
+            $d7,        ; I2CPEEK(dev,addr)
+            $db -> return true  ; MWHEEL             (no arguments)
+        }
+        return false
+    }
+
+    ; classify a $CE sub-token as a supported STRING-returning X16 function: HEX$($D5) / BIN$($D6),
+    ; each taking one numeric arg. RPT$($DA) is excluded (it takes a string arg, which the synthesized-
+    ; call path can't embed yet). These route through the string-expression parser -> OP_CALLXS.
+    sub is_xsfunc(ubyte s) -> bool {
+        return s == $d5 or s == $d6
     }
 
     sub single_char_op(ubyte c) -> ubyte {

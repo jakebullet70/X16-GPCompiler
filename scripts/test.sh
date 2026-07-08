@@ -125,8 +125,8 @@ bash "$DIR/check-out.sh" '10 PRINT 6*7'                     "42"         || fail
 bash "$DIR/check-out.sh" '10 A$="AB":A$=A$+"CD":A$=A$+"EF":PRINT A$' "ABCDEF" || fail=1
 
 echo
-echo "== String-heap garbage collection (compaction reclaims abandoned concat temporaries) =="
-# 200-char accumulation: without GC this OOM'd at ~45 chars (heap full of dead intermediates); GC compacts
+echo "== String garbage collection (ROM garba2 reclaims abandoned concat temporaries) =="
+# 200-char accumulation: without GC this OOM'd at ~45 chars (heap full of dead intermediates); garba2 reclaims
 bash "$DIR/check-basic.sh" '10 B$="X"\n20 FOR I=1 TO 200\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=c8 0401=00 || fail=1
 # grows right up to BASIC's 255-char string ceiling
 bash "$DIR/check-basic.sh" '10 B$="X"\n20 FOR I=1 TO 255\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=ff 0401=00 || fail=1
@@ -148,6 +148,57 @@ bash "$DIR/check-basic.sh" "10 A=1280:POKE A,7:PRINT PEEK(A)"     0400=7        
 # SYS calls machine code: POKE a routine (LDA #$5A; STA $0510; RTS) at $0500, then SYS it
 POKESYS="10 POKE 1280,169:POKE 1281,90:POKE 1282,141:POKE 1283,16:POKE 1284,5:POKE 1285,96:SYS 1280"
 bash "$DIR/check-basic.sh" "$POKESYS"                             0510=5a         || fail=1
+
+echo
+echo "== Command pass-through: X16 keywords GPC doesn't compile, run via ROM BASIC (OP_PASSTHRU) =="
+# VPOKE (X16 escape token \$CE\$84) writes 66 to VRAM \$1234 through the ROM interpreter; read it back
+# via VERA ADDR0/DATA0 with native POKE/PEEK.  \$9F25=CTRL \$9F20/21/22=ADDR0 \$9F23=DATA0.
+VPT='10 VPOKE 0,4660,66\n20 POKE 40741,0\n30 POKE 40736,52\n40 POKE 40737,18\n50 POKE 40738,0\n60 PRINT PEEK(40739)'
+bash "$DIR/check-basic.sh"      "$VPT" 0400=42 || fail=1
+# a passed-through statement mid-line, then native code continues on the same line (colon-separated)
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4661,77:PRINT 5' 0400=5 || fail=1
+# standalone: the tokenized statement is bundled into out.prg and run via ROM BASIC, no compiler present
+bash "$DIR/check-standalone.sh" mail "$VPT" 0400=42 || fail=1
+# pass-through statements can see GPC variables: the compiler substitutes each scalar numeric var with a
+# marker the runtime expands to the var's current value, so VPOKE's A reaches the ROM as 4660 (not the
+# ROM's own undefined A=0). End-to-end: A drives BOTH a pass-through statement (VPOKE) and a VPEEK.
+bash "$DIR/check-basic.sh" '10 A=4660:VPOKE 0,A,66:PRINT VPEEK(0,A)' 0400=42 || fail=1
+# a variable inside an expression argument: the ROM still does the arithmetic on the substituted value
+bash "$DIR/check-basic.sh" '10 B=100:VPOKE 0,B*40,55:PRINT VPEEK(0,4000)' 0400=37 || fail=1
+# a literal $-hex argument is NOT mistaken for a variable (its A-F digits are copied verbatim) -> $FF=255
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,$FF:PRINT VPEEK(0,4660)' 0400=ff || fail=1
+# standalone: variable substitution happens in the runtime, so it works with no compiler present too
+bash "$DIR/check-standalone.sh" mail '10 A=4660:VPOKE 0,A,66:PRINT VPEEK(0,A)' 0400=42 || fail=1
+
+echo
+echo "== X16 expression functions: VPEEK/JOY/... run via ROM frmevl in expression context (OP_CALLX) =="
+# VPEEK reads back through the ROM function evaluator a byte VPOKE wrote to VRAM -> 66 = \$42
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,66:PRINT VPEEK(0,4660)' 0400=42 || fail=1
+# a GPC variable as the address argument: proves the runtime passes the COMPUTED value to frmevl (GPC's
+# own variables are not in BASIC's table, so a whole VPEEK(0,A) can't just be handed to the ROM -- the
+# compiler evaluates A itself and OP_CALLX formats the value into the call).
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,99:A=4660:PRINT VPEEK(0,A)'  0400=63 || fail=1
+# an arithmetic expression as an argument compiles and is evaluated by GPC before the call
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,55:PRINT VPEEK(0,4096+564)' 0400=37 || fail=1
+# the VPEEK result feeds back into a GPC expression (numeric round-trip both directions)
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,40:PRINT VPEEK(0,4660)+2' 0400=2a || fail=1
+# standalone: VPEEK bundled into out.prg and evaluated via ROM frmevl with no compiler present
+bash "$DIR/check-standalone.sh" mail '10 VPOKE 0,4660,66:PRINT VPEEK(0,4660)' 0400=42 || fail=1
+
+echo
+echo "== X16 string functions: HEX\$/BIN\$ run via ROM frmevl, result adopted as a GPC string (OP_CALLXS) =="
+# HEX$ returns a string temp from the ROM; the runtime frees the BASIC temp and copies the body into a GPC temp
+bash "$DIR/check-out.sh" '10 PRINT HEX$(255)'   "FF"       || fail=1
+bash "$DIR/check-out.sh" '10 PRINT HEX$(4660)'  "1234"     || fail=1
+bash "$DIR/check-out.sh" '10 PRINT BIN$(5)'     "00000101" || fail=1
+# a GPC variable as the (numeric) argument
+bash "$DIR/check-out.sh" '10 A=255:PRINT HEX$(A)' "FF"     || fail=1
+# the result flows into GPC string machinery: assignment, concatenation (two temps), comparison
+bash "$DIR/check-out.sh"   '10 A$=HEX$(255):PRINT A$'        "FF"    || fail=1
+bash "$DIR/check-out.sh"   '10 PRINT HEX$(255)+HEX$(16)'     "FF10"  || fail=1
+bash "$DIR/check-basic.sh" '10 IF HEX$(255)="FF" THEN PRINT 7' 0400=7 || fail=1
+# standalone: HEX$ bundled and run with no compiler present
+bash "$DIR/check-standalone.sh" out '10 PRINT HEX$(4660)' "1234" || fail=1
 
 echo
 echo "== Channel / file I/O (OPEN / CLOSE / PRINT# / GET# / ST, via the KERNAL device API) =="
@@ -389,6 +440,10 @@ bash "$DIR/check-standalone.sh" out "10 PRINT 10/4" "2.5" || fail=1
 bash "$DIR/check-standalone.sh" out "10 PRINT SQR(16)" "4" || fail=1
 # string functions standalone: LEFT$ of a bundled literal, no compiler present
 bash "$DIR/check-standalone.sh" out '10 PRINT LEFT$("BLITZ",3)' "BLI" || fail=1
+# standalone GC stress: 200-char accumulation forces many ROM garba2 collections above datatop, no compiler present
+bash "$DIR/check-standalone.sh" mail '10 B$="X"\n20 FOR I=1 TO 200\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=c8 0401=00 || fail=1
+# standalone: string content survives collections byte-for-byte -> MID$ char still 'B' ($42) after 150 collections
+bash "$DIR/check-standalone.sh" mail '10 A$="ABC"\n20 FOR I=1 TO 150\n30 A$=A$+"."\n40 NEXT\n50 PRINT ASC(MID$(A$,2,1))' 0400=42 || fail=1
 
 echo
 echo "== Capacity: programs past the old 256-byte / 48-line / 32-var limits =="
