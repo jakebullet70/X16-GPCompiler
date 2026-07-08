@@ -9,7 +9,6 @@
 ; This is a *module* (block `vm`), used both by the standalone runtime and, for
 ; now, embedded in the compiler so it can compile-and-run on the X16.
 
-%import textio
 %import strings
 %import floats
 %import pcode_format

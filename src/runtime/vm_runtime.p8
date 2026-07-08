@@ -14,7 +14,6 @@
 ; the P-code to produce out.prg. Keep this small: it must fit (code + variables)
 ; below PCODE_BASE.
 
-%import textio
 %import pcode_format
 %import vm
 %option no_sysinit          ; skip Prog8's screen reset (80x60 + yellow-on-black clear); a compiled
