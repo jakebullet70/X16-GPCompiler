@@ -39,14 +39,14 @@ vm {
     uword[16] callstack          ; GOSUB return addresses
     ubyte     csp
 
-    ubyte[8]  for_var            ; FOR loop frames (innermost on top)
-    float[8]  for_limit
-    float[8]  for_step
+    ubyte[8]  @shared for_var    ; FOR loop frames (innermost on top); @shared: all FOR handlers are now asm
+    float[8]  @shared for_limit
+    float[8]  @shared for_step
     word[8]   @shared for_ilimit ; integer FOR (FOR I%=..): 16-bit limit + step, and for_var holds an
     word[8]   @shared for_istep  ; ivarsf slot. A frame uses EITHER the float or the int pair -- which is
                                  ; @shared: now referenced only from hand-asm op_iforpush/op_ifornext
                                  ; fixed by the opcode (OP_FORNEXT vs OP_IFORNEXT), so no per-frame tag.
-    uword[8]  for_top            ; pcode offset of the loop body's first instruction
+    uword[8]  @shared for_top    ; pcode offset of the loop body's first instruction
     ubyte     forsp
 
     ; --- strings (BASIC-format, collected by the ROM garbage collector via the bstr module) ---
@@ -1240,33 +1240,149 @@ _ijznt:     lda  p8b_vm.p8v_pc                    ; pc += 2
                     csp--
                     pc = callstack[csp]
                 }
-    sub op_forpush() {
-                    ubyte slot = @(pcbase + pc)    ; slot < 128, fits in a byte
-                    pc += 2
-                    sp--
-                    float stepv = stack[sp]      ; step was pushed last
-                    sp--
-                    for_var[forsp] = slot
-                    for_limit[forsp] = stack[sp] ; then limit
-                    for_step[forsp] = stepv
-                    for_top[forsp] = pc          ; body starts right after this opcode
-                    forsp++
-                }
-    sub op_fornext() {
-                    ubyte top = forsp - 1
-                    uword vaddr = varsf + (for_var[top] as uword) * 5
-                    float nv = peekf(vaddr) + for_step[top]
-                    pokef(vaddr, nv)
-                    bool cont
-                    if for_step[top] >= 0.0
-                        cont = nv <= for_limit[top]
-                    else
-                        cont = nv >= for_limit[top]
-                    if cont
-                        pc = for_top[top]
-                    else
-                        forsp--                  ; loop finished; pop the frame
-                }
+    asmsub op_forpush() {                    ; FOR var=start TO limit STEP step -- open a float loop frame
+        %asm {{
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)           ; slot
+            pha
+            lda  p8b_vm.p8v_pc               ; pc += 2 (body start)
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           dec  p8b_vm.p8v_sp               ; sp -= 2 : limit at [sp], step at [sp+1]
+            dec  p8b_vm.p8v_sp
+            ldy  p8b_vm.p8v_forsp
+            pla                              ; slot -> for_var[forsp]
+            sta  p8b_vm.p8v_for_var,y
+            lda  p8b_vm.p8v_sp               ; for_limit[forsp] = stack[sp]
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = limit
+            lda  p8b_vm.p8v_forsp
+            sta  P8ZP_SCRATCH_REG
+            asl  a
+            asl  a
+            clc
+            adc  P8ZP_SCRATCH_REG            ; forsp*5
+            clc
+            adc  #<p8b_vm.p8v_for_limit
+            tax
+            lda  #>p8b_vm.p8v_for_limit
+            adc  #0
+            tay
+            jsr  $fe66                       ; MOVMF  for_limit[forsp] = FAC
+            lda  p8b_vm.p8v_sp               ; for_step[forsp] = stack[sp+1]
+            clc
+            adc  #1
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = step
+            lda  p8b_vm.p8v_forsp
+            sta  P8ZP_SCRATCH_REG
+            asl  a
+            asl  a
+            clc
+            adc  P8ZP_SCRATCH_REG            ; forsp*5
+            clc
+            adc  #<p8b_vm.p8v_for_step
+            tax
+            lda  #>p8b_vm.p8v_for_step
+            adc  #0
+            tay
+            jsr  $fe66                       ; MOVMF  for_step[forsp] = FAC
+            ldy  p8b_vm.p8v_forsp            ; for_top[forsp] = pc
+            lda  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_for_top_lsb,y
+            lda  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_for_top_msb,y
+            inc  p8b_vm.p8v_forsp
+            rts
+        }}
+    }
+    asmsub op_fornext() {                    ; step the innermost float FOR (the old ~1.5KB copy_float hog)
+        %asm {{
+            ldx  p8b_vm.p8v_forsp
+            dex                              ; x = top
+            stx  P8ZP_SCRATCH_B1
+            lda  p8b_vm.p8v_for_var,x        ; vaddr = varsf + for_var[top]*5 -> W2
+            ldy  #0
+            jsr  prog8_math.mul_word_5
+            clc
+            adc  p8b_vm.p8v_varsf
+            sta  P8ZP_SCRATCH_W2
+            tya
+            adc  p8b_vm.p8v_varsf+1
+            sta  P8ZP_SCRATCH_W2+1
+            lda  P8ZP_SCRATCH_W2             ; FAC = peekf(vaddr) = loop var
+            ldy  P8ZP_SCRATCH_W2+1
+            jsr  $fe63                       ; MOVFM
+            lda  P8ZP_SCRATCH_B1             ; FAC += for_step[top]  (addr = for_step + top*5)
+            sta  P8ZP_SCRATCH_REG
+            asl  a
+            asl  a
+            clc
+            adc  P8ZP_SCRATCH_REG
+            clc
+            adc  #<p8b_vm.p8v_for_step
+            tax
+            lda  #>p8b_vm.p8v_for_step
+            adc  #0
+            tay
+            txa
+            jsr  $fe18                       ; FADD  FAC = nv
+            ldx  P8ZP_SCRATCH_W2             ; pokef(vaddr, nv)
+            ldy  P8ZP_SCRATCH_W2+1
+            jsr  $fe66                       ; MOVMF  store nv to loop var
+            lda  P8ZP_SCRATCH_B1             ; step sign -> ascending/descending
+            sta  P8ZP_SCRATCH_REG
+            asl  a
+            asl  a
+            clc
+            adc  P8ZP_SCRATCH_REG            ; top*5 -> X (index into for_step bytes)
+            tax
+            lda  p8b_vm.p8v_for_step,x       ; MFLPT exponent byte
+            beq  _fnasc                      ; 0.0 -> step >= 0 -> ascending
+            lda  p8b_vm.p8v_for_step+1,x     ; sign byte
+            bpl  _fnasc                      ; positive -> ascending
+            jsr  _fncmp                      ; descending: cont = nv >= limit <=> FCOMP != $ff
+            cmp  #$ff
+            beq  _fnstop
+            bne  _fncont
+_fnasc:     jsr  _fncmp                      ; ascending: cont = nv <= limit <=> FCOMP != 1
+            cmp  #1
+            beq  _fnstop
+_fncont:    ldy  P8ZP_SCRATCH_B1             ; continue: pc = for_top[top]
+            lda  p8b_vm.p8v_for_top_lsb,y
+            sta  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_for_top_msb,y
+            sta  p8b_vm.p8v_pc+1
+            rts
+_fnstop:    dec  p8b_vm.p8v_forsp            ; loop finished; pop the frame
+            rts
+_fncmp:     lda  P8ZP_SCRATCH_B1             ; A = FCOMP(FAC=nv, for_limit[top])
+            sta  P8ZP_SCRATCH_REG
+            asl  a
+            asl  a
+            clc
+            adc  P8ZP_SCRATCH_REG            ; top*5
+            clc
+            adc  #<p8b_vm.p8v_for_limit
+            tax
+            lda  #>p8b_vm.p8v_for_limit
+            adc  #0
+            tay
+            txa
+            jmp  $fe54                       ; FCOMP (tail): returns A, rts to caller
+        }}
+    }
     asmsub op_iforpush() {                        ; FOR I%=start TO limit STEP step -- open an integer frame
         %asm {{
             lda  p8b_vm.p8v_pcbase                ; slot = @(pcbase+pc)
