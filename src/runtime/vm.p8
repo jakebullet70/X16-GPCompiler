@@ -1588,29 +1588,169 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
                         arr_len[adslot] = 0                  ; too big / out of heap -> unusable
                     }
                 }
-    sub op_aload() {                      ; A(i[,j..]): push the element (0 if out of range)
-                    ubyte alslot = @(pcbase + pc)
-                    ubyte alnd = @(pcbase + pc + 2)
-                    pc += 3
-                    uword aloff = index_of(arr_dims, alslot, alnd, sp - alnd, arr_len[alslot])
-                    sp -= alnd
-                    if aloff != $ffff
-                        stack[sp] = peekf(arrheap + arr_base[alslot] + aloff * 5)
-                    else
-                        stack[sp] = 0.0
-                    sp++
-                }
-    sub op_astore() {                     ; A(i[,j..])=v: store into the element (dropped if out of range)
-                    ubyte asslot = @(pcbase + pc)
-                    ubyte asnd = @(pcbase + pc + 2)
-                    pc += 3
-                    sp--
-                    float asval = stack[sp]                  ; value was pushed after the subscripts
-                    uword asoff = index_of(arr_dims, asslot, asnd, sp - asnd, arr_len[asslot])
-                    sp -= asnd
-                    if asoff != $ffff
-                        pokef(arrheap + arr_base[asslot] + asoff * 5, asval)
-                }
+    asmsub op_aload() {                   ; A(i[,j..]): push element; 0.0 if any subscript out of range
+        %asm {{
+            ; --- operands: slot @ pcbase+pc (low byte), nd @ pcbase+pc+2 ; then pc += 3 ---
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)               ; slot
+            sta  p8b_vm.p8s_index_of.p8v_slot
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y             ; nd
+            sta  p8b_vm.p8s_index_of.p8v_nd
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #3
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           ; --- aloff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
+            lda  p8b_vm.p8v_arr_dims            ; index_of reads (never writes) slot/nd, so the
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr   ; param slots double as our slot/nd storage after the call
+            lda  p8b_vm.p8v_arr_dims+1
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8s_index_of.p8v_first
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  p8b_vm.p8v_arr_len_lsb,y
+            sta  p8b_vm.p8s_index_of.p8v_total
+            lda  p8b_vm.p8v_arr_len_msb,y
+            sta  p8b_vm.p8s_index_of.p8v_total+1
+            jsr  p8b_vm.p8s_index_of            ; A=lo, Y=hi of aloff ($ffff => out of range)
+            pha
+            phy
+            lda  p8b_vm.p8v_sp                  ; sp -= nd
+            sec
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8v_sp
+            ply
+            pla
+            cmp  #$ff                           ; aloff == $ffff ?
+            bne  _alok
+            cpy  #$ff
+            beq  _alzero
+_alok:      jsr  prog8_math.mul_word_5         ; A/Y = aloff*5   (clobbers W1,W2)
+            clc                                 ; src = arrheap + arr_base[slot] + aloff*5 -> W1
+            adc  p8b_vm.p8v_arrheap
+            sta  P8ZP_SCRATCH_W1
+            tya
+            adc  p8b_vm.p8v_arrheap+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  P8ZP_SCRATCH_W1
+            clc
+            adc  p8b_vm.p8v_arr_base_lsb,y
+            sta  P8ZP_SCRATCH_W1
+            lda  P8ZP_SCRATCH_W1+1
+            adc  p8b_vm.p8v_arr_base_msb,y
+            sta  P8ZP_SCRATCH_W1+1
+            lda  p8b_vm.p8v_sp                  ; dest = &stack[sp] -> W2
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W2
+            sty  P8ZP_SCRATCH_W2+1
+            ldy  #4                             ; copy the 5-byte element straight in (no FAC round-trip)
+-           lda  (P8ZP_SCRATCH_W1),y
+            sta  (P8ZP_SCRATCH_W2),y
+            dey
+            bpl  -
+            jmp  _aldone
+_alzero:    lda  p8b_vm.p8v_sp                  ; out of range: stack[sp] = 0.0
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W2
+            sty  P8ZP_SCRATCH_W2+1
+            lda  #0
+            ldy  #4
+-           sta  (P8ZP_SCRATCH_W2),y
+            dey
+            bpl  -
+_aldone:    inc  p8b_vm.p8v_sp
+            rts
+        }}
+    }
+    asmsub op_astore() {                  ; A(i[,j..]) = v: store element; dropped if any subscript out of range
+        %asm {{
+            ; --- operands: slot, nd ; pc += 3 ---
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            sta  p8b_vm.p8s_index_of.p8v_slot
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y
+            sta  p8b_vm.p8s_index_of.p8v_nd
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #3
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           dec  p8b_vm.p8v_sp                  ; sp-- : value now at stack[sp], subscripts below it
+            ; --- asoff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
+            lda  p8b_vm.p8v_arr_dims
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr
+            lda  p8b_vm.p8v_arr_dims+1
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8s_index_of.p8v_first
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  p8b_vm.p8v_arr_len_lsb,y
+            sta  p8b_vm.p8s_index_of.p8v_total
+            lda  p8b_vm.p8v_arr_len_msb,y
+            sta  p8b_vm.p8s_index_of.p8v_total+1
+            jsr  p8b_vm.p8s_index_of            ; A=lo, Y=hi of asoff
+            pha
+            phy
+            lda  p8b_vm.p8v_sp                  ; B1 = value slot (= sp before sp-=nd)
+            sta  P8ZP_SCRATCH_B1
+            sec                                 ; sp -= nd
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8v_sp
+            ply
+            pla
+            cmp  #$ff                           ; asoff == $ffff -> drop the store
+            bne  _asok
+            cpy  #$ff
+            beq  _asdone
+_asok:      jsr  prog8_math.mul_word_5         ; A/Y = asoff*5  (clobbers W1,W2)
+            clc                                 ; dest = arrheap + arr_base[slot] + asoff*5 -> W1
+            adc  p8b_vm.p8v_arrheap
+            sta  P8ZP_SCRATCH_W1
+            tya
+            adc  p8b_vm.p8v_arrheap+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  P8ZP_SCRATCH_W1
+            clc
+            adc  p8b_vm.p8v_arr_base_lsb,y
+            sta  P8ZP_SCRATCH_W1
+            lda  P8ZP_SCRATCH_W1+1
+            adc  p8b_vm.p8v_arr_base_msb,y
+            sta  P8ZP_SCRATCH_W1+1
+            lda  P8ZP_SCRATCH_B1               ; src = &stack[value slot] -> W2
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W2
+            sty  P8ZP_SCRATCH_W2+1
+            ldy  #4                             ; copy 5-byte value straight into the element
+-           lda  (P8ZP_SCRATCH_W2),y
+            sta  (P8ZP_SCRATCH_W1),y
+            dey
+            bpl  -
+_asdone:    rts
+        }}
+    }
     sub op_inputv() {
                     ubyte ivslot = @(pcbase + pc)
                     pc += 2
