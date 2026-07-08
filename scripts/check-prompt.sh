@@ -14,7 +14,7 @@ case "$1" in default|correction) MODE="$1"; shift;; esac
 SRCLINE="$1"; shift
 FS="$(mktemp -d)"
 printf '%b\n' "$SRCLINE" | python "$DIR/tokenize.py" > "$FS/A"     # source, named "A"
-cp build/vm_runtime.prg "$FS/runtime.prg"                          # bundled VM (fixed name)
+cp build/vm_runtime.prg "$FS/gpc.runtime.prg"                          # bundled VM (fixed name)
 
 if [ "$MODE" = "default" ]; then
     KEYS="65 13 13"                     # 'A' CR  CR  (empty output name -> default "c.A")

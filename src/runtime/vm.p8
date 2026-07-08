@@ -31,6 +31,11 @@ vm {
     ; integer (`%`) variable slots: their own namespace + storage, 128 words addressed as ivarsf + slot*2
     uword     ivarsf = memory("vm_ivars", 256, 0)
     word      last_printed        ; most recent PRINTI, truncated to an integer (for headless tests)
+    ; When true, emit_char also mirrors each printed byte to the x16emu debug register $9FBB so the
+    ; HEADLESS test harness can capture program output on the host console. A shipped program (visual /
+    ; standalone / interactive) must NOT touch $9FBB -- native X16 BASIC never does -- so this defaults
+    ; OFF and each main enables it only in its TESTBENCH build (vm.host_echo = TESTBENCH before vm.run).
+    bool      host_echo = false
 
     uword[16] callstack          ; GOSUB return addresses
     ubyte     csp
@@ -635,8 +640,20 @@ _end:
                 }
     sub op_printi() {
                     sp--
-                    last_printed = stack[sp] as word     ; truncated integer, for the mailbox
-                    print_float(stack[sp])               ; BASIC-formatted, no newline
+                    float pv = stack[sp]
+                    ; last_printed feeds the headless test mailbox ONLY. Prog8's float->word cast is
+                    ; range-checked by the ROM and throws ILLEGAL QUANTITY outside -32768..32767, so it
+                    ; must be guarded: a real PRINT of a large number (directory block counts, addresses,
+                    ; big sums) has to PRINT, not crash. FOUT (below) handles the full float range fine;
+                    ; only this mailbox convenience needed the cast. Values in signed-word range keep an
+                    ; exact mailbox (any fractional part rounds within range since pv <= 32767.0 can't
+                    ; reach the 32768 throw threshold); out-of-range values leave the mailbox 0 (no test
+                    ; inspects it for those -- they assert the printed text instead).
+                    if pv >= -32768.0 and pv <= 32767.0
+                        last_printed = pv as word
+                    else
+                        last_printed = 0
+                    print_float(pv)                      ; BASIC-formatted, no newline
                 }
     sub op_prints() {
                     ssp--
@@ -1411,8 +1428,9 @@ _end:
     ; tests. The host byte is translated PETSCII->ASCII (CR->LF) so captured output
     ; is readable text.
     sub emit_char(ubyte ch) {
-        cbm.CHROUT(ch)
-        @(EMU_CHROUT) = to_host(ch)
+        cbm.CHROUT(ch)                          ; to the X16 screen -- exactly what native BASIC does
+        if host_echo
+            @(EMU_CHROUT) = to_host(ch)         ; test-only mirror to the host console (see host_echo)
     }
 
     sub to_host(ubyte ch) -> ubyte {

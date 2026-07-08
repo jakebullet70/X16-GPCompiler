@@ -1,0 +1,59 @@
+GPC DEMO  --  the Greased Piglet Compiler, running natively on the Commander X16
+================================================================================
+
+This folder is a HostFS root: point the emulator (or copy it to an SD card) at it and
+you get the resident BASIC->P-code compiler plus sample programs to compile and run,
+with no PC toolchain involved.
+
+  gpc.prg          the compiler (prompts you for file names)
+  gpc.runtime.prg  the little VM the compiler bundles into a standalone build
+  HELLO        \
+  SQUARES       \  sample programs, as classic tokenized BASIC -- type one of these
+  LOGIC          } names at the compiler's "compile file:" prompt. The readable
+  INTMATH       /  source for each is in src/<NAME>.bas.
+  XKEYS        /
+  STRINGS
+  c.HELLO      HELLO already compiled -- LOAD"C.HELLO",8 : RUN it right away
+  DIR.PRG      a plain-BASIC file lister: LOAD"DIR.PRG",8 : RUN  to see what's on disk
+
+--------------------------------------------------------------------------------
+Run it (emulator)
+--------------------------------------------------------------------------------
+  x16emu -fsroot demo -prg demo/gpc.prg -run
+
+At the prompts:
+  compile file:  SQUARES        (a sample name above)
+  write to:                     (just press RETURN -> it auto-names c.SQUARES)
+
+Then, back at the READY prompt, run the compiled program with no compiler present:
+  LOAD "C.SQUARES",8
+  RUN
+
+Or skip compiling and run the pre-built one immediately:
+  LOAD "C.HELLO",8
+  RUN
+
+--------------------------------------------------------------------------------
+What each sample shows
+--------------------------------------------------------------------------------
+  HELLO    PRINT, FOR/NEXT, strings -- the basics.
+  SQUARES  numeric arrays: fill A(I)=I*I in a loop, then read A(I) back by a
+           variable subscript in a second loop.
+  LOGIC    comparisons and AND / OR / NOT driving IF ... THEN.
+  INTMATH  %-suffixed integer variables compile to native 16-bit integer ops
+           (integer +, *, and FOR/NEXT) -- markedly faster than ROM float.
+  XKEYS    X16-only keywords for free: VPOKE (statement) and VPEEK / HEX$ / BIN$
+           (functions) run by handing them to the ROM BASIC interpreter.
+  STRINGS  strings live in BASIC's own storage and are reclaimed by the ROM
+           garbage collector -- 50 concatenations, then LEN / LEFT$ / CHR$.
+
+--------------------------------------------------------------------------------
+Regenerating this folder
+--------------------------------------------------------------------------------
+Everything here except this README and src/*.bas is generated. After changing the
+compiler, runtime, or a sample, re-stage with:
+
+  scripts/stage-demo.sh
+
+That rebuilds gpc.prg + gpc.runtime.prg, re-tokenizes src/*.bas, and refreshes c.HELLO.
+DIR.PRG is a hand-authored utility and is preserved as-is (not regenerated).

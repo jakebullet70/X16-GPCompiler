@@ -1,25 +1,24 @@
 @ECHO OFF
-REM Build EDIT and run it in the emulator from the run\ folder.
-REM The run\ folder is the host filesystem root the editor sees, and holds
-REM sample text files to open/save.
+REM Launch the GPC on-device demo in the Commander X16 emulator.
 REM
-REM Usage:  run.bat [source.p8]    (defaults to edit.p8)
+REM   demo\ is used as the HostFS root (the disk the emulated X16 sees), and the
+REM   interactive compiler demo\gpc.prg boots straight up. At its prompts:
+REM       compile file:  SQUARES      (any sample name -- see demo\README)
+REM       write to:                   (press RETURN to auto-name c.SQUARES)
+REM   then back at READY:  LOAD "C.SQUARES",8 : RUN
+REM
+REM   Tip: LOAD "DIR.PRG",8 : RUN  lists the files on disk.
+REM
+REM Usage:  run.bat              boot the compiler (default)
+REM         run.bat C.HELLO      boot straight into a pre-compiled standalone (then RUN)
+REM         run.bat SQUARES      boot with a different .prg loaded
 
 SETLOCAL
-SET SRC=%1
-IF "%SRC%"=="" SET SRC=edit.p8
-
-REM 1) compile (build.bat writes edit.prg to the project root)
-CALL "%~dp0build.bat" %SRC%
-IF ERRORLEVEL 1 GOTO :EOF
-
-REM 2) stage the fresh .prg into the run folder
-SET RUNDIR=%~dp0run
-IF NOT EXIST "%RUNDIR%" MKDIR "%RUNDIR%"
-COPY /Y "%~dp0edit.prg" "%RUNDIR%\edit.prg" >NUL
-
-REM 3) launch with the run folder as the host filesystem root, so the emulator
-REM    boots straight into edit.prg.
 CALL "%~dp0LOCAL.BAT"
-START "" /D "%RUNDIR%" "%x16%" -fsroot "%RUNDIR%" -prg edit.prg -run -rtc -joy1
+
+SET "DEMO=%~dp0demo"
+SET "PRG=%~1"
+IF "%PRG%"=="" SET "PRG=gpc.prg"
+
+START "" "%x16%" -fsroot "%DEMO%" -prg "%DEMO%\%PRG%" -run -rtc
 ENDLOCAL

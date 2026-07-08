@@ -10,13 +10,16 @@
 ; SYSes into start(), which simply interprets the P-code sitting at PCODE_BASE.
 ; No compiler is present -- this is what makes a compiled program self-contained.
 ;
-; Built once into runtime.prg; the compiler loads that file and prepends it to
+; Built once into gpc.runtime.prg; the compiler loads that file and prepends it to
 ; the P-code to produce out.prg. Keep this small: it must fit (code + variables)
 ; below PCODE_BASE.
 
 %import textio
 %import pcode_format
 %import vm
+%option no_sysinit          ; skip Prog8's screen reset (80x60 + yellow-on-black clear); a compiled
+                            ; program replays only the KERNAL init it needs in start(), leaving the
+                            ; caller's screen mode + colors exactly as they were (like an X16 ML program)
 %zeropage basicsafe
 
 main {
@@ -24,6 +27,16 @@ main {
     const uword MAILBOX = $0400            ; $0400=result lo, +1=hi, +2=ran-sentinel
 
     sub start() {
+        %asm {{
+            ; no_sysinit skips Prog8's init_system (which clears + recolors the screen). Replay only
+            ; its KERNAL half so the ROM string GC works; the ROM bank is left as BASIC left it (the
+            ; VM's float ops page in BASIC ROM themselves), and the screen is left untouched.
+            sei
+            jsr  $ff84          ; IOINIT : (re)init CIA/VIA + the default IRQ
+            jsr  $ff8a          ; RESTOR : restore the KERNAL indirect vectors
+            cli
+        }}
+        vm.host_echo = TESTBENCH   ; mirror output to the host console only in the headless test build
         ; the 6-byte header at PCODE_BASE locates the bundled literal + data pools; P-code follows
         vm.litbase  = peekw(pcode.PCODE_BASE)          ; +0: literal-pool address
         vm.database = peekw(pcode.PCODE_BASE + 2)      ; +2: data-pool address

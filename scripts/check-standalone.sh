@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compile a BASIC snippet to a STANDALONE out.prg (the runtime VM bundled in) and verify it
 # runs with NO compiler present -- the Blitz payoff. Two emulator runs:
-#   1. the compiler reads source.prg + runtime.prg from HostFS and writes out.prg
+#   1. the compiler reads source.prg + gpc.runtime.prg from HostFS and writes out.prg
 #   2. out.prg runs on its own (no -fsroot, no compiler) and we assert its result
 #
 #   check-standalone.sh mail "<basic>" <addr>=<hex> ...   (assert the VM numeric mailbox)
@@ -14,7 +14,7 @@ source "$DIR/env.sh"; cd "$ROOT"
 MODE="$1"; SRCLINE="$2"; shift 2
 FS="$(mktemp -d)"
 printf '%b\n' "$SRCLINE" | python "$DIR/tokenize.py" > "$FS/source.prg"
-cp build/vm_runtime.prg "$FS/runtime.prg"      # the compiler opens it as "runtime.prg"
+cp build/vm_runtime.prg "$FS/gpc.runtime.prg"      # the compiler opens it as "gpc.runtime.prg"
 rm -f "$FS/out.prg"
 echo "  \"$SRCLINE\"  (standalone)"
 

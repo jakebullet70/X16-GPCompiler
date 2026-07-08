@@ -20,7 +20,7 @@ source "$DIR/env.sh"; cd "$ROOT"
 INPUT="$1"; SRCLINE="$2"; MODE="$3"; shift 3
 FS="$(mktemp -d)"
 printf '%b\n' "$SRCLINE" | python "$DIR/tokenize.py" > "$FS/source.prg"
-cp build/vm_runtime.prg "$FS/runtime.prg"
+cp build/vm_runtime.prg "$FS/gpc.runtime.prg"
 rm -f "$FS/out.prg"
 echo "  input='$INPUT'  \"$SRCLINE\""
 

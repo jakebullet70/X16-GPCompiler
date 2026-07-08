@@ -26,6 +26,7 @@ main {
 
     sub start() {
         txt.print("vm selftest\n")
+        vm.host_echo = TESTBENCH   ; host-console mirror only in the headless test build
         vm.run(&program)
         if TESTBENCH {
             @(MAILBOX)     = lsb(vm.last_printed as uword)

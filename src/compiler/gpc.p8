@@ -40,6 +40,8 @@
 %import floats
 %import pcode_format
 %import vm
+%option no_sysinit          ; skip Prog8's screen reset (80x60 + yellow-on-black clear); we replay only
+                            ; the KERNAL half it needs in start() so the caller's screen is left as-is
 %zeropage basicsafe
 
 main {
@@ -256,14 +258,24 @@ main {
     const ubyte E_NOFILE  = 7      ; "FILE NOT FOUND"
 
     sub start() {
-        txt.print("Greased Piglet Compiler! (V1.0 Build:100)\n")
+        %asm {{
+            ; With no_sysinit, Prog8's init_system (which ALSO clears + recolors the screen) is skipped.
+            ; Replay only its KERNAL half so the ROM string GC still works, but leave the screen alone.
+            sei
+            jsr  $ff84          ; IOINIT : (re)init CIA/VIA + the default IRQ
+            jsr  $ff8a          ; RESTOR : restore the KERNAL indirect vectors
+            cli
+        }}
+        txt.print("\n\ngreased piglet compiler! v1.0 build:100\n")
         setup_names()                             ; decide what to compile and where to write it
+        if INTERACTIVE and not TESTBENCH and src_name[0] == 0
+            return                                ; blank name at "compile file:" -> quit to READY (no error)
         compile()
         wrote_output = false
         if had_error {
             txt.print("compile failed\n")
         } else {
-            wrote_output = write_output()         ; emit standalone out.prg (if runtime.prg present)
+            wrote_output = write_output()         ; emit standalone out.prg (if gpc.runtime.prg present)
             if INTERACTIVE and not TESTBENCH {
                 report_output()                   ; a real compile run: name the file, don't auto-run
             } else {
@@ -273,6 +285,7 @@ main {
                 vm.heapfloor = sys.progend()         ; string heap goes ABOVE all slabs (name tables are
                                                      ; banked now), using the free RAM up to MEMTOP
                 if code_len <= RUN_CAP {
+                    vm.host_echo = TESTBENCH         ; host-console mirror only in the headless test build
                     cx16.rambank(PCODE_BANK0)        ; select the P-code bank; the VM never switches it,
                     txt.print("run:\n")              ; so it reads the P-code straight from the $A000 window
                     vm.run(BRAM)
@@ -302,6 +315,8 @@ main {
         if INTERACTIVE {
             txt.print("compile file: ")
             read_name(&src_name)
+            if src_name[0] == 0
+                return                        ; blank name -> quit (start() exits); skip the output prompt
             txt.print("write to: ")
             read_name(&out_name)
             if out_name[0] == 0 {
@@ -364,7 +379,7 @@ main {
             txt.print(&out_name)
             txt.nl()
         } else {
-            txt.print("no runtime.prg?\n")
+            txt.print("no gpc.runtime.prg?\n")
         }
     }
 
@@ -508,19 +523,19 @@ main {
     }
 
     ; ---- standalone output: write out.prg = [runtime][ @PCODE_BASE: litaddr:2, pcode, litpool ] ----
-    ; The bundled runtime (runtime.prg) is loaded from disk and prepended to the compiled
+    ; The bundled runtime (gpc.runtime.prg) is loaded from disk and prepended to the compiled
     ; P-code, producing a self-contained program that runs with no compiler present -- the
     ; whole point of a compiler. A 6-byte header at PCODE_BASE tells the runtime where the literal
     ; and data pools ended up (both float right after the P-code, keeping the file compact). The
     ; P-code itself lives in banked RAM now, so it's streamed out bank by bank (write_pcode).
-    ; Returns false (and simply skips) if runtime.prg is absent, so plain compile-and-run
+    ; Returns false (and simply skips) if gpc.runtime.prg is absent, so plain compile-and-run
     ; keeps working when there's nothing to bundle.
     sub write_output() -> bool {
         ; The compile is done, so reuse the source banks (SRC_BANK0..) as scratch to hold the runtime
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        if not diskio.f_open("runtime.prg")     ; fixed internal dependency, not a user file
+        if not diskio.f_open("gpc.runtime.prg")  ; fixed internal dependency, not a user file
             return false
         uword rt_len = 0
         ubyte rbank = SRC_BANK0
@@ -538,6 +553,7 @@ main {
         uword rt_body_len = rt_len - 2          ; drop the 2-byte load address
         if $0801 + rt_body_len > pcode.PCODE_BASE
             return false                        ; runtime would overlap the P-code region
+        debrand_stub()                          ; make the bundled BASIC stub LIST like X16 BASIC, not Prog8
 
         if not diskio.f_open_w(&out_name)
             return false
@@ -578,6 +594,32 @@ main {
             void diskio.f_write(datapool_ptr, data_len)          ; data pool -> dataaddr..
         diskio.f_close_w()
         return true
+    }
+
+    ; A compiled program is [runtime][pcode], so its first BASIC line is the runtime's Prog8 launcher
+    ; stub -- "2026 SYS <e> :REM PROG8" -- which brands the output as Prog8 when LISTed. Rewrite it in
+    ; place (in the scratch bank holding the runtime image) into a plain X16 BASIC loader, "10 SYS <e>",
+    ; so our compiled .prg LISTs like normal X16 BASIC. The SYS address and everything from the code
+    ; entry on are left byte-for-byte identical, so nothing moves: we only renumber the line to 10 and
+    ; end the program right after the address (the leftover ":REM PROG8" bytes fall after the end-of-
+    ; program marker, so LIST never shows them and SYS jumps straight past them into the code).
+    sub debrand_stub() {
+        cx16.rambank(SRC_BANK0)                 ; runtime image lives here; stub at BRAM+2 (BRAM+0,1=load addr)
+        if @(BRAM + 6) != $9e                   ; SYS token where we expect it? if not, leave the stub alone
+            return
+        @(BRAM + 4) = 10                         ; line number -> 10 (was the Prog8 build year, 2026)
+        @(BRAM + 5) = 0
+        uword q = BRAM + 7                       ; just past the SYS token
+        while @(q) == ' '                        ; skip spaces before the address
+            q++
+        while @(q) >= '0' and @(q) <= '9'        ; skip the SYS address digits (kept intact)
+            q++
+        @(q) = 0                                 ; end this BASIC line right after the address
+        @(q + 1) = 0                             ; two nulls = end-of-program (a null next-line link)
+        @(q + 2) = 0
+        uword endaddr = $0801 + (q + 1 - (BRAM + 2))    ; memory address of the end-of-program marker
+        @(BRAM + 2) = lsb(endaddr)               ; the line's link now points at end-of-program
+        @(BRAM + 3) = msb(endaddr)
     }
 
     ; stream the banked P-code (code_len bytes, laid out contiguously from offset 0 across banks

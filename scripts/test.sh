@@ -121,6 +121,15 @@ bash "$DIR/check-out.sh" '10 PRINT "X=";5+2'                "X=7"        || fail
 bash "$DIR/check-out.sh" '10 A$="NAME":PRINT "HI ";A$;"!"'  "HI NAME!"   || fail=1
 # numbers still print correctly through the new output path
 bash "$DIR/check-out.sh" '10 PRINT 6*7'                     "42"         || fail=1
+# PRINT of a number >= 32768 must print, not crash: op_printi's mailbox float->word cast is
+# range-checked by the ROM (?ILLEGAL QUANTITY outside -32768..32767). Regression for demo/DIR.PRG,
+# which died on the trailer "65535 BLOCKS FREE." (block count 65535 > 32767). See memory
+# gpc-print-large-number-bug. FOUT handles the full float range; only the mailbox cast was guarded.
+bash "$DIR/check-out.sh" '10 PRINT 40000'                   "40000"      || fail=1
+bash "$DIR/check-out.sh" '10 PRINT 65535'                   "65535"      || fail=1
+bash "$DIR/check-out.sh" '10 A=255:B=256:PRINT A*B'         "65280"      || fail=1  # the A2*256+A1 shape
+bash "$DIR/check-out.sh" '10 PRINT -40000'                  "-40000"     || fail=1  # negative out-of-range too
+bash "$DIR/check-standalone.sh" out '10 PRINT 50000'        "50000"      || fail=1  # standalone (compiled prg)
 # string var reused, concatenation chain
 bash "$DIR/check-out.sh" '10 A$="AB":A$=A$+"CD":A$=A$+"EF":PRINT A$' "ABCDEF" || fail=1
 
