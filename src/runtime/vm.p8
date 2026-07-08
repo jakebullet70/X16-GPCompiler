@@ -477,21 +477,104 @@ _end:
     ; OP_END / OP_JMP / OP_JZ (opcodes 0/1/2) are handled inline in run()'s asm dispatch
     ; (_t0/_t1/_t2): END exits the loop, JMP/JZ set pc directly, JZ tests the MFLPT exponent
     ; byte instead of a ROM float-compare. No Prog8 handler subs are needed for them.
-    sub op_pushi() {
-                    stack[sp] = mkword(@(pcbase + pc + 1), @(pcbase + pc)) as float
-                    pc += 2
-                    sp++
-                }
-    sub op_loadv() {
-                    stack[sp] = peekf(varsf + (@(pcbase + pc) as uword) * 5)
-                    pc += 2
-                    sp++
-                }
-    sub op_storv() {
-                    sp--
-                    pokef(varsf + (@(pcbase + pc) as uword) * 5, stack[sp])
-                    pc += 2
-                }
+    asmsub op_pushi() {                      ; stack[sp] = (unsigned imm word) as float
+        %asm {{
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)           ; imm lo
+            pha
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W1),y         ; imm hi
+            tay
+            pla                              ; A = lo, Y = hi
+            jsr  floats.GIVUAYFAY            ; FAC = unsigned(A/Y) as float
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF  stack[sp] = FAC
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           inc  p8b_vm.p8v_sp
+            rts
+        }}
+    }
+    asmsub op_loadv() {                      ; stack[sp] = var[slot]  (var = varsf + slot*5)
+        %asm {{
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)           ; slot
+            ldy  #0
+            jsr  prog8_math.mul_word_5       ; A=lo, Y=hi of slot*5
+            clc
+            adc  p8b_vm.p8v_varsf
+            sta  P8ZP_SCRATCH_W2
+            tya
+            adc  p8b_vm.p8v_varsf+1
+            sta  P8ZP_SCRATCH_W2+1           ; W2 = &var
+            lda  P8ZP_SCRATCH_W2
+            ldy  P8ZP_SCRATCH_W2+1
+            jsr  $fe63                       ; MOVFM  FAC = var
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF  stack[sp] = FAC
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           inc  p8b_vm.p8v_sp
+            rts
+        }}
+    }
+    asmsub op_storv() {                      ; var[slot] = stack[sp]; sp--
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)           ; slot
+            ldy  #0
+            jsr  prog8_math.mul_word_5
+            clc
+            adc  p8b_vm.p8v_varsf
+            sta  P8ZP_SCRATCH_W2
+            tya
+            adc  p8b_vm.p8v_varsf+1
+            sta  P8ZP_SCRATCH_W2+1           ; W2 = &var
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = stack[sp]
+            ldx  P8ZP_SCRATCH_W2
+            ldy  P8ZP_SCRATCH_W2+1
+            jsr  $fe66                       ; MOVMF  var = FAC
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #2
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           rts
+        }}
+    }
     ; --- Phase 2: float arithmetic + compare, hand-asm. The numeric cell is a 5-byte ROM MFLPT float at
     ;     stack + i*5. These call the X16 stable float API ($FE00-$FE90) directly: FAC1<-mem via MOVFM
     ;     ($FE63, ptr A/Y); the op reads its second operand from mem (FADD $FE18 / FSUB $FE12 / FMULT
@@ -886,12 +969,42 @@ _end:
             rts
         }}
     }
-    sub op_itof() {                       ; coerce the TOP cell int -> float
-                    stack[sp-1] = istack[sp-1] as float
-                }
-    sub op_itof2() {                      ; coerce the SECOND-from-top cell int -> float (mixed a<op>b)
-                    stack[sp-2] = istack[sp-2] as float
-                }
+    asmsub op_itof() {                    ; coerce the TOP cell int -> float (signed)
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            dec  a
+            tay
+            lda  p8b_vm.p8v_istack_lsb,y
+            ldx  p8b_vm.p8v_istack_msb,y
+            stx  P8ZP_SCRATCH_REG
+            ldy  P8ZP_SCRATCH_REG            ; A = lo, Y = hi (signed)
+            jsr  floats.GIVAYFAY             ; FAC = signed(A/Y) as float
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF  stack[sp-1] = FAC
+            rts
+        }}
+    }
+    asmsub op_itof2() {                   ; coerce the SECOND-from-top cell int -> float (mixed a<op>b)
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  #2
+            tay
+            lda  p8b_vm.p8v_istack_lsb,y
+            ldx  p8b_vm.p8v_istack_msb,y
+            stx  P8ZP_SCRATCH_REG
+            ldy  P8ZP_SCRATCH_REG
+            jsr  floats.GIVAYFAY
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  #2
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF  stack[sp-2] = FAC
+            rts
+        }}
+    }
     sub op_ftoi() {                       ; coerce the TOP cell float -> int, truncating toward zero
                     ; `as word` rounds; CBM `%` assignment truncates toward zero (A%=7.9 -> 7, -7.9 -> -7)
                     float x = stack[sp-1]
@@ -1359,11 +1472,31 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
                     read_line()
                     bstr.var_from_mem(isslot, &inbuf, strings.length(&inbuf))   ; heap-copy into the var
                 }
-    sub op_pushf() {
-                    stack[sp] = peekf(pcbase + pc)         ; 5-byte float immediate
-                    pc += 5
-                    sp++
-                }
+    asmsub op_pushf() {                      ; stack[sp] = 5-byte float immediate at pcbase+pc
+        %asm {{
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  P8ZP_SCRATCH_W1
+            ldy  P8ZP_SCRATCH_W1+1
+            jsr  $fe63                       ; MOVFM  FAC = immediate float
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF  stack[sp] = FAC
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #5
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           inc  p8b_vm.p8v_sp
+            rts
+        }}
+    }
     sub op_callfn() {
                     ubyte fnid = @(pcbase + pc)
                     pc++
