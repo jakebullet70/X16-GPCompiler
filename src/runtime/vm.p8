@@ -492,49 +492,228 @@ _end:
                     pokef(varsf + (@(pcbase + pc) as uword) * 5, stack[sp])
                     pc += 2
                 }
-    sub op_add() {
-                    sp--
-                    stack[sp-1] += stack[sp]
-                }
-    sub op_sub() {
-                    sp--
-                    stack[sp-1] -= stack[sp]
-                }
-    sub op_mul() {
-                    sp--
-                    stack[sp-1] *= stack[sp]
-                }
-    sub op_div() {
-                    sp--
-                    stack[sp-1] /= stack[sp]
-                }
-    sub op_neg() {
-                    stack[sp-1] = -stack[sp-1]
-                }
-    sub op_cmpeq() {
-                    sp--
-                    stack[sp-1] = bool_to_float(stack[sp-1] == stack[sp])
-                }
-    sub op_cmpne() {
-                    sp--
-                    stack[sp-1] = bool_to_float(stack[sp-1] != stack[sp])
-                }
-    sub op_cmplt() {
-                    sp--
-                    stack[sp-1] = bool_to_float(stack[sp-1] < stack[sp])
-                }
-    sub op_cmpgt() {
-                    sp--
-                    stack[sp-1] = bool_to_float(stack[sp-1] > stack[sp])
-                }
-    sub op_cmple() {
-                    sp--
-                    stack[sp-1] = bool_to_float(stack[sp-1] <= stack[sp])
-                }
-    sub op_cmpge() {
-                    sp--
-                    stack[sp-1] = bool_to_float(stack[sp-1] >= stack[sp])
-                }
+    ; --- Phase 2: float arithmetic + compare, hand-asm. The numeric cell is a 5-byte ROM MFLPT float at
+    ;     stack + i*5. These call the X16 stable float API ($FE00-$FE90) directly: FAC1<-mem via MOVFM
+    ;     ($FE63, ptr A/Y); the op reads its second operand from mem (FADD $FE18 / FSUB $FE12 / FMULT
+    ;     $FE1E / FDIV $FE24, ptr A/Y); MOVMF ($FE66, ptr X/Y) writes FAC1 back. No tempv/copy_float round
+    ;     trips (the old Prog8 per-op cost). FSUB/FDIV/FPWR are FAC = mem OP FAC, so for a<op>b load
+    ;     FAC=b (stack[sp]) then op with mem=a (stack[sp-1]). ---
+
+    ; &stack[i] for i in A -> X=lo, Y=hi (i<32 => i*5<256 fits a byte). Clobbers A, SCRATCH_REG.
+    asmsub faddr(ubyte i @A) -> ubyte @X, ubyte @Y {
+        %asm {{
+            sta  P8ZP_SCRATCH_REG
+            asl  a
+            asl  a
+            clc
+            adc  P8ZP_SCRATCH_REG            ; A = i*5
+            clc
+            adc  #<p8b_vm.p8v_stack
+            tax
+            lda  #>p8b_vm.p8v_stack
+            adc  #0
+            tay
+            rts
+        }}
+    }
+    float @shared c_negone = -1.0           ; MFLPT constant for the CBM 'true' compare result (-1.0)
+
+    asmsub st_cmpfalse() {                  ; stack[sp-1] = 0.0
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            lda  #0
+            ldy  #4
+-           sta  (P8ZP_SCRATCH_W1),y
+            dey
+            bpl  -
+            rts
+        }}
+    }
+    asmsub st_cmptrue() {                   ; stack[sp-1] = -1.0
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            ldy  #4
+-           lda  p8b_vm.p8v_c_negone,y
+            sta  (P8ZP_SCRATCH_W1),y
+            dey
+            bpl  -
+            rts
+        }}
+    }
+    asmsub fcmp() -> ubyte @A {             ; A = FCOMP(a=stack[sp-1], b=stack[sp]): 0 eq / 1 a>b / $ff a<b
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = a
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe54                       ; FCOMP  A = sign(a - b)
+            rts
+        }}
+    }
+
+    asmsub op_add() {                        ; stack[sp-1] += stack[sp]  (commutative)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = stack[sp]
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe18                       ; FADD   FAC += stack[sp-1]
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF  stack[sp-1] = FAC
+            rts
+        }}
+    }
+    asmsub op_sub() {                        ; stack[sp-1] -= stack[sp]  (a-b: FAC=b, FSUB mem=a)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = b
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe12                       ; FSUB   FAC = a - b
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF
+            rts
+        }}
+    }
+    asmsub op_mul() {                        ; stack[sp-1] *= stack[sp]  (commutative)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = stack[sp]
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe1e                       ; FMULT  FAC *= stack[sp-1]
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF
+            rts
+        }}
+    }
+    asmsub op_div() {                        ; stack[sp-1] /= stack[sp]  (a/b: FAC=b, FDIV mem=a)
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = b
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe24                       ; FDIV   FAC = a / b
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF
+            rts
+        }}
+    }
+    asmsub op_neg() {                        ; stack[sp-1] = -stack[sp-1]
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                       ; MOVFM  FAC = x
+            jsr  $fe33                       ; NEGOP  FAC = -FAC
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                       ; MOVMF
+            rts
+        }}
+    }
+    asmsub op_cmpeq() {                      ; a==b  <=>  FCOMP == 0
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_fcmp
+            cmp  #0
+            bne  +
+            jmp  p8b_vm.p8s_st_cmptrue
++           jmp  p8b_vm.p8s_st_cmpfalse
+        }}
+    }
+    asmsub op_cmpne() {                      ; a!=b  <=>  FCOMP != 0
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_fcmp
+            cmp  #0
+            beq  +
+            jmp  p8b_vm.p8s_st_cmptrue
++           jmp  p8b_vm.p8s_st_cmpfalse
+        }}
+    }
+    asmsub op_cmplt() {                      ; a<b  <=>  FCOMP == $ff
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_fcmp
+            cmp  #$ff
+            bne  +
+            jmp  p8b_vm.p8s_st_cmptrue
++           jmp  p8b_vm.p8s_st_cmpfalse
+        }}
+    }
+    asmsub op_cmpgt() {                      ; a>b  <=>  FCOMP == 1
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_fcmp
+            cmp  #1
+            bne  +
+            jmp  p8b_vm.p8s_st_cmptrue
++           jmp  p8b_vm.p8s_st_cmpfalse
+        }}
+    }
+    asmsub op_cmple() {                      ; a<=b  <=>  FCOMP != 1
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_fcmp
+            cmp  #1
+            beq  +
+            jmp  p8b_vm.p8s_st_cmptrue
++           jmp  p8b_vm.p8s_st_cmpfalse
+        }}
+    }
+    asmsub op_cmpge() {                      ; a>=b  <=>  FCOMP != $ff
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_fcmp
+            cmp  #$ff
+            beq  +
+            jmp  p8b_vm.p8s_st_cmptrue
++           jmp  p8b_vm.p8s_st_cmpfalse
+        }}
+    }
     sub op_and() {                        ; bitwise AND of the two 16-bit values
                     sp--
                     stack[sp-1] = ((as_bits(stack[sp-1]) & as_bits(stack[sp])) as word) as float
@@ -1400,10 +1579,26 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
     sub op_clrch() {                       ; end a PRINT#/INPUT#, restore default I/O
                     cbm.CLRCHN()
                 }
-    sub op_pow() {                    ; a ^ b  (float power via ROM's FPWR)
-                    sp--
-                    stack[sp-1] = floats.pow(stack[sp-1], stack[sp])
-                }
+    asmsub op_pow() {                 ; a ^ b  (a=stack[sp-1], b=stack[sp]); FPWRT: FAC = ARG ^ FAC
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp            ; ARG = a (base)  via CONUPK
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe5a                    ; CONUPK  ARG = stack[sp-1] = a
+            lda  p8b_vm.p8v_sp            ; FAC = b (exponent)  via MOVFM
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                    ; MOVFM   FAC = stack[sp] = b
+            jsr  $fe39                    ; FPWRT   FAC = ARG ^ FAC = a ^ b
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                    ; MOVMF
+            rts
+        }}
+    }
     sub op_wait() {                   ; WAIT addr,mask,xor: spin until (peek(addr) ^ xor) & mask
                     sp--
                     ubyte wxor = lsb(stack[sp] as uword)
