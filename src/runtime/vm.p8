@@ -38,6 +38,9 @@ vm {
     ubyte[8]  for_var            ; FOR loop frames (innermost on top)
     float[8]  for_limit
     float[8]  for_step
+    word[8]   for_ilimit         ; integer FOR (FOR I%=..): 16-bit limit + step, and for_var holds an
+    word[8]   for_istep          ; ivarsf slot. A frame uses EITHER the float or the int pair -- which is
+                                 ; fixed by the opcode (OP_FORNEXT vs OP_IFORNEXT), so no per-frame tag.
     uword[8]  for_top            ; pcode offset of the loop body's first instruction
     ubyte     forsp
 
@@ -67,6 +70,11 @@ vm {
     uword      database          ; start of the DATA pool
     uword      datatop           ; one past the end of the DATA pool (out-of-data boundary)
     uword      dataptr           ; the READ cursor
+    ; string-heap FLOOR: where BASIC's string var table + heap are placed. In-process (compiler resident)
+    ; the host sets this to sys.progend() -- ABOVE all the compiler's + runtime's slabs, so the heap uses
+    ; the free RAM up to MEMTOP without a slab-ordering dependency. Standalone leaves it 0 -> the heap
+    ; floors at datatop (above the loaded P-code). Kept separate from datatop, which READ still needs.
+    uword      heapfloor
 
     ; --- numeric arrays (DIM): a bump-allocated heap of floats + per-array descriptors. Arrays are
     ;     N-dimensional (up to pcode.MAXDIMS subscripts); the per-dimension SIZES drive the row-major
@@ -113,15 +121,20 @@ vm {
         csp = 0
         forsp = 0
         ssp = 0
-        ; place BASIC's string var table + heap just above the pools (datatop). NOT above progend:
-        ; in-process progend is the top of ALL slabs (near MEMTOP -> no room), but the compiler's
-        ; name-table slabs between datatop and varsf are DEAD during the run, so the heap may use them.
-        ; bstr grows the var table up from datatop and the heap DOWN from a ceiling capped just below
-        ; varsf -- the lowest LIVE runtime slab (varsf/ivarsf/arrheap...) -- so a big string can't corrupt
-        ; numeric-var storage. Standalone: datatop is above the P-code and varsf is far below it (heap
-        ; runs all the way to MEMTOP, since the cap `varsf < datatop` is ignored).
-        uword image_top = datatop
-        if image_top == 0                ; a hand-built run (VM selftest) leaves datatop unset -> use progend
+        ; place BASIC's string var table + heap in free RAM: bstr grows the var table UP from image_top
+        ; and the string heap DOWN from a ceiling (KERNAL MEMTOP, or `cap` if that sits lower). Floor
+        ; selection (heapfloor -> datatop -> progend):
+        ;   * in-process (compiler resident): the host sets heapfloor = sys.progend(), i.e. ABOVE ALL of
+        ;     the compiler's + runtime's slabs, so the heap owns the free RAM up to MEMTOP. (The Phase-5
+        ;     banked-RAM move sent the compiler's name tables to banked RAM, so the old trick of reusing
+        ;     the dead low-RAM name-table gap between datatop and varsf is gone -- progend is the room.)
+        ;   * standalone: heapfloor is 0, so the heap floors at datatop (above the loaded P-code) and runs
+        ;     to MEMTOP (varsf sits far below, so the `cap` is ignored).
+        ;   * VM selftest (hand-built P-code): heapfloor and datatop both 0 -> fall back to progend.
+        uword image_top = heapfloor
+        if image_top == 0
+            image_top = datatop
+        if image_top == 0
             image_top = sys.progend()
         bstr.init(image_top, varsf)
         sys.memset(varsf, 640, 0)        ; all-zero bytes == float 0.0 (BASIC vars start at 0)
@@ -144,9 +157,9 @@ _next:
             bne  +
             inc  p8b_vm.p8v_pc+1
 +
-            cmp  #77                       ; unknown opcode -> ignore (parity with when no-match)
+            cmp  #89                       ; unknown opcode -> ignore (parity with when no-match)
             bcs  _next
-            asl  a                         ; *2 for the word table (0..76 -> 0..152)
+            asl  a                         ; *2 for the word table (0..88 -> 0..176)
             tax
             jmp  (_optab,x)
 _after:
@@ -154,7 +167,7 @@ _after:
             beq  _next
             jmp  _end
 _optab:
-            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66, _t67, _t68, _t69, _t70, _t71, _t72, _t73, _t74, _t75, _t76
+            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66, _t67, _t68, _t69, _t70, _t71, _t72, _t73, _t74, _t75, _t76, _t77, _t78, _t79, _t80, _t81, _t82, _t83, _t84, _t85, _t86, _t87, _t88
 _t0:                                    ; OP_END -> leave the interpreter loop
             jmp  _end
 _t1:                                    ; OP_JMP -> pc = target word at pcbase+pc
@@ -416,6 +429,42 @@ _t75:
 _t76:
             jsr  p8b_vm.p8s_op_ftoi
             jmp  _after
+_t77:
+            jsr  p8b_vm.p8s_op_icmpeq
+            jmp  _after
+_t78:
+            jsr  p8b_vm.p8s_op_icmpne
+            jmp  _after
+_t79:
+            jsr  p8b_vm.p8s_op_icmplt
+            jmp  _after
+_t80:
+            jsr  p8b_vm.p8s_op_icmpgt
+            jmp  _after
+_t81:
+            jsr  p8b_vm.p8s_op_icmple
+            jmp  _after
+_t82:
+            jsr  p8b_vm.p8s_op_icmpge
+            jmp  _after
+_t83:
+            jsr  p8b_vm.p8s_op_ijz
+            jmp  _after
+_t84:
+            jsr  p8b_vm.p8s_op_iand
+            jmp  _after
+_t85:
+            jsr  p8b_vm.p8s_op_ior
+            jmp  _after
+_t86:
+            jsr  p8b_vm.p8s_op_inot
+            jmp  _after
+_t87:
+            jsr  p8b_vm.p8s_op_iforpush
+            jmp  _after
+_t88:
+            jsr  p8b_vm.p8s_op_ifornext
+            jmp  _after
 _end:
         }}
     }
@@ -540,6 +589,50 @@ _end:
                     else
                         istack[sp-1] = floats.floor(x) as word
                 }
+    ; --- integer comparison / logic / branch (Phase 5 increment 2): all operate on istack[] (16-bit
+    ;     signed), pushing the CBM truth value -1/0; they skip the ROM float compare entirely. ---
+    sub op_icmpeq() {
+                    sp--
+                    if istack[sp-1] == istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
+                }
+    sub op_icmpne() {
+                    sp--
+                    if istack[sp-1] != istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
+                }
+    sub op_icmplt() {
+                    sp--
+                    if istack[sp-1] < istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
+                }
+    sub op_icmpgt() {
+                    sp--
+                    if istack[sp-1] > istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
+                }
+    sub op_icmple() {
+                    sp--
+                    if istack[sp-1] <= istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
+                }
+    sub op_icmpge() {
+                    sp--
+                    if istack[sp-1] >= istack[sp]  istack[sp-1] = -1  else  istack[sp-1] = 0
+                }
+    sub op_ijz() {                        ; pop int; branch to the operand offset if it is zero
+                    sp--
+                    if istack[sp] == 0
+                        pc = mkword(@(pcbase + pc + 1), @(pcbase + pc))   ; take the branch (absolute offset)
+                    else
+                        pc += 2                                          ; fall through, skip the 2-byte target
+                }
+    sub op_iand() {                       ; bitwise AND of the two 16-bit ints (== logical, truth is -1/0)
+                    sp--
+                    istack[sp-1] = (istack[sp-1] as uword & istack[sp] as uword) as word
+                }
+    sub op_ior() {                        ; bitwise OR
+                    sp--
+                    istack[sp-1] = (istack[sp-1] as uword | istack[sp] as uword) as word
+                }
+    sub op_inot() {                       ; bitwise complement (NOT x == -(x+1))
+                    istack[sp-1] = (~ (istack[sp-1] as uword)) as word
+                }
     sub op_printi() {
                     sp--
                     last_printed = stack[sp] as word     ; truncated integer, for the mailbox
@@ -587,6 +680,33 @@ _end:
                         cont = nv <= for_limit[top]
                     else
                         cont = nv >= for_limit[top]
+                    if cont
+                        pc = for_top[top]
+                    else
+                        forsp--                  ; loop finished; pop the frame
+                }
+    sub op_iforpush() {                   ; FOR I%=start TO limit STEP step -- open an integer loop frame
+                    ubyte slot = @(pcbase + pc)    ; ivarsf slot (< 128, fits a byte)
+                    pc += 2
+                    sp--
+                    word istepv = istack[sp]     ; step was pushed last
+                    sp--
+                    for_var[forsp] = slot
+                    for_ilimit[forsp] = istack[sp]  ; then limit
+                    for_istep[forsp] = istepv
+                    for_top[forsp] = pc          ; body starts right after this opcode
+                    forsp++
+                }
+    sub op_ifornext() {                   ; step the innermost integer FOR (16-bit, wraps like other % ops)
+                    ubyte top = forsp - 1
+                    uword vaddr = ivarsf + (for_var[top] as uword) * 2
+                    word nv = (peekw(vaddr) as word) + for_istep[top]
+                    pokew(vaddr, nv as uword)
+                    bool cont
+                    if for_istep[top] >= 0
+                        cont = nv <= for_ilimit[top]
+                    else
+                        cont = nv >= for_ilimit[top]
                     if cont
                         pc = for_top[top]
                     else
@@ -647,6 +767,11 @@ _end:
                         arr_base[adslot] = arr_top
                         arr_len[adslot] = adtot
                         arr_ndims[adslot] = adnd
+                        ; BASIC guarantees DIM'd numeric elements start at 0.0. arrheap is an
+                        ; uninitialized memory() slab (in-process: stale compiler bytes), so a
+                        ; never-stored element would otherwise read a garbage 5-byte value -- and a
+                        ; non-normalized MFLPT float hangs the ROM FOUT formatter when PRINTed.
+                        sys.memset(arrheap + arr_top, adtot * 5, 0)
                         arr_top += adtot * 5
                     } else {
                         arr_len[adslot] = 0                  ; too big / out of heap -> unusable

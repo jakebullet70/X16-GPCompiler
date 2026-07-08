@@ -167,6 +167,32 @@ pcode {
     const ubyte OP_ITOF2  = 75   ; ()           coerce the SECOND-from-top cell int->float (for mixed a<op>b)
     const ubyte OP_FTOI   = 76   ; ()           coerce the TOP cell float->int, truncating toward zero
 
+    ; --- integer comparison / logic / branch (Phase 5 increment 2): the compiler emits these for
+    ;     integer-typed operands (same firing rule as the arithmetic ops -- both intish, >=1 real INT),
+    ;     so integer conditionals and loop guards never touch the ROM float compare. Each comparison
+    ;     pops two ints and pushes an int truth value (-1 true / 0 false, CBM convention). IAND/IOR/INOT
+    ;     are bitwise on the 16-bit int (which is also logical, since truth is -1/0). IJZ is the integer
+    ;     twin of OP_JZ: it pops the int stack (not the float stack) and branches when the value is 0. ---
+    const ubyte OP_ICMPEQ = 77   ; ()           pop b,a (int); push (a==b) ? -1 : 0
+    const ubyte OP_ICMPNE = 78   ; ()           pop b,a (int); push (a!=b) ? -1 : 0
+    const ubyte OP_ICMPLT = 79   ; ()           pop b,a (int, signed); push (a<b)  ? -1 : 0
+    const ubyte OP_ICMPGT = 80   ; ()           pop b,a (int, signed); push (a>b)  ? -1 : 0
+    const ubyte OP_ICMPLE = 81   ; ()           pop b,a (int, signed); push (a<=b) ? -1 : 0
+    const ubyte OP_ICMPGE = 82   ; ()           pop b,a (int, signed); push (a>=b) ? -1 : 0
+    const ubyte OP_IJZ    = 83   ; (imm16 pc)   pop int; jump to pcode offset if it is zero
+    const ubyte OP_IAND   = 84   ; ()           pop b,a (int); push (a & b)
+    const ubyte OP_IOR    = 85   ; ()           pop b,a (int); push (a | b)
+    const ubyte OP_INOT   = 86   ; ()           unary: pop a (int); push ~a  (NOT x == -(x+1))
+
+    ; --- integer FOR/NEXT (Phase 5 inc 2): the twins of OP_FORPUSH/OP_FORNEXT for a `%` loop counter
+    ;     (FOR I%=..). The counter, limit and step are 16-bit ints (stepped/compared without the ROM
+    ;     float path). CBM V2 rejects `FOR I%`, so this is a pure GPC extension. Integer stepping WRAPS
+    ;     at 16 bits like the other `%` ops -- a counter that crosses +-32767 wraps (documented divergence
+    ;     from float FOR). The compiler statically pairs each I(FOR)PUSH with the matching I(FOR)NEXT, so
+    ;     the runtime never needs a per-frame type tag: the opcode itself says int vs float. ---
+    const ubyte OP_IFORPUSH = 87 ; (imm16 slot) pop step then limit (int); open an integer FOR frame
+    const ubyte OP_IFORNEXT = 88 ; ()           step the innermost (integer) FOR; loop to top or pop frame
+
     ; Element addressing for both array families is ROW-MAJOR over dimension SIZES s_j = (max index j)+1:
     ; for subscripts i_0..i_{nd-1}, offset = (((i_0)*s_1 + i_1)*s_2 + i_2)... (Horner). The compiler emits
     ; the same subscripts for DIM and for access, so the exact layout only has to be self-consistent.
@@ -212,11 +238,12 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $5000                    ; runtime finds the compiled program here. Must sit
+    const uword PCODE_BASE = $5600                    ; runtime finds the compiled program here. Must sit
                                                       ; ABOVE the bundled runtime's whole memory footprint
                                                       ; (code + vars + slabs: heap, numeric & string array
                                                       ; heaps) so its RAM never overlaps the loaded P-code.
-                                                      ; The runtime's slabs end ~$4CE0 (grew with the X16
-                                                      ; function buffers + the integer istack/ivars slabs),
-                                                      ; so PCODE_BASE sits above that; leaves ~20 KB for P-code.
+                                                      ; The runtime's live RAM tops ~$5098 (grew with the X16
+                                                      ; function buffers + the integer istack/ivars slabs +
+                                                      ; the increment-2 integer compare/branch/FOR opcodes),
+                                                      ; so PCODE_BASE sits above that; leaves ~18 KB for P-code.
 }

@@ -241,6 +241,50 @@ bash "$DIR/check-out.sh"   '10 A%=30000:PRINT A%+30000'     "-5536" || fail=1
 bash "$DIR/check-standalone.sh" mail '10 S%=0\n20 FOR I=1 TO 100\n30 S%=S%+2\n40 NEXT\n50 PRINT S%' 0400=c8 || fail=1
 
 echo
+echo "== Integer comparisons, logic & branches (Phase 5 inc 2): % operands -> ICMP*/IAND/IOR/INOT/IJZ =="
+# an integer comparison drives IF via IJZ (no ROM float compare): taken, and not-taken falls through
+bash "$DIR/check-basic.sh" '10 A%=5:IF A%>3 THEN PRINT 42'            0400=2a || fail=1   # ICMPGT true -> taken
+bash "$DIR/check-basic.sh" '10 A%=5:IF A%>7 THEN PRINT 42\n20 PRINT 9' 0400=9 || fail=1  # false -> THEN skipped
+bash "$DIR/check-basic.sh" '10 A%=5:IF A%=5 THEN PRINT 1'             0400=1  || fail=1   # ICMPEQ
+bash "$DIR/check-basic.sh" '10 A%=5:IF A%<>6 THEN PRINT 1'            0400=1  || fail=1   # ICMPNE
+# an integer comparison result is the CBM truth value -1/0 (coerced to float only to PRINT it)
+bash "$DIR/check-basic.sh" '10 A%=5:PRINT A%>3'                       0400=ff 0401=ff || fail=1  # -1
+bash "$DIR/check-basic.sh" '10 A%=5:PRINT A%<3'                       0400=0  || fail=1           # 0
+# compound conditions stay integer end-to-end (ICMP + IAND/IOR + IJZ)
+bash "$DIR/check-basic.sh" '10 A%=5:IF A%>0 AND A%<10 THEN PRINT 42'  0400=2a || fail=1  # IAND, both true
+bash "$DIR/check-basic.sh" '10 A%=5:IF A%<0 OR A%>3 THEN PRINT 7'     0400=7  || fail=1  # IOR
+# AND/OR/NOT are BITWISE on the 16-bit int (logical truth -1/0 is the special case)
+bash "$DIR/check-basic.sh" '10 A%=6:PRINT A% AND 3'                   0400=2  || fail=1   # 6 & 3 = 2
+bash "$DIR/check-basic.sh" '10 A%=5:PRINT A% OR 2'                    0400=7  || fail=1   # 5 | 2 = 7
+bash "$DIR/check-basic.sh" '10 A%=0:PRINT NOT A%'                     0400=ff 0401=ff || fail=1  # ~0 = -1
+bash "$DIR/check-out.sh"   '10 A%=5:PRINT NOT A%'                     "-6"    || fail=1   # ~5 = -(5+1)
+# a mixed int/float comparison falls to the FLOAT path (coerce the % operand), still correct
+bash "$DIR/check-basic.sh" '10 A%=5:B=3.5:IF A%>B THEN PRINT 1'       0400=1  || fail=1
+# an all-integer IF-driven loop: ICMPLT + IJZ back-edge (the loop-control win)
+bash "$DIR/check-basic.sh" '10 I%=0\n20 I%=I%+1\n30 IF I%<5 THEN GOTO 20\n40 PRINT I%' 0400=5 || fail=1
+# standalone: an integer doubling loop guarded by an integer compare, no compiler present -> 10 doublings
+bash "$DIR/check-standalone.sh" mail '10 N%=0\n20 A%=1\n30 A%=A%+A%:N%=N%+1\n40 IF A%<1000 THEN GOTO 30\n50 PRINT N%' 0400=0a || fail=1
+
+echo
+echo "== Integer FOR/NEXT (Phase 5 inc 2): FOR I%=.. compiles to IFORPUSH/IFORNEXT (16-bit counter) =="
+# a fully integer counting loop (IFORPUSH/IFORNEXT + integer body): sum 1..10 = 55
+bash "$DIR/check-basic.sh" '10 S%=0\n20 FOR I%=1 TO 10\n30 S%=S%+I%\n40 NEXT\n50 PRINT S%'         0400=37 || fail=1
+# NEXT with a matching % counter name
+bash "$DIR/check-basic.sh" '10 S%=0\n20 FOR I%=1 TO 10\n30 S%=S%+I%\n40 NEXT I%\n50 PRINT S%'      0400=37 || fail=1
+# STEP: 0+2+..+10 = 30
+bash "$DIR/check-basic.sh" '10 S%=0\n20 FOR I%=0 TO 10 STEP 2\n30 S%=S%+I%\n40 NEXT\n50 PRINT S%'  0400=1e || fail=1
+# a negative STEP counts down; the final counter value is 1
+bash "$DIR/check-basic.sh" '10 FOR I%=5 TO 1 STEP -1\n20 PRINT I%\n30 NEXT'                       0400=1  || fail=1
+# nested integer loops: 3 * 4 = 12 iterations
+bash "$DIR/check-basic.sh" '10 C%=0\n20 FOR A%=1 TO 3\n30 FOR B%=1 TO 4\n40 C%=C%+1\n50 NEXT B%\n60 NEXT A%\n70 PRINT C%' 0400=0c || fail=1
+# mixed nesting: a FLOAT outer FOR around an INTEGER inner FOR (frames don't collide) -> 12
+bash "$DIR/check-basic.sh" '10 C%=0\n20 FOR A=1 TO 3\n30 FOR B%=1 TO 4\n40 C%=C%+1\n50 NEXT B%\n60 NEXT A\n70 PRINT C%' 0400=0c || fail=1
+# a float loop bound truncates toward zero into the integer counter: TO 5.9 -> last iteration at 5
+bash "$DIR/check-basic.sh" '10 S%=0\n20 FOR I%=1 TO 5.9\n30 S%=S%+1\n40 NEXT\n50 PRINT S%'         0400=5  || fail=1
+# standalone: an integer FOR-accumulation loop bundled with no compiler present -> 2*100 = 200
+bash "$DIR/check-standalone.sh" mail '10 S%=0\n20 FOR I%=1 TO 100\n30 S%=S%+2\n40 NEXT\n50 PRINT S%' 0400=c8 || fail=1
+
+echo
 echo "== Channel / file I/O (OPEN / CLOSE / PRINT# / GET# / ST, via the KERNAL device API) =="
 # round-trip: write "AB" to a file with PRINT#, read it back a byte at a time with GET#, count to EOF (ST)
 CIO='10 OPEN 1,8,1,"CIO,S,W"\n20 PRINT#1,"AB";\n30 CLOSE 1\n40 OPEN 1,8,0,"CIO"\n50 GET#1,A$:N=N+1:IF ST=0 GOTO 50\n70 PRINT N\n80 CLOSE 1'
@@ -264,6 +308,16 @@ bash "$DIR/check-basic.sh" "10 DIM A(5):DIM B(2):B(0)=3:A(3)=99:PRINT A(B(0))"  
 bash "$DIR/check-basic.sh" "10 A=7:DIM A(3):A(0)=9:PRINT A"                      0400=7  || fail=1
 # out-of-range element reads as 0 (no corruption)
 bash "$DIR/check-basic.sh" "10 DIM A(2):PRINT A(9)"                              0400=0  || fail=1
+# fresh DIM'd elements must read as 0.0 (BASIC zero-init). Regression: op_dim used to leave
+# arrheap garbage, and PRINTing an unstored element's non-normalized float HUNG the ROM FOUT.
+bash "$DIR/check-basic.sh" "10 DIM A(5):PRINT A(0)"                              0400=0  || fail=1
+bash "$DIR/check-basic.sh" "10 DIM A(3,3):PRINT A(1,2)"                          0400=0  || fail=1
+# read an unstored element via a VARIABLE subscript across a multi-iteration loop (the exact
+# shape that used to hang): all elements 0, so PRINT of the last-read value is 0.
+bash "$DIR/check-basic.sh" "10 DIM A(5)\n20 FOR I=1 TO 3\n30 S=A(I)\n40 NEXT\n50 PRINT S" 0400=0 || fail=1
+bash "$DIR/check-basic.sh" "10 DIM A(5):FOR I=1 TO 2:S=A(I):NEXT:PRINT S"        0400=0  || fail=1
+# partially-filled array: unstored neighbours stay 0, stored one reads back (no garbage bleed)
+bash "$DIR/check-basic.sh" "10 DIM A(9):A(4)=7:PRINT A(3)+A(4)+A(5)"            0400=7  || fail=1
 
 echo
 echo "== Multi-dimensional & string arrays =="

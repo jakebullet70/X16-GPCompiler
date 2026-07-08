@@ -75,14 +75,14 @@ main {
 
     ; --- string-literal pool; OP_PUSHS stores pool-relative offsets (vm.litbase resolves
     ;     them), so the same P-code works in-process and in a standalone out.prg ---
-    const uword LIT_SIZE = 768            ; trimmed from 1024 to fit the Phase-5 integer-typing code under MEMTOP
+    const uword LIT_SIZE = 768            ; string-literal pool (low RAM freed by banked-RAM name tables)
     uword litpool_ptr = memory("gpc_lit", LIT_SIZE, 0)
     uword lit_len
     ubyte[64] tokstr               ; string-literal text when tok == T_STRLIT (also DATA-item text)
 
     ; --- DATA pool: item texts (null-terminated, in line order) that READ walks at run time.
     ;     Bundled after the literal pool in a standalone out.prg; resolved via vm.database. ---
-    const uword DATA_SIZE = 768           ; trimmed from 1024 to fit the Phase-5 integer-typing code under MEMTOP
+    const uword DATA_SIZE = 768           ; DATA-item pool (low RAM freed by banked-RAM name tables)
     uword datapool_ptr = memory("gpc_data", DATA_SIZE, 0)
     uword data_len
 
@@ -112,45 +112,51 @@ main {
     ubyte[NAMELEN] tokname         ; identifier text when tok == T_IDENT (zero-terminated)
     ubyte[NAMELEN] pend_name       ; an identifier held across one lookahead (scalar vs array)
 
-    ; --- symbol tables in memory() slabs (name -> slot); slot must fit the VM's arrays ---
+    ; --- symbol tables: the name -> slot maps live in BANKED RAM (NAMES_BANK's $A000 window), freeing
+    ;     ~2.4 KB of low RAM so the self-hosted compiler fits under MEMTOP $9f00 with room for Phase-5
+    ;     integer typing. Only the intern_*() lookups touch these tables, and each pages NAMES_BANK in
+    ;     first; every P-code emit (pc_poke) and source read (next_src_line) re-asserts ITS own bank, so
+    ;     the switch is self-correcting. The tables are compile-time only (a run reads P-code by slot,
+    ;     never by name), so clobbering NAMES_BANK during the standalone output pass would be harmless. ---
+    const ubyte NAMES_BANK = PCODE_BANK0 + 2     ; = 9: a free bank above source (1..6) and P-code (7..8)
+    ; byte offsets of each table within the NAMES_BANK window (BRAM = $A000); NAMELEN bytes per entry:
+    const uword varnames_ptr  = BRAM + 0         ; MAXVARS  128 * 8 = 1024  -> $A000..$A3FF
+    const uword ivarnames_ptr = BRAM + 1024      ; MAXIVARS  64 * 8 =  512  -> $A400..$A5FF
+    const uword svarnames_ptr = BRAM + 1536      ; MAXSVARS  64 * 8 =  512  -> $A600..$A7FF
+    const uword arrnames_ptr  = BRAM + 2048      ; MAXARRS   32 * 8 =  256  -> $A800..$A8FF
+    const uword sarrnames_ptr = BRAM + 2304      ; MAXSARRS  32 * 8 =  256  -> $A900..$A9FF
+    ; compile-time-only maps also live in the bank (same reason -- a run never reads them):
+    const uword linenums_ptr  = BRAM + 2560      ; MAXLINES 128 * 2 =  256  -> $AA00..$AAFF  (GOTO/THEN map)
+    const uword lineaddrs_ptr = BRAM + 2816      ; MAXLINES 128 * 2 =  256  -> $AB00..$ABFF
+    const uword fnnames_bptr  = BRAM + 3072      ; MAXFNS    16 * 8 =  128  -> $AC00..$AC7F  (DEF FN names)
+                                                 ; (3200 bytes used of the 8 KB bank -- room to grow caps)
     const ubyte MAXVARS = 128            ; VM has word[128] vars
     const ubyte SCRATCH_SLOT = 127       ; top numeric slot reserved for the compiler (ON selector temp)
-    uword varnames_ptr = memory("gpc_varnames", 1024, 0)     ; 128 * 8
     ubyte nvars
 
-    ; --- integer (`%`) variables: own namespace + VM storage (vm.ivarsf), Phase 5. Kept modest to fit
-    ;     the self-hosted compiler under MEMTOP $9f00; could move to banked RAM later if more are needed. ---
-    const ubyte MAXIVARS = 48
-    uword ivarnames_ptr = memory("gpc_ivarnames", 384, 0)    ; 48 * 8 (names include the '%')
+    const ubyte MAXIVARS = 64            ; integer (`%`) variables: own namespace + VM storage (vm.ivarsf)
     ubyte niv
 
     ; --- DEF FN user functions: name -> (pcode entry offset, parameter var slot). Reuses OP_GOSUB/
     ;     OP_RET at runtime; a call emits STORV param + GOSUB entry. DEF must precede use (textually). ---
     const ubyte MAXFNS = 16
-    ubyte[MAXFNS * NAMELEN] fnnames      ; 16 * 8 = 128 bytes of function names
+    ; fnnames lives in NAMES_BANK (fnnames_bptr); fn_entry/fn_param stay in low RAM (small, hot in a run's setup)
     uword[MAXFNS] fn_entry               ; pcode offset of each function body
     ubyte[MAXFNS] fn_param               ; the numeric var slot bound to the parameter
     ubyte nfns
 
-    ; --- separate namespace for string variables (name incl. '$' suffix) ---
-    const ubyte MAXSVARS = 64            ; VM has uword[64] svars
-    uword svarnames_ptr = memory("gpc_svarnames", 512, 0)    ; 64 * 8
+    const ubyte MAXSVARS = 64            ; string variables (name incl. '$'); VM has uword[64] svars
     ubyte nsvars
 
-    ; --- separate namespace for numeric arrays (DIM); slot must fit the VM's 32 descriptors ---
-    const ubyte MAXARRS = 32
-    uword arrnames_ptr = memory("gpc_arrnames", 256, 0)      ; 32 * 8
+    const ubyte MAXARRS = 32             ; numeric arrays (DIM); slot must fit the VM's 32 descriptors
     ubyte narr
 
-    ; --- separate namespace for string arrays (DIM A$()); the VM keeps 32 of these too ---
-    const ubyte MAXSARRS = 32
-    uword sarrnames_ptr = memory("gpc_sarrnames", 256, 0)    ; 32 * 8 (names include the '$')
+    const ubyte MAXSARRS = 32            ; string arrays (DIM A$(), name incl. '$'); the VM keeps 32 too
     ubyte nsarr
 
-    ; --- line-number map (linenum -> pcode offset) for GOTO / THEN targets ---
+    ; --- line-number map (linenum -> pcode offset) for GOTO / THEN targets; lives in NAMES_BANK
+    ;     (linenums_ptr/lineaddrs_ptr) -- record_line/find_line_addr page it in, compile-time only ---
     const ubyte MAXLINES = 128
-    uword[MAXLINES] line_nums            ; 128 * 2 = 256 bytes (the array-size ceiling)
-    uword[MAXLINES] line_addrs
     ubyte nlines
 
     ; --- forward-reference fixups, backpatched in pass 2 (Blitz style two-pass core) ---
@@ -163,6 +169,7 @@ main {
     ; --- compile-time FOR stack (to match each NEXT to its FOR) ---
     const ubyte MAXFOR = 8
     ubyte[MAXFOR] for_slots        ; loop-variable slot of each open FOR
+    bool[MAXFOR]  for_is_int       ; true if that FOR's counter is a `%` integer var (Phase 5 inc 2)
     ubyte for_depth
 
     const ubyte T_EOF     = 0
@@ -263,6 +270,8 @@ main {
                 vm.litbase = litpool_ptr             ; literals + DATA live in our own pools in-process
                 vm.database = datapool_ptr
                 vm.datatop = datapool_ptr + data_len
+                vm.heapfloor = sys.progend()         ; string heap goes ABOVE all slabs (name tables are
+                                                     ; banked now), using the free RAM up to MEMTOP
                 if code_len <= RUN_CAP {
                     cx16.rambank(PCODE_BANK0)        ; select the P-code bank; the VM never switches it,
                     txt.print("run:\n")              ; so it reads the P-code straight from the $A000 window
@@ -1067,48 +1076,76 @@ main {
         next_token()
     }
 
-    ; FOR ident "=" start TO limit [STEP step]
-    ; runtime stack layout for FORPUSH: push limit, then step (popped step-first)
+    ; FOR ident "=" start TO limit [STEP step]   (ident may be a `%` integer var -> a native integer FOR)
+    ; runtime stack layout for (I)FORPUSH: push limit, then step (popped step-first)
     sub parse_for() {
         next_token()
-        if tok != T_IDENT {
+        bool is_int = tok == T_IVAR             ; FOR I%=.. : integer counter (GPC extension; V2 rejects it)
+        ubyte slot
+        if is_int {
+            slot = intern_ivar()
+        } else if tok == T_IDENT {
+            slot = intern_var()
+        } else {
             error(E_SYNTAX)
             return
         }
-        ubyte slot = intern_var()
         next_token()
         if tok != T_EQ {
             error(E_SYNTAX)
             return
         }
         next_token()
-        parse_expr()                            ; start value
-        emit_byte(pcode.OP_STORV)               ; ... into the loop variable
+        for_operand(is_int)                     ; start value
+        if is_int
+            emit_byte(pcode.OP_ISTORV)          ; ... into the integer loop variable
+        else
+            emit_byte(pcode.OP_STORV)           ; ... into the float loop variable
         emit_imm16(slot as uword)
         if tok != T_TO {
             error(E_SYNTAX)
             return
         }
         next_token()
-        parse_expr()                            ; limit -> left on the stack
+        for_operand(is_int)                     ; limit -> left on the stack
         if tok == T_STEP {
             next_token()
-            parse_expr()                        ; step -> on top of limit
+            for_operand(is_int)                 ; step -> on top of limit
         } else {
-            emit_byte(pcode.OP_PUSHI)           ; default STEP 1
+            if is_int
+                emit_byte(pcode.OP_IPUSHI)      ; default STEP 1
+            else
+                emit_byte(pcode.OP_PUSHI)
             emit_imm16(1)
         }
-        emit_byte(pcode.OP_FORPUSH)
+        if is_int
+            emit_byte(pcode.OP_IFORPUSH)
+        else
+            emit_byte(pcode.OP_FORPUSH)
         emit_imm16(slot as uword)
         if for_depth == MAXFOR {
             error(E_MEM)
             return
         }
         for_slots[for_depth] = slot
+        for_is_int[for_depth] = is_int
         for_depth++
     }
 
-    ; NEXT [ident]   -- steps the innermost FOR (the VM tracks the frame)
+    ; parse one FOR sub-expression (start / limit / step); an integer FOR truncates a float bound to int
+    sub for_operand(bool is_int) {
+        if is_int {
+            expr_keep_int = true
+            parse_expr()
+            if expr_type == TY_FLOAT
+                emit_byte(pcode.OP_FTOI)        ; a float bound truncates toward zero into the int counter
+        } else {
+            parse_expr()
+        }
+    }
+
+    ; NEXT [ident]   -- steps the innermost FOR (the VM tracks the frame). The counter's kind (int/float)
+    ; is known from the open FOR, so the matching integer or float NEXT opcode is emitted.
     sub parse_next() {
         next_token()
         if for_depth == 0 {
@@ -1116,12 +1153,21 @@ main {
             return
         }
         for_depth--
-        if tok == T_IDENT {                     ; optional variable: must match the open FOR
-            if intern_var() != for_slots[for_depth]
-                error(E_NEXT)
-            next_token()
+        if for_is_int[for_depth] {
+            if tok == T_IVAR {                  ; optional counter: must match the open integer FOR
+                if intern_ivar() != for_slots[for_depth]
+                    error(E_NEXT)
+                next_token()
+            }
+            emit_byte(pcode.OP_IFORNEXT)
+        } else {
+            if tok == T_IDENT {                 ; optional variable: must match the open FOR
+                if intern_var() != for_slots[for_depth]
+                    error(E_NEXT)
+                next_token()
+            }
+            emit_byte(pcode.OP_FORNEXT)
         }
-        emit_byte(pcode.OP_FORNEXT)
     }
 
     sub parse_gosub() {
@@ -1273,6 +1319,7 @@ main {
     }
 
     sub intern_fn() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; fn names are banked; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nfns {
             if strings.compare(&tokname, fn_ptr(i)) == 0
@@ -1290,6 +1337,7 @@ main {
 
     ; find a defined function by the name in `tokname`; $ff if undefined (FN used before its DEF)
     sub lookup_fn() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; fn names are banked; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nfns {
             if strings.compare(&tokname, fn_ptr(i)) == 0
@@ -1300,7 +1348,7 @@ main {
     }
 
     sub fn_ptr(ubyte idx) -> uword {
-        return &fnnames + (idx as uword) * NAMELEN
+        return fnnames_bptr + (idx as uword) * NAMELEN
     }
 
     ; the body after THEN. Must NOT re-enter parse_if (Prog8 has no recursion),
@@ -1356,6 +1404,7 @@ main {
     sub parse_if() {
         next_token()                            ; consume IF
         uword before = code_len
+        expr_keep_int = true                    ; keep an integer condition raw so we can branch with IJZ
         parse_expr()
         if code_len == before {
             error(E_SYNTAX)
@@ -1371,7 +1420,10 @@ main {
             }
             ; leave the GOTO as the current token; parse_then_body parses it as the THEN body
         }
-        emit_byte(pcode.OP_JZ)
+        if is_intish(expr_type)                 ; integer condition -> branch off the int stack
+            emit_byte(pcode.OP_IJZ)
+        else
+            emit_byte(pcode.OP_JZ)
         uword patch = code_len                  ; operand slot to backpatch
         emit_imm16(0)
         parse_then_body()
@@ -1403,16 +1455,18 @@ main {
             error(E_MEM)
             return
         }
-        line_nums[nlines] = num
-        line_addrs[nlines] = addr
+        cx16.rambank(NAMES_BANK)                ; line map is banked; next emit/read re-asserts its bank
+        pokew(linenums_ptr  + (nlines as uword) * 2, num)
+        pokew(lineaddrs_ptr + (nlines as uword) * 2, addr)
         nlines++
     }
 
     sub find_line_addr(uword num) -> uword {
+        cx16.rambank(NAMES_BANK)                ; line map is banked; caller re-asserts its bank on the next emit
         ubyte i = 0
         while i < nlines {
-            if line_nums[i] == num
-                return line_addrs[i]
+            if peekw(linenums_ptr + (i as uword) * 2) == num
+                return peekw(lineaddrs_ptr + (i as uword) * 2)
             i++
         }
         return $ffff
@@ -1843,6 +1897,7 @@ main {
 
     ; string variable slot (separate namespace from numeric vars)
     sub intern_svar() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nsvars {
             if strings.compare(&tokname, svar_ptr(i)) == 0
@@ -1864,6 +1919,7 @@ main {
 
     ; find the slot for the identifier currently in `tokname`, defining it if new
     sub intern_var() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nvars {
             if strings.compare(&tokname, name_ptr(i)) == 0
@@ -1885,6 +1941,7 @@ main {
 
     ; slot for the integer (`%`) variable in `tokname` (name incl. '%'; its own namespace + VM storage)
     sub intern_ivar() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < niv {
             if strings.compare(&tokname, iname_ptr(i)) == 0
@@ -1931,6 +1988,7 @@ main {
 
     ; array slot for the identifier in `tokname` (separate namespace from scalars/strings)
     sub intern_arr() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < narr {
             if strings.compare(&tokname, arr_ptr(i)) == 0
@@ -1952,6 +2010,7 @@ main {
 
     ; string-array slot for the identifier in `tokname` (name includes the '$'; own namespace)
     sub intern_sarr() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nsarr {
             if strings.compare(&tokname, sarr_ptr(i)) == 0
@@ -1991,6 +2050,12 @@ main {
     ubyte[EXPRNEST] fr_id                        ; a held function sub-id (snid/nsid/slid)
     ubyte[EXPRNEST] fr_slot                      ; a held array slot across a nested subscript-list parse
     ubyte[EXPRNEST] fr_nd                        ; running subscript count of an array access
+    ; parse_expr's type-stack base + keep-int flag ALSO outlive a nested parse: they are static locals
+    ; that the recursive subscript/argument parse_expr overwrites, so every nested-parse site saves them
+    ; here and restores them after (without this, an integer expression containing an array/func load
+    ; mis-types its result -- the exit ITOF/type would use the inner parse's clobbered values).
+    ubyte[EXPRNEST] fr_tbase                     ; saved parse_expr `tbase`
+    bool[EXPRNEST]  fr_keepint                   ; saved parse_expr `keep_int`
     ubyte fr_sp                                  ; frame-stack pointer
 
     ; --- integer-first arithmetic (Phase 5): a compile-time TYPE STACK that mirrors the runtime numeric
@@ -2082,6 +2147,8 @@ main {
                         }
                         fr_base[fr_sp] = mybase
                         fr_stoprp[fr_sp] = stop_rp
+                        fr_tbase[fr_sp] = tbase
+                        fr_keepint[fr_sp] = keep_int
                         fr_slot[fr_sp] = intern_arr()
                         fr_nd[fr_sp] = 0
                         fr_sp++
@@ -2098,6 +2165,8 @@ main {
                         fr_sp--
                         mybase = fr_base[fr_sp]
                         stop_rp = fr_stoprp[fr_sp]
+                        tbase = fr_tbase[fr_sp]
+                        keep_int = fr_keepint[fr_sp]
                         ubyte aslot = fr_slot[fr_sp]
                         ubyte ndim = fr_nd[fr_sp]
                         if tok != T_RPAREN {
@@ -2164,6 +2233,8 @@ main {
                     }
                     fr_base[fr_sp] = mybase
                     fr_stoprp[fr_sp] = stop_rp
+                    fr_tbase[fr_sp] = tbase
+                    fr_keepint[fr_sp] = keep_int
                     fr_id[fr_sp] = tok_funcid
                     fr_sp++
                     next_token()                     ; consume the function keyword
@@ -2176,6 +2247,8 @@ main {
                     fr_sp--
                     mybase = fr_base[fr_sp]
                     stop_rp = fr_stoprp[fr_sp]
+                    tbase = fr_tbase[fr_sp]
+                    keep_int = fr_keepint[fr_sp]
                     ubyte snid = fr_id[fr_sp]
                     if tok != T_RPAREN {
                         error(E_SYNTAX)
@@ -2214,6 +2287,8 @@ main {
                     }
                     fr_base[fr_sp] = mybase
                     fr_stoprp[fr_sp] = stop_rp
+                    fr_tbase[fr_sp] = tbase
+                    fr_keepint[fr_sp] = keep_int
                     fr_slot[fr_sp] = fidx
                     fr_sp++
                     next_token()                     ; consume '('
@@ -2221,6 +2296,8 @@ main {
                     fr_sp--
                     mybase = fr_base[fr_sp]
                     stop_rp = fr_stoprp[fr_sp]
+                    tbase = fr_tbase[fr_sp]
+                    keep_int = fr_keepint[fr_sp]
                     ubyte f2 = fr_slot[fr_sp]
                     if had_error
                         return
@@ -2257,6 +2334,8 @@ main {
                         }
                         fr_base[fr_sp] = mybase
                         fr_stoprp[fr_sp] = stop_rp
+                        fr_tbase[fr_sp] = tbase
+                        fr_keepint[fr_sp] = keep_int
                         fr_slot[fr_sp] = xsub
                         fr_nd[fr_sp] = 0
                         fr_sp++
@@ -2273,6 +2352,8 @@ main {
                         fr_sp--
                         mybase = fr_base[fr_sp]
                         stop_rp = fr_stoprp[fr_sp]
+                        tbase = fr_tbase[fr_sp]
+                        keep_int = fr_keepint[fr_sp]
                         xsub = fr_slot[fr_sp]
                         xn = fr_nd[fr_sp]
                         if tok != T_RPAREN {
@@ -2360,6 +2441,8 @@ main {
                     }
                     fr_base[fr_sp] = mybase
                     fr_stoprp[fr_sp] = stop_rp
+                    fr_tbase[fr_sp] = tbase
+                    fr_keepint[fr_sp] = keep_int
                     fr_sp++
                     parse_string_expr()             ; left string operand
                     if not is_cmp(tok) {
@@ -2372,6 +2455,8 @@ main {
                     fr_sp--
                     mybase = fr_base[fr_sp]
                     stop_rp = fr_stoprp[fr_sp]
+                    tbase = fr_tbase[fr_sp]
+                    keep_int = fr_keepint[fr_sp]
                     emit_byte(pcode.OP_SCMP)
                     emit_byte(fr_id[fr_sp])
                     type_push(TY_FLOAT)             ; SCMP consumes two strings; result is a numeric truth value
@@ -2455,30 +2540,48 @@ main {
                 emit_byte(slot)
                 type_push(TY_FLOAT)
             }
-            T_NOT -> {
+            T_NOT -> {                             ; unary logical: stays integer if the operand is
                 t1 = type_pop()
-                if is_intish(t1)  emit_byte(pcode.OP_ITOF)
-                emit_byte(pcode.OP_NOT)
-                type_push(TY_FLOAT)
+                if is_intish(t1) {
+                    emit_byte(pcode.OP_INOT)
+                    type_push(t1)                  ; preserve the flavour (like INEG)
+                } else {
+                    emit_byte(pcode.OP_NOT)
+                    type_push(TY_FLOAT)
+                }
             }
-            else -> {                              ; binary float ops: /, ^, comparisons, AND, OR
+            else -> {                              ; binary ops: /, ^, comparisons, AND, OR
                 t2 = type_pop()
                 t1 = type_pop()
-                if is_intish(t1)  emit_byte(pcode.OP_ITOF2)
-                if is_intish(t2)  emit_byte(pcode.OP_ITOF)
+                ubyte fop = pcode.OP_DIV            ; the float opcode for this operator
                 when op {
-                    T_SLASH -> emit_byte(pcode.OP_DIV)
-                    T_POW   -> emit_byte(pcode.OP_POW)
-                    T_EQ    -> emit_byte(pcode.OP_CMPEQ)
-                    T_LT    -> emit_byte(pcode.OP_CMPLT)
-                    T_GT    -> emit_byte(pcode.OP_CMPGT)
-                    T_LE    -> emit_byte(pcode.OP_CMPLE)
-                    T_GE    -> emit_byte(pcode.OP_CMPGE)
-                    T_NE    -> emit_byte(pcode.OP_CMPNE)
-                    T_AND   -> emit_byte(pcode.OP_AND)
-                    T_OR    -> emit_byte(pcode.OP_OR)
+                    T_SLASH -> fop = pcode.OP_DIV
+                    T_POW   -> fop = pcode.OP_POW
+                    T_EQ    -> fop = pcode.OP_CMPEQ
+                    T_LT    -> fop = pcode.OP_CMPLT
+                    T_GT    -> fop = pcode.OP_CMPGT
+                    T_LE    -> fop = pcode.OP_CMPLE
+                    T_GE    -> fop = pcode.OP_CMPGE
+                    T_NE    -> fop = pcode.OP_CMPNE
+                    T_AND   -> fop = pcode.OP_AND
+                    T_OR    -> fop = pcode.OP_OR
                 }
-                type_push(TY_FLOAT)
+                ; comparisons + AND/OR (float opcodes 11..18, a contiguous block) go integer under the
+                ; usual rule: both intish, >=1 real INT. The integer twin is a fixed opcode offset above
+                ; the float one (CMP*: +66, AND/OR: +67), so no second cascade is needed. DIV/POW (9/62)
+                ; are outside the block -> always float. Result of a compare/logic is an INT truth value.
+                if fop >= pcode.OP_CMPEQ and fop <= pcode.OP_OR and is_intish(t1) and is_intish(t2) and (t1 == TY_INT or t2 == TY_INT) {
+                    if fop <= pcode.OP_CMPGE
+                        emit_byte(fop + (pcode.OP_ICMPEQ - pcode.OP_CMPEQ))
+                    else
+                        emit_byte(fop + (pcode.OP_IAND - pcode.OP_AND))
+                    type_push(TY_INT)
+                } else {
+                    if is_intish(t1)  emit_byte(pcode.OP_ITOF2)
+                    if is_intish(t2)  emit_byte(pcode.OP_ITOF)
+                    emit_byte(fop)
+                    type_push(TY_FLOAT)
+                }
             }
         }
     }
