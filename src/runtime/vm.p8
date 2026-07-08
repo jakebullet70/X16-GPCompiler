@@ -599,6 +599,20 @@ _end:
             rts
         }}
     }
+    ; (stack[i] as uword) -> P8ZP_SCRATCH_W1 (lo), W1+1 (hi).  Same conversion routine prog8's
+    ; `as uword` cast uses, so semantics are identical.  Used by the machine ops (POKE/PEEK/SYS/
+    ; CLOSE/CHKIN/CHKOUT) to turn a numeric-stack cell into an address / device / logical-file number.
+    asmsub stack_word(ubyte i @A) {
+        %asm {{
+            jsr  p8b_vm.p8s_faddr                    ; X=lo, Y=hi of &stack[i]
+            txa                                      ; A=lo, Y=hi -> MOVFM ptr
+            jsr  floats.MOVFM                        ; FAC = stack[i]
+            jsr  floats.cast_FAC1_as_uw_into_ya      ; Y=lo, A=hi of (FAC as uword)
+            sty  P8ZP_SCRATCH_W1
+            sta  P8ZP_SCRATCH_W1+1
+            rts
+        }}
+    }
     float @shared c_negone = -1.0           ; MFLPT constant for the CBM 'true' compare result (-1.0)
     float @shared c_one = 1.0               ; MFLPT 1.0 -- positive RND arg (op_callfn: fresh random 0..1)
 
@@ -1555,20 +1569,48 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
                     sstack[ssp] = cres
                     ssp++
                 }
-    sub op_poke() {
-                    sp--
-                    ubyte v = lsb(stack[sp] as uword)    ; value (low byte)
-                    sp--
-                    @(stack[sp] as uword) = v            ; ...into the target address
-                }
-    sub op_peek() {
-                    stack[sp-1] = @(stack[sp-1] as uword) as float   ; addr -> byte 0..255
-                }
-    sub op_sys() {
-                    sp--
-                    sys_target = stack[sp] as uword
-                    sys_call()                            ; JSR to sys_target, returns here
-                }
+    asmsub op_poke() {                    ; POKE addr, v : write the low byte of v to addr
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word         ; W1 = value word
+            lda  P8ZP_SCRATCH_W1               ; A = value low byte
+            pha
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word         ; W1 = target address
+            pla
+            sta  (P8ZP_SCRATCH_W1)             ; @(addr) = v
+            rts
+        }}
+    }
+    asmsub op_peek() {                    ; PEEK(addr) : stack[sp-1] = byte at addr (0..255) as float
+        %asm {{
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_stack_word         ; W1 = addr (from stack[sp-1])
+            lda  (P8ZP_SCRATCH_W1)             ; byte at addr
+            tay
+            jsr  floats.FREADUY                ; FAC = unsigned(Y) as float
+            lda  p8b_vm.p8v_sp
+            dec  a
+            jsr  p8b_vm.p8s_faddr              ; X=lo, Y=hi of &stack[sp-1]
+            jsr  $fe66                         ; MOVMF  stack[sp-1] = FAC
+            rts
+        }}
+    }
+    asmsub op_sys() {                     ; SYS addr : subroutine-call the target, return here
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word         ; W1 = target
+            lda  P8ZP_SCRATCH_W1
+            sta  p8b_vm.p8v_sys_target
+            lda  P8ZP_SCRATCH_W1+1
+            sta  p8b_vm.p8v_sys_target+1
+            jmp  (p8b_vm.p8v_sys_target)       ; JSR-trick: target's rts returns to op_sys's caller
+        }}
+    }
     sub op_dim() {                        ; DIM A(d0[,d1..]): allocate a numeric array
                     ubyte adslot = @(pcbase + pc)          ; imm16 slot (low byte; slot < 256)
                     ubyte adnd = @(pcbase + pc + 2)        ; ndims byte follows the 2-byte slot
@@ -2009,10 +2051,15 @@ _cffnhi:    .byte >$fe84, >$fe2d, >$fe4e, >$fe30, >$fe57, >$fe42, >$fe3f, >$fe45
                     void cbm.OPEN()
                     bstr.free_temp_if_top(o_name)
                 }
-    sub op_close() {                       ; CLOSE lfn
-                    sp--
-                    cbm.CLOSE(lsb(stack[sp] as uword))
-                }
+    asmsub op_close() {                    ; CLOSE lfn
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word         ; W1 = lfn word
+            lda  P8ZP_SCRATCH_W1               ; A = lfn (low byte)
+            jmp  cbm.CLOSE
+        }}
+    }
     sub op_getch() {                       ; GET#lfn,v$ : one byte -> a 0/1-char string
                     sp--
                     void cbm.CHKIN(lsb(stack[sp] as uword))
@@ -2032,14 +2079,24 @@ _cffnhi:    .byte >$fe84, >$fe2d, >$fe4e, >$fe30, >$fe57, >$fe42, >$fe3f, >$fe45
                     stack[sp] = cbm.READST() as float
                     sp++
                 }
-    sub op_chkout() {                      ; PRINT#lfn : redirect the following PRINTs
-                    sp--
-                    cbm.CHKOUT(lsb(stack[sp] as uword))
-                }
-    sub op_chkin() {                       ; INPUT#lfn : redirect the following INPUT
-                    sp--
-                    void cbm.CHKIN(lsb(stack[sp] as uword))
-                }
+    asmsub op_chkout() {                   ; PRINT#lfn : redirect the following PRINTs
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word         ; W1 = lfn word
+            ldx  P8ZP_SCRATCH_W1               ; CHKOUT takes the logical file number in X
+            jmp  cbm.CHKOUT
+        }}
+    }
+    asmsub op_chkin() {                    ; INPUT#lfn : redirect the following INPUT
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word         ; W1 = lfn word
+            ldx  P8ZP_SCRATCH_W1               ; CHKIN takes the logical file number in X
+            jmp  cbm.CHKIN
+        }}
+    }
     sub op_clrch() {                       ; end a PRINT#/INPUT#, restore default I/O
                     cbm.CLRCHN()
                 }
