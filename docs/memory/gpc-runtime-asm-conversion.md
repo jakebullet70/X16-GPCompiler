@@ -88,6 +88,19 @@ xbuf pass-through buffers MUST stay low for ROM CHRGET/TXTPTR reach) — if BSS 
 silently corrupted at runtime. Full Blitz parity (pcode right after code, ~43 blocks) needs the hot BSS moved
 out of low RAM too — deferred. Residual: runtime CODE still ~10.4KB vs Blitz ~5KB (the long-tail 2x).
 
+**PCODE_BASE invariant now BUILD-ENFORCED + tightened (2026-07-09, branch `harden-and-tier2`).** Both int-array
+bugs were silent; one was the BSS-crosses-PCODE_BASE trap (in-process immune, so corpus passes while standalone
+silently corrupts). `scripts/assert-pcode-base.sh` reads the authoritative footprint top (`prog8_program_end` from
+the `.vice-mon-list`) + PCODE_BASE (from `pcode_format.p8`) and FAILS the build if the footprint reaches PCODE_BASE
+(warns if margin <256 B). Wired into `build.sh`'s `runtime` target (the single chokepoint producing the shipped VM
+image). Verified: exit 1 when violated, 0 when valid. With the guard in place, PCODE_BASE tightened **$3e00 -> $3c80**
+(footprint top $3b5b + 293 B margin), reclaiming 384 dead filler bytes from every compiled program = ~1 block (54 vs
+55 on a sample loop). **Tier-2 "BSS above P-code" (~43 blocks) INVESTIGATED + REJECTED as a bad trade:** unlike Tier-1's
+slabs (already-indirect `memory()` handles, 4736 B -> pure win), the remaining low BSS is ABSOLUTE-addressed (`istack`
+98 asm sites, `sstack` 48, ...); relocating it above the P-code means converting each site to indirect access, which
+trades BSS bytes for ~equal CODE bytes (re-raising the footprint) AND slows the hot paths -- ~2-3 blocks for real risk +
+a slower VM. The real remaining size lever is runtime CODE shrink (the deferred long-tail ~2x vs Blitz), not BSS moves.
+
 **op_callfn (P4b):** dispatches fnid→ROM float fn via a split lo/hi vector table indexed by fnid, called
 through a `jsr _cfvec / _cfvec: jmp (W2)` trampoline (ROM fn's rts returns past the jsr). RND special-cased:
 load FAC=`c_one`(1.0, positive) before `$fe57` for a fresh 0..1. Table order = FN_* ids 0..10:
