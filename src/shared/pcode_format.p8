@@ -247,7 +247,7 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $3E00                    ; runtime finds the compiled program here. Must sit
+    const uword PCODE_BASE = $3C80                    ; runtime finds the compiled program here. Must sit
                                                       ; ABOVE the bundled runtime's LOW-RAM footprint (code
                                                       ; + hot BSS: passbuf/xbuf pass-through buffers + VM
                                                       ; state) so its RAM never overlaps the loaded P-code.
@@ -255,10 +255,13 @@ pcode {
                                                       ; the BASIC string var table/heap park ABOVE the P-code
                                                       ; (see vm.run), so only code + hot BSS stays low --
                                                       ; topping ~$3b5a (testbench) / ~$3b42 (visual) after the
-                                                      ; inc-2c integer arrays. PCODE_BASE clears that with
-                                                      ; ~0.7 KB margin. INVARIANT: keep PCODE_BASE above the
+                                                      ; inc-2c integer arrays. Tightened to $3c80 = footprint
+                                                      ; top + 293 B, now that scripts/assert-pcode-base.sh
+                                                      ; guards this at build time (was $3e00 w/ ~0.7 KB slack;
+                                                      ; the extra 384 B were dead file bytes in every program).
+                                                      ; INVARIANT (build-enforced): keep PCODE_BASE above the
                                                       ; runtime's BSS top -- if BSS grows past it, loaded
                                                       ; P-code is silently corrupted at run time (standalone
                                                       ; only; in-process runs P-code from banked RAM). The
-                                                      ; build.sh runtime map's last BSS gap end is that top.
+                                                      ; build.sh runtime map's prog8_program_end is that top.
 }
