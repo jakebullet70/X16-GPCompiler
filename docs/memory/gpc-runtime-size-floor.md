@@ -1,6 +1,6 @@
 ---
 name: gpc-runtime-size-floor
-description: Why the GPC runtime is near its size floor — 64tass .proc DCE, prog8 cx16 floats are already ROM wrappers
+description: GPC runtime size — the 6-tier subset-selected ladder, per-tier PCODE_BASE mechanism, and why the floor is where it is (64tass .proc DCE, ROM floats, no on-device linker)
 metadata:
   type: project
 ---
@@ -26,17 +26,32 @@ exactly in the historically bug-prone FOUT/word-cast path ([[gpc-print-large-num
 `64tass --ascii --case-sensitive --long-branch --cbm-prg -o out.prg file.asm` (the `--ascii` matters —
 prog8 emits a `π` constant that fails without it).
 
-**Real size levers that DID land** (see [[gpc-inc2-design]] / runtime-tiers branch): feature-tiered runtime
-+ per-tier PCODE_BASE. A standalone `.PRG` floor is `PCODE_BASE - $0801`, so lowering the base is the only
-thing that shrinks programs; shrinking runtime code below the base just grows filler. THREE tiers now, the
-compiler auto-picks the lowest whose feature set covers `features_used`:
-- core @ $1D00 (float/control/PRINT only; features_used==0)
-- str  @ $2A20 (core + strings/bstr; features_used==FEAT_STR) -> strings-only program saves ~4.7 KB /
-  ~18 blocks vs full (HELLO 13508->8804 B). String programs are common, so this hits the frequent case.
-- full @ $3C80 (everything else)
+**Real size levers that DID land** (see [[gpc-inc2-design]] / runtime-tiers branch, unmerged as of 2026-07-09):
+feature-tiered runtime + per-tier PCODE_BASE. A standalone `.PRG` floor is `PCODE_BASE - $0801`, so lowering
+the base is the ONLY thing that shrinks programs; shrinking runtime code below the base just grows filler.
+SIX tiers now; the compiler tracks a `features_used` bitmask (STR=1 ARR=2 INT=4 X16=8 IO=$10 DATA=$20) and
+picks by SUBSET selection — lowest-base tier whose feature SET covers the program (`features_used & ~mask == 0`),
+checked ascending, so a multi-feature program is never left paying full price when a covering tier exists:
+- core       @ $1D00  (float/control/PRINT only; features_used==0)         saves ~45 blk vs full
+- arr        @ $2240  ({ARR} numeric arrays)                               saves ~26 blk
+- str        @ $2A20  ({STR} strings/bstr)                                 saves ~18 blk (HELLO 13508->8804 B)
+- arrstr     @ $2CA0  ({ARR,STR})                                          saves ~15 blk
+- arrstrdata @ $2D60  (subset of {ARR,STR,DATA}; e.g. DATA-only lands here) saves ~15 blk
+- full       @ $3C80  (anything using INT/X16/IO, or a wider mix)
 
-Mechanism (build.sh `build_tier` helper): stub the tier's excluded opcodes in _optab -> _unimpl AND collapse
-their asmsub bodies to `rts` (prog8 never DCEs `asmsub`s), which drops the footprint enough to claim a lower
-PCODE_BASE; each tier's base is set empirically from its build's `prog8_program_end` (assert-pcode-base
-guards it, needs >=256 B margin). Next rung would be +ARR (numeric arrays). Further shrink of a GIVEN tier
-needs deep hand-asm of the dispatch/live handlers — diminishing returns. See [[gpc-runtime-asm-conversion]].
+Mechanism (build.sh `build_tier <name> <strip-regex> <keep-bstr> <base> [visual]` helper): stub the tier's
+excluded opcodes in _optab -> _unimpl AND collapse their asmsub bodies to `rts` (prog8 never DCEs `asmsub`s),
+which drops the footprint enough to claim a lower PCODE_BASE; each base is set empirically from that build's
+`prog8_program_end` (assert-pcode-base guards it, ~280 B margin). To add a tier: new STRIP list (all optional
+opcodes MINUS the feature's families) + build_tier call + a `*_PCODE_BASE` const + a subset branch in gpc.p8
+write_output + stage its gpc.rt.<name>.bin in every harness (check-standalone/input/prompt, run, stage-demo,
+test.sh). Remaining rungs would be INT/X16/IO — narrower audiences, natural place to stop.
+
+**True per-program custom runtimes would need an on-device linker.** The runtime is ONE pre-linked 64tass
+image: handlers reference each other + shared VM state by absolute address, _optab holds absolute addresses,
+BSS sits at the top. To include exactly what a program uses you'd have to re-link on the X16 (relocatable
+handler fragments + reloc tables + a relocator in the compiler) OR redesign the layout for compile-time
+truncation (BSS moved to a fixed low addr, optional handlers grouped/ordered high, cut after the last used
+group). Both are real projects for only ~hundreds of bytes to ~1 KB over the nearest tier — the tiers ARE the
+pragmatic substitute. Further shrink of a GIVEN tier needs deep hand-asm of the dispatch/live handlers —
+diminishing returns. See [[gpc-runtime-asm-conversion]].
