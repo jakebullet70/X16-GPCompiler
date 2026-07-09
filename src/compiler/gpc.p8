@@ -340,11 +340,18 @@ main {
     ; (so the 100+ automated checks need no keyboard); a real on-device build prompts for them.
     sub setup_names() {
         if INTERACTIVE {
-            txt.print("compile file: ")
+            txt.print("input file: ")
             read_name(&src_name)
             if src_name[0] == 0
                 return                        ; blank name -> quit (start() exits); skip the output prompt
-            txt.print("write to: ")
+            if not diskio.exists(&src_name) {
+                ; the input doesn't exist -- report it and quit BEFORE prompting for an output
+                ; name (default_out_name would otherwise delete a stale c.<name> for a typo'd input).
+                txt.print("file not found\n")
+                src_name[0] = 0               ; signal start() to quit cleanly to READY (no compile)
+                return
+            }
+            txt.print("output file: ")
             read_name(&out_name)
             if out_name[0] == 0 {
                 default_out_name()            ; just RETURN pressed -> auto-name the output

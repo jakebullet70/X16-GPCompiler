@@ -590,6 +590,9 @@ bash "$DIR/check-prompt.sh" "10 PRINT 42" 0400=2a || fail=1
 bash "$DIR/check-prompt.sh" default "10 PRINT 42" 0400=2a || fail=1
 # correcting a mistyped name with DELETE must not corrupt it (the DEL byte used to be stored verbatim)
 bash "$DIR/check-prompt.sh" correction "10 PRINT 42" 0400=2a || fail=1
+# a non-existent input is caught BEFORE the output prompt -> FILE NOT FOUND, and a stale c.<name>
+# is NOT deleted (default_out_name would otherwise wipe it for a typo'd input)
+bash "$DIR/check-notfound.sh" || fail=1
 
 echo
 echo "== Standalone .prg: compiled programs run with NO compiler present =="
