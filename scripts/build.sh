@@ -48,3 +48,12 @@ case "$MODE" in
         echo "built: build/$BASE.prg (test)"
         ;;
 esac
+
+# Guard the PCODE_BASE invariant for the shipped standalone VM image. The runtime's
+# low-RAM footprint must end below PCODE_BASE or standalone P-code is silently corrupted
+# (see scripts/assert-pcode-base.sh). Only the 'runtime' target produces that image.
+if [ "$TARGET" = "runtime" ]; then
+    LISTBASE="$BASE"
+    [ "$MODE" = "prompt" ] && LISTBASE="${BASE}_prompt"
+    bash "$(dirname "${BASH_SOURCE[0]}")/assert-pcode-base.sh" "build/$LISTBASE.vice-mon-list"
+fi
