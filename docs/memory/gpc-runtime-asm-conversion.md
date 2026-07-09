@@ -101,6 +101,20 @@ slabs (already-indirect `memory()` handles, 4736 B -> pure win), the remaining l
 trades BSS bytes for ~equal CODE bytes (re-raising the footprint) AND slows the hot paths -- ~2-3 blocks for real risk +
 a slower VM. The real remaining size lever is runtime CODE shrink (the deferred long-tail ~2x vs Blitz), not BSS moves.
 
+**Runtime CODE shrink -- RTS-dispatch (2026-07-09, branch `if-line-semantics`, commit 0c7736b).** run()'s jump
+table pointed at ~89 per-opcode trampolines, each a 6-byte `jsr p8s_op_X / jmp _after` (~534 B, the single most
+CONCENTRATED fat -- everything else is spread 80-400 B across cold handlers). Replaced with the classic RTS-dispatch
+trick: the loop pushes `_after-1` ONCE (lda #>/pha, lda #</pha after `tax`), then `jmp (_optab,x)` straight into the
+handler; the handler's own final `rts` returns to `_after`. `_optab` now lists the handler subs directly
+(`p8b_vm.p8s_op_*`). The 3 inline ops (`_t0/_t1/_t2` = END/JMP/JZ) `jmp` not `rts`, so each pulls the pushed addr off
+first (`pla/pla`). Transparent to handlers that tail-`jmp str_error` (the final rts in the chain still lands on `_after`).
+**vm_runtime.prg 11182 -> 10660 B (-522), footprint top $3b5b -> $3951 (PCODE_BASE margin now 815 B); also -1 jsr+jmp per
+opcode (faster dispatch).** **HONEST CEILING (confirmed by module measurement): p8b_vm handlers = 8270 B / 74%, p8b_bstr
+= 1896 / 17%, all else ~1000 B combined. No more concentrated wins exist -- the handlers ARE the size and are already
+dense hand-asm. Further shrink toward the ~5 KB Blitz aspiration = shaving many handlers by small amounts (high effort,
+real regression risk, diminishing returns); realistic floor stays ~8-9 KB.** Method to find fat: sort code-region labels
+from `.vice-mon-list`, diff consecutive addrs, group by module prefix.
+
 **op_callfn (P4b):** dispatches fnid→ROM float fn via a split lo/hi vector table indexed by fnid, called
 through a `jsr _cfvec / _cfvec: jmp (W2)` trampoline (ROM fn's rts returns past the jsr). RND special-cased:
 load FAC=`c_one`(1.0, positive) before `$fe57` for a fresh 0..1. Table order = FN_* ids 0..10:
