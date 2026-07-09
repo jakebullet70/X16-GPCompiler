@@ -63,6 +63,9 @@ vm {
     uword[16]  sstack            ; string-value stack (holds descriptor addresses)
     ubyte      ssp
     ubyte[48]  sdesc             ; per-slot scratch descriptors for off-heap literals/DATA (16 * 3)
+    uword @shared shtmp          ; hand-asm string handlers park a descriptor here across bstr calls
+    uword @shared shtmp2         ; second scratch word (string-array handlers need slot/nd + tot/off)
+                                 ; (BSS, so they cost no .prg bytes; live only within one handler)
     str        str_long_msg  = "?STRING TOO LONG"     ; a concat would exceed BASIC's 255-char limit
     str        formula_msg   = "?FORMULA TOO COMPLEX" ; > 3 live string temporaries (BASIC's limit)
     str        empty_c       = ""                     ; off-heap "" for out-of-data READ results
@@ -611,6 +614,32 @@ _end:
             sty  P8ZP_SCRATCH_W1
             sta  P8ZP_SCRATCH_W1+1
             rts
+        }}
+    }
+    ; P8ZP_SCRATCH_W1 = &operand = pcbase + pc.  The string handlers read their imm operand bytes
+    ; via `lda (P8ZP_SCRATCH_W1)` / `ldy #n : lda (P8ZP_SCRATCH_W1),y` right after calling this --
+    ; before any bstr/helper call, which may reuse W1.  Leaves X and Y untouched.
+    asmsub opw() {
+        %asm {{
+            lda  p8b_vm.p8v_pcbase
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            rts
+        }}
+    }
+    ; pc += A -- advance the program counter past the consumed operand bytes. Clobbers A.
+    asmsub pcadd(ubyte n @A) {
+        %asm {{
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           rts
         }}
     }
     float @shared c_negone = -1.0           ; MFLPT constant for the CBM 'true' compare result (-1.0)
@@ -1235,12 +1264,20 @@ _ijznt:     lda  p8b_vm.p8v_pc                    ; pc += 2
                         last_printed = 0
                     print_float(pv)                      ; BASIC-formatted, no newline
                 }
-    sub op_prints() {
-                    ssp--
-                    uword psd = sstack[ssp]
-                    print_desc(psd)                       ; length-counted (bodies aren't null-terminated)
-                    bstr.free_temp_if_top(psd)            ; a printed temp is done -> reclaim its slot
-                }
+    asmsub op_prints() {
+        ; psd stays at sstack[ssp] (ssp fixed after the dec), so it's re-read for the trailing free.
+        %asm {{
+            dec  p8b_vm.p8v_ssp
+            ldx  p8b_vm.p8v_ssp
+            lda  p8b_vm.p8v_sstack_lsb,x
+            ldy  p8b_vm.p8v_sstack_msb,x
+            jsr  p8b_vm.p8s_print_desc          ; length-counted (bodies aren't null-terminated)
+            ldx  p8b_vm.p8v_ssp
+            lda  p8b_vm.p8v_sstack_lsb,x
+            ldy  p8b_vm.p8v_sstack_msb,x
+            jmp  p8b_bstr.p8s_free_temp_if_top  ; a printed temp is done -> reclaim its slot
+        }}
+    }
     sub op_newline() {
                     emit_char(13)                         ; CR to screen, LF to host console
                 }
@@ -1537,38 +1574,86 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
             rts
         }}
     }
-    sub op_pushs() {
-                    ; operand is an offset into the literal pool; litbase makes it absolute. Literal
-                    ; bodies are off-heap (program text) -> a scratch descriptor over them, which the
-                    ; collector ignores (never rooted, never moved), so the same P-code works both
-                    ; in-process and in a standalone .PRG.
-                    push_cstr(litbase + mkword(@(pcbase + pc + 1), @(pcbase + pc)))
-                    pc += 2
-                }
-    sub op_loads() {
-                    sstack[ssp] = bstr.vdesc(@(pcbase + pc))    ; push the variable's descriptor address
-                    ssp++
-                    pc += 2
-                }
-    sub op_stors() {
-                    ssp--
-                    bstr.store_var(@(pcbase + pc), sstack[ssp]) ; heap-copy / steal-temp assignment
-                    pc += 2
-                }
-    sub op_concat() {
-                    ; result = a + b, produced as a BASIC temp. concat_temp allocates the result body
-                    ; while a/b are still rooted (a GC during getspa relocates them), copies, frees any
-                    ; operand temps top-first, then pushes the result temp. A total > 255 sets
-                    ; err_toolong -> ?STRING TOO LONG (checked by str_error).
-                    uword b = sstack[ssp-1]
-                    uword a = sstack[ssp-2]
-                    uword cres = bstr.concat_temp(a, b)
-                    if str_error()
-                        return
-                    ssp -= 2
-                    sstack[ssp] = cres
-                    ssp++
-                }
+    asmsub op_pushs() {
+        ; operand is a little-endian offset into the literal pool; litbase makes it absolute. Literal
+        ; bodies are off-heap (program text) -> a scratch descriptor over them, which the collector
+        ; ignores (never rooted, never moved), so the same P-code works in-process and standalone.
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; lo = operand[0]
+            clc
+            adc  p8b_vm.p8v_litbase
+            pha
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W1),y            ; hi = operand[1] (carry from lo-add preserved)
+            adc  p8b_vm.p8v_litbase+1
+            tay                                 ; Y = hi
+            pla                                 ; A = lo
+            jsr  p8b_vm.p8s_push_cstr           ; push_cstr(litbase + le16)
+            lda  #2
+            jmp  p8b_vm.p8s_pcadd               ; pc += 2
+        }}
+    }
+    asmsub op_loads() {                     ; push the variable's descriptor address
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            jsr  p8b_bstr.p8s_vdesc             ; A=lo, Y=hi of the var's descriptor
+            ldx  p8b_vm.p8v_ssp
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            lda  #2
+            jmp  p8b_vm.p8s_pcadd
+        }}
+    }
+    asmsub op_stors() {                     ; heap-copy / steal-temp assignment into a string var
+        %asm {{
+            dec  p8b_vm.p8v_ssp
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            sta  p8b_bstr.p8s_store_var.p8v_slot
+            ldx  p8b_vm.p8v_ssp
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_store_var.p8v_sd
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_store_var.p8v_sd+1
+            jsr  p8b_bstr.p8s_store_var
+            lda  #2
+            jmp  p8b_vm.p8s_pcadd
+        }}
+    }
+    asmsub op_concat() {
+        ; result = a + b, produced as a BASIC temp. concat_temp allocates the result body while a/b are
+        ; still rooted (a GC during getspa relocates them), copies, frees any operand temps top-first,
+        ; then returns the result temp. A total > 255 sets err_toolong -> ?STRING TOO LONG. We write the
+        ; result cell then tail-call str_error: on error it sets halt (run() stops, so the just-written
+        ; cell is inert); on success it returns false, leaving the pushed result exactly as before.
+        %asm {{
+            ldx  p8b_vm.p8v_ssp
+            dex                                 ; ssp-1 -> b (pushed last)
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_concat_temp.p8v_bd
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_concat_temp.p8v_bd+1
+            dex                                 ; ssp-2 -> a
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_concat_temp.p8v_ad
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_concat_temp.p8v_ad+1
+            jsr  p8b_bstr.p8s_concat_temp       ; A=lo, Y=hi = result temp
+            ldx  p8b_vm.p8v_ssp
+            dex
+            dex                                 ; X = ssp-2 (result lands where a was)
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inx                                 ; net ssp = ssp-1 (two popped, one pushed)
+            stx  p8b_vm.p8v_ssp
+            jmp  p8b_vm.p8s_str_error           ; sets halt on overflow; bool result ignored by dispatch
+        }}
+    }
     asmsub op_poke() {                    ; POKE addr, v : write the low byte of v to addr
         %asm {{
             dec  p8b_vm.p8v_sp
@@ -1799,12 +1884,28 @@ _asdone:    rts
                     read_line()
                     pokef(varsf + (ivslot as uword) * 5, floats.parse(&inbuf))
                 }
-    sub op_inputs() {
-                    ubyte isslot = @(pcbase + pc)
-                    pc += 2
-                    read_line()
-                    bstr.var_from_mem(isslot, &inbuf, strings.length(&inbuf))   ; heap-copy into the var
-                }
+    asmsub op_inputs() {
+        ; slot parked in shtmp across read_line (which must not see var_from_mem's params set yet).
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            sta  p8b_vm.p8v_shtmp
+            lda  #2
+            jsr  p8b_vm.p8s_pcadd               ; pc += 2
+            jsr  p8b_vm.p8s_read_line           ; read one line into inbuf
+            lda  p8b_vm.p8v_shtmp
+            sta  p8b_bstr.p8s_var_from_mem.p8v_slot
+            lda  #<p8b_vm.p8v_inbuf
+            sta  p8b_bstr.p8s_var_from_mem.p8v_src
+            lda  #>p8b_vm.p8v_inbuf
+            sta  p8b_bstr.p8s_var_from_mem.p8v_src+1
+            lda  #<p8b_vm.p8v_inbuf
+            ldy  #>p8b_vm.p8v_inbuf
+            jsr  strings.length                 ; Y = length(inbuf)
+            sty  p8b_bstr.p8s_var_from_mem.p8v_n
+            jmp  p8b_bstr.p8s_var_from_mem      ; heap-copy into the var
+        }}
+    }
     asmsub op_pushf() {                      ; stack[sp] = 5-byte float immediate at pcbase+pc
         %asm {{
             lda  p8b_vm.p8v_pcbase
@@ -1875,182 +1976,539 @@ _cffnhi:    .byte >$fe84, >$fe2d, >$fe4e, >$fe30, >$fe57, >$fe42, >$fe3f, >$fe45
             ; !notreached!  (the two .byte rows above are the jump-vector data, not code)
         }}
     }
-    sub op_strnum() {                     ; LEN/ASC/VAL: pop string, push number
-                    ubyte snid = @(pcbase + pc)
-                    pc++
-                    ssp--
-                    uword snd = sstack[ssp]
-                    when snid {
-                        pcode.SN_LEN -> stack[sp] = bstr.dlen(snd) as float
-                        pcode.SN_ASC -> {
-                            if bstr.dlen(snd) == 0
-                                stack[sp] = 0.0                          ; ASC("") -> 0 (as the ported VM did)
-                            else
-                                stack[sp] = @(bstr.dptr(snd)) as float    ; PETSCII of the first char
-                        }
-                        pcode.SN_VAL -> stack[sp] = floats.parse(bstr.to_cbuf(snd))   ; parse needs a null
-                    }
-                    sp++
-                    bstr.free_temp_if_top(snd)               ; the consumed string temp is done
-                }
-    sub op_numstr() {                     ; CHR$/STR$: pop number, push a string temp
-                    ubyte nsid = @(pcbase + pc)
-                    pc++
-                    sp--
-                    uword nsres = 0
-                    when nsid {
-                        pcode.NS_CHR -> nsres = bstr.chr_temp(lsb(stack[sp] as uword))   ; one PETSCII char
-                        pcode.NS_STR -> {
-                            uword nssrc = floats.tostr(stack[sp])       ; ROM buffer, off-heap/stable
-                            if @(nssrc) == ' '
-                                nssrc++                                 ; match PRINT: drop FOUT's lead space
-                            nsres = bstr.mem_to_temp(nssrc, strings.length(nssrc))
-                        }
-                    }
-                    if str_error()
-                        return
-                    sstack[ssp] = nsres
-                    ssp++
-                }
-    sub op_lefts() {                      ; LEFT$(s,n): first n chars
-                    sp--
-                    ubyte lfn = clamp_count(stack[sp])
-                    ssp--
-                    uword lfsrc = sstack[ssp]
-                    uword lfres = bstr.substr_temp(lfsrc, 0, lfn)   ; frees src temp, pushes result temp
-                    if str_error()
-                        return
-                    sstack[ssp] = lfres
-                    ssp++
-                }
-    sub op_rights() {                     ; RIGHT$(s,n): last n chars
-                    sp--
-                    ubyte rtn = clamp_count(stack[sp])
-                    ssp--
-                    uword rtsrc = sstack[ssp]
-                    ubyte rtlen = bstr.dlen(rtsrc)
-                    ubyte rtstart = 0
-                    if rtn < rtlen
-                        rtstart = rtlen - rtn
-                    uword rtres = bstr.substr_temp(rtsrc, rtstart, rtn)
-                    if str_error()
-                        return
-                    sstack[ssp] = rtres
-                    ssp++
-                }
-    sub op_mids() {                       ; MID$(s,start,len): substring, start 1-based
-                    sp--
-                    ubyte mdlen = clamp_count(stack[sp])
-                    sp--
-                    word mdstart = stack[sp] as word
-                    ssp--
-                    uword mdsrc = sstack[ssp]
-                    ubyte mds0 = 0
-                    if mdstart > 256
-                        mds0 = 255                                      ; past end -> empty
-                    else if mdstart >= 1
-                        mds0 = (mdstart - 1) as ubyte
-                    uword mdres = bstr.substr_temp(mdsrc, mds0, mdlen)
-                    if str_error()
-                        return
-                    sstack[ssp] = mdres
-                    ssp++
-                }
+    asmsub op_strnum() {                  ; LEN/ASC/VAL: pop string, push number
+        ; snd stays valid at sstack[ssp] (ssp is fixed after the single dec), so it's re-read for the
+        ; trailing free_temp; we park it in shtmp only to survive the dlen/dptr/to_cbuf/parse calls.
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; snid
+            pha
+            lda  #1
+            jsr  p8b_vm.p8s_pcadd               ; pc++
+            dec  p8b_vm.p8v_ssp
+            ldx  p8b_vm.p8v_ssp                 ; snd = sstack[ssp]
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_vm.p8v_shtmp
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_vm.p8v_shtmp+1
+            pla                                 ; A = snid
+            cmp  #1                             ; SN_ASC
+            beq  _snasc
+            cmp  #2                             ; SN_VAL
+            beq  _snval
+            ; --- SN_LEN: FAC = dlen(snd) ---
+            lda  p8b_vm.p8v_shtmp
+            ldy  p8b_vm.p8v_shtmp+1
+            jsr  p8b_bstr.p8s_dlen              ; A = length
+            tay
+            jsr  floats.FREADUY                 ; FAC = unsigned(Y)
+            bra  _snstore
+_snasc:     lda  p8b_vm.p8v_shtmp               ; ASC: PETSCII of first char, 0 for ""
+            ldy  p8b_vm.p8v_shtmp+1
+            jsr  p8b_bstr.p8s_dlen
+            tay
+            beq  _snasc_fac                     ; empty -> Y=0 -> FREADUY gives 0.0
+            lda  p8b_vm.p8v_shtmp
+            ldy  p8b_vm.p8v_shtmp+1
+            jsr  p8b_bstr.p8s_dptr              ; A=lo, Y=hi = body ptr
+            sta  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)              ; first char
+            tay
+_snasc_fac: jsr  floats.FREADUY
+            bra  _snstore
+_snval:     lda  p8b_vm.p8v_shtmp               ; VAL: parse leading number
+            ldy  p8b_vm.p8v_shtmp+1
+            jsr  p8b_bstr.p8s_to_cbuf           ; A=lo, Y=hi -> null-terminated copy
+            jsr  floats.parse                   ; FAC = parsed number
+_snstore:   lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr               ; X=lo, Y=hi of &stack[sp]
+            jsr  $fe66                          ; MOVMF  stack[sp] = FAC
+            inc  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_shtmp               ; free_temp_if_top(snd)
+            ldy  p8b_vm.p8v_shtmp+1
+            jmp  p8b_bstr.p8s_free_temp_if_top
+        }}
+    }
+    asmsub op_numstr() {                  ; CHR$/STR$: pop number, push a string temp
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; nsid
+            pha
+            lda  #1
+            jsr  p8b_vm.p8s_pcadd               ; pc++
+            dec  p8b_vm.p8v_sp
+            pla                                 ; A = nsid
+            beq  _nschr                         ; NS_CHR (0)
+            ; --- NS_STR: the number's printed form (FOUT), leading space dropped like PRINT ---
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                          ; MOVFM  FAC = stack[sp]
+            jsr  floats.tostr                   ; A=lo, Y=hi -> ROM string buffer (null-terminated)
+            sta  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            cmp  #32                            ; leading ' ' ?
+            bne  _nslen
+            inc  P8ZP_SCRATCH_W1                ; skip it
+            bne  _nslen
+            inc  P8ZP_SCRATCH_W1+1
+_nslen:     lda  P8ZP_SCRATCH_W1               ; src -> mem_to_temp
+            sta  p8b_bstr.p8s_mem_to_temp.p8v_src
+            lda  P8ZP_SCRATCH_W1+1
+            sta  p8b_bstr.p8s_mem_to_temp.p8v_src+1
+            ldy  #0                             ; n = strlen(src)  (number strings are short)
+_nsslen:    lda  (P8ZP_SCRATCH_W1),y
+            beq  _nsgo
+            iny
+            bne  _nsslen
+_nsgo:      tya
+            sta  p8b_bstr.p8s_mem_to_temp.p8v_n
+            jsr  p8b_bstr.p8s_mem_to_temp       ; A=lo, Y=hi = result temp
+            bra  _nspush
+_nschr:     lda  p8b_vm.p8v_sp                 ; NS_CHR: one PETSCII char = CHR$(n)
+            jsr  p8b_vm.p8s_stack_word          ; W1 = stack[sp] as uword
+            lda  P8ZP_SCRATCH_W1                ; low byte
+            jsr  p8b_bstr.p8s_chr_temp          ; A=lo, Y=hi = result temp
+_nspush:    ldx  p8b_vm.p8v_ssp                ; sstack[ssp] = result ; ssp++
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            jmp  p8b_vm.p8s_str_error
+        }}
+    }
+    asmsub op_lefts() {                   ; LEFT$(s,n): first n chars
+        ; substr_temp frees the src temp and pushes the result body; we just replace the top sstack
+        ; slot (pop src / push result = same depth). Write-then-tail-str_error: inert if it halts.
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr               ; X=lo, Y=hi of &stack[sp]
+            stx  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            lda  #<p8b_vm.p8s_clamp_count.p8v_f
+            ldy  #>p8b_vm.p8s_clamp_count.p8v_f
+            jsr  floats.copy_float              ; clamp_count.f = stack[sp]
+            jsr  p8b_vm.p8s_clamp_count         ; A = n (0..255)
+            sta  p8b_bstr.p8s_substr_temp.p8v_count
+            stz  p8b_bstr.p8s_substr_temp.p8v_start   ; LEFT$ starts at 0
+            dec  p8b_vm.p8v_ssp
+            ldx  p8b_vm.p8v_ssp                 ; src = sstack[ssp]
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_substr_temp.p8v_sd
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_substr_temp.p8v_sd+1
+            jsr  p8b_bstr.p8s_substr_temp       ; A=lo, Y=hi = result temp
+            ldx  p8b_vm.p8v_ssp
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            jmp  p8b_vm.p8s_str_error
+        }}
+    }
+    asmsub op_rights() {                  ; RIGHT$(s,n): last n chars
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            lda  #<p8b_vm.p8s_clamp_count.p8v_f
+            ldy  #>p8b_vm.p8s_clamp_count.p8v_f
+            jsr  floats.copy_float
+            jsr  p8b_vm.p8s_clamp_count         ; A = n
+            sta  p8b_bstr.p8s_substr_temp.p8v_count
+            dec  p8b_vm.p8v_ssp
+            ldx  p8b_vm.p8v_ssp                 ; src = sstack[ssp]
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_substr_temp.p8v_sd
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_substr_temp.p8v_sd+1
+            lda  p8b_bstr.p8s_substr_temp.p8v_sd     ; start = (n < len) ? len-n : 0
+            ldy  p8b_bstr.p8s_substr_temp.p8v_sd+1
+            jsr  p8b_bstr.p8s_dlen              ; A = len
+            sec
+            sbc  p8b_bstr.p8s_substr_temp.p8v_count   ; A = len - n ; C set iff len >= n
+            bcs  +
+            lda  #0                             ; n > len -> start 0 (whole string)
++           sta  p8b_bstr.p8s_substr_temp.p8v_start
+            jsr  p8b_bstr.p8s_substr_temp
+            ldx  p8b_vm.p8v_ssp
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            jmp  p8b_vm.p8s_str_error
+        }}
+    }
+    asmsub op_mids() {                    ; MID$(s,start,len): substring, start 1-based
+        ; start arg is a SIGNED word: <=0 -> 0, 1..256 -> start-1, >256 -> 255 (past end -> empty).
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            stx  P8ZP_SCRATCH_W1
+            sty  P8ZP_SCRATCH_W1+1
+            lda  #<p8b_vm.p8s_clamp_count.p8v_f
+            ldy  #>p8b_vm.p8s_clamp_count.p8v_f
+            jsr  floats.copy_float
+            jsr  p8b_vm.p8s_clamp_count         ; A = len
+            sta  p8b_bstr.p8s_substr_temp.p8v_count
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            txa
+            jsr  $fe63                          ; MOVFM  FAC = stack[sp] (start)
+            jsr  floats.cast_FAC1_as_w_into_ay  ; A=lo, Y=hi = start (signed word)
+            cpy  #0
+            bmi  _md0                           ; start < 0 -> 0
+            bne  _mdcap                          ; start >= 256 -> 255
+            cmp  #0                             ; hi==0: start in 0..255
+            beq  _mdset                          ; start == 0 -> 0
+            dec  a                              ; start-1
+            bra  _mdset
+_md0:       lda  #0
+            bra  _mdset
+_mdcap:     lda  #255
+_mdset:     sta  p8b_bstr.p8s_substr_temp.p8v_start
+            dec  p8b_vm.p8v_ssp
+            ldx  p8b_vm.p8v_ssp                 ; src = sstack[ssp]
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_substr_temp.p8v_sd
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_substr_temp.p8v_sd+1
+            jsr  p8b_bstr.p8s_substr_temp
+            ldx  p8b_vm.p8v_ssp
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            jmp  p8b_vm.p8s_str_error
+        }}
+    }
     sub op_read() {                       ; READ into a numeric var: parse the item
                     ubyte rdslot = @(pcbase + pc)
                     pc += 2
                     pokef(varsf + (rdslot as uword) * 5, floats.parse(data_next()))
                 }
-    sub op_reads() {                      ; READ into a string var: heap-copy the item
-                    ubyte rsslot = @(pcbase + pc)
-                    pc += 2
-                    uword rssrc = data_next()            ; DATA-pool text (off-heap, stable)
-                    bstr.var_from_mem(rsslot, rssrc, strings.length(rssrc))
-                }
+    asmsub op_reads() {                   ; READ into a string var: heap-copy the item
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            pha
+            lda  #2
+            jsr  p8b_vm.p8s_pcadd               ; pc += 2
+            jsr  p8b_vm.p8s_data_next           ; A=lo, Y=hi -> DATA-pool text (stable)
+            sta  p8b_bstr.p8s_var_from_mem.p8v_src
+            sty  p8b_bstr.p8s_var_from_mem.p8v_src+1
+            jsr  strings.length                 ; A/Y still the src ptr -> Y = length
+            sty  p8b_bstr.p8s_var_from_mem.p8v_n
+            pla
+            sta  p8b_bstr.p8s_var_from_mem.p8v_slot
+            jmp  p8b_bstr.p8s_var_from_mem
+        }}
+    }
     sub op_restore() {                    ; rewind the DATA cursor to the first item
                     dataptr = database
                 }
-    sub op_sdim() {                       ; DIM A$(...): allocate a BASIC string array
-                    ubyte sdslot = @(pcbase + pc)
-                    ubyte sdnd = @(pcbase + pc + 2)
-                    pc += 3
-                    uword sdtot = dim_setup(sarr_dims, sdslot, sdnd, SARR_MAXELEM)
-                    if sdtot != 0 and bstr.sarr_alloc(sdslot, sdtot, sdnd) {
-                        sarr_len[sdslot] = sdtot
-                        sarr_ndims[sdslot] = sdnd
-                    } else {
-                        sarr_len[sdslot] = 0                  ; too big / out of memory -> unusable
-                    }
-                }
-    sub op_saload() {                     ; A$(i[,j..]): push the element's descriptor ("" if out of range)
-                    ubyte slslot = @(pcbase + pc)
-                    ubyte slnd = @(pcbase + pc + 2)
-                    pc += 3
-                    uword sloff = index_of(sarr_dims, slslot, slnd, sp - slnd, sarr_len[slslot])
-                    sp -= slnd
-                    if sloff != $ffff {
-                        sstack[ssp] = bstr.sarr_desc(slslot, sloff)   ; a live, self-relocating GC root
-                        ssp++
-                    } else {
-                        push_empty()                                  ; out of range reads as ""
-                    }
-                }
-    sub op_sastore() {                    ; A$(i[,j..])=v$: store the element (dropped if out of range)
-                    ubyte ssslot = @(pcbase + pc)
-                    ubyte ssnd = @(pcbase + pc + 2)
-                    pc += 3
-                    ssp--
-                    uword ssval = sstack[ssp]                ; the string value, pushed after the subscripts
-                    uword ssoff = index_of(sarr_dims, ssslot, ssnd, sp - ssnd, sarr_len[ssslot])
-                    sp -= ssnd
-                    if ssoff != $ffff
-                        bstr.store_desc(bstr.sarr_desc(ssslot, ssoff), ssval)   ; heap-copy / steal-temp
-                    else
-                        bstr.free_temp_if_top(ssval)         ; store dropped, but still free a temp value
-                }
+    asmsub op_sdim() {                    ; DIM A$(...): allocate a BASIC string array
+        ; shtmp = slot(lo)/ndims(hi) parked across dim_setup + sarr_alloc; shtmp2 = element total.
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            sta  p8b_vm.p8v_shtmp
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y            ; ndims
+            sta  p8b_vm.p8v_shtmp+1
+            lda  #3
+            jsr  p8b_vm.p8s_pcadd               ; pc += 3
+            lda  p8b_vm.p8v_sarr_dims           ; dim_setup(sarr_dims, slot, nd, SARR_MAXELEM)
+            sta  p8b_vm.p8s_dim_setup.p8v_dims_ptr
+            lda  p8b_vm.p8v_sarr_dims+1
+            sta  p8b_vm.p8s_dim_setup.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_shtmp
+            sta  p8b_vm.p8s_dim_setup.p8v_slot
+            lda  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8s_dim_setup.p8v_nd
+            lda  #<8192
+            sta  p8b_vm.p8s_dim_setup.p8v_cap
+            lda  #>8192
+            sta  p8b_vm.p8s_dim_setup.p8v_cap+1
+            jsr  p8b_vm.p8s_dim_setup           ; A=lo, Y=hi = total
+            sta  p8b_vm.p8v_shtmp2
+            sty  p8b_vm.p8v_shtmp2+1
+            ora  p8b_vm.p8v_shtmp2+1            ; total == 0 -> unusable
+            beq  _sdfail
+            lda  p8b_vm.p8v_shtmp               ; sarr_alloc(slot, total, ndims)
+            sta  p8b_bstr.p8s_sarr_alloc.p8v_slot
+            lda  p8b_vm.p8v_shtmp2
+            sta  p8b_bstr.p8s_sarr_alloc.p8v_nelem
+            lda  p8b_vm.p8v_shtmp2+1
+            sta  p8b_bstr.p8s_sarr_alloc.p8v_nelem+1
+            lda  p8b_vm.p8v_shtmp+1
+            sta  p8b_bstr.p8s_sarr_alloc.p8v_ndims
+            jsr  p8b_bstr.p8s_sarr_alloc        ; A = bool (0 = out of memory)
+            beq  _sdfail
+            ldy  p8b_vm.p8v_shtmp               ; sarr_len[slot] = total ; sarr_ndims[slot] = ndims
+            lda  p8b_vm.p8v_shtmp2
+            sta  p8b_vm.p8v_sarr_len_lsb,y
+            lda  p8b_vm.p8v_shtmp2+1
+            sta  p8b_vm.p8v_sarr_len_msb,y
+            lda  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8v_sarr_ndims,y
+            rts
+_sdfail:    ldy  p8b_vm.p8v_shtmp               ; sarr_len[slot] = 0 -> unusable
+            lda  #0
+            sta  p8b_vm.p8v_sarr_len_lsb,y
+            sta  p8b_vm.p8v_sarr_len_msb,y
+            rts
+        }}
+    }
+    asmsub op_saload() {                  ; A$(i[,j..]): push the element's descriptor ("" if out of range)
+        ; shtmp = slot(lo)/nd(hi); shtmp2 = element offset ($ffff if any subscript out of range).
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            sta  p8b_vm.p8v_shtmp
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y            ; nd
+            sta  p8b_vm.p8v_shtmp+1
+            lda  #3
+            jsr  p8b_vm.p8s_pcadd               ; pc += 3
+            lda  p8b_vm.p8v_sarr_dims           ; index_of(sarr_dims, slot, nd, sp-nd, sarr_len[slot])
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr
+            lda  p8b_vm.p8v_sarr_dims+1
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_shtmp
+            sta  p8b_vm.p8s_index_of.p8v_slot
+            lda  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8s_index_of.p8v_nd
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8s_index_of.p8v_first
+            ldy  p8b_vm.p8v_shtmp
+            lda  p8b_vm.p8v_sarr_len_lsb,y
+            sta  p8b_vm.p8s_index_of.p8v_total
+            lda  p8b_vm.p8v_sarr_len_msb,y
+            sta  p8b_vm.p8s_index_of.p8v_total+1
+            jsr  p8b_vm.p8s_index_of            ; A=lo, Y=hi = off
+            sta  p8b_vm.p8v_shtmp2
+            sty  p8b_vm.p8v_shtmp2+1
+            lda  p8b_vm.p8v_sp                  ; sp -= nd
+            sec
+            sbc  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_shtmp2              ; off == $ffff -> out of range
+            and  p8b_vm.p8v_shtmp2+1
+            cmp  #$ff
+            beq  _slempty
+            lda  p8b_vm.p8v_shtmp               ; sstack[ssp] = sarr_desc(slot, off) ; ssp++
+            sta  p8b_bstr.p8s_sarr_desc.p8v_slot
+            lda  p8b_vm.p8v_shtmp2
+            sta  p8b_bstr.p8s_sarr_desc.p8v_elemidx
+            lda  p8b_vm.p8v_shtmp2+1
+            sta  p8b_bstr.p8s_sarr_desc.p8v_elemidx+1
+            jsr  p8b_bstr.p8s_sarr_desc         ; A=lo, Y=hi = live descriptor address (GC root)
+            ldx  p8b_vm.p8v_ssp
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            rts
+_slempty:   jmp  p8b_vm.p8s_push_empty          ; out of range reads as ""
+        }}
+    }
+    asmsub op_sastore() {                 ; A$(i[,j..])=v$: store the element (dropped if out of range)
+        ; ssval stays at sstack[ssp] (ssp fixed after the dec) so it's re-read for store/free.
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; slot
+            sta  p8b_vm.p8v_shtmp
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y            ; nd
+            sta  p8b_vm.p8v_shtmp+1
+            lda  #3
+            jsr  p8b_vm.p8s_pcadd               ; pc += 3
+            dec  p8b_vm.p8v_ssp                 ; ssval = sstack[ssp] (pushed after the subscripts)
+            lda  p8b_vm.p8v_sarr_dims           ; index_of(sarr_dims, slot, nd, sp-nd, sarr_len[slot])
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr
+            lda  p8b_vm.p8v_sarr_dims+1
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_shtmp
+            sta  p8b_vm.p8s_index_of.p8v_slot
+            lda  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8s_index_of.p8v_nd
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8s_index_of.p8v_first
+            ldy  p8b_vm.p8v_shtmp
+            lda  p8b_vm.p8v_sarr_len_lsb,y
+            sta  p8b_vm.p8s_index_of.p8v_total
+            lda  p8b_vm.p8v_sarr_len_msb,y
+            sta  p8b_vm.p8s_index_of.p8v_total+1
+            jsr  p8b_vm.p8s_index_of            ; A=lo, Y=hi = off
+            sta  p8b_vm.p8v_shtmp2
+            sty  p8b_vm.p8v_shtmp2+1
+            lda  p8b_vm.p8v_sp                  ; sp -= nd
+            sec
+            sbc  p8b_vm.p8v_shtmp+1
+            sta  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_shtmp2              ; off == $ffff -> drop store, still free the value
+            and  p8b_vm.p8v_shtmp2+1
+            cmp  #$ff
+            beq  _ssdrop
+            lda  p8b_vm.p8v_shtmp               ; store_desc(sarr_desc(slot, off), ssval)
+            sta  p8b_bstr.p8s_sarr_desc.p8v_slot
+            lda  p8b_vm.p8v_shtmp2
+            sta  p8b_bstr.p8s_sarr_desc.p8v_elemidx
+            lda  p8b_vm.p8v_shtmp2+1
+            sta  p8b_bstr.p8s_sarr_desc.p8v_elemidx+1
+            jsr  p8b_bstr.p8s_sarr_desc         ; A=lo, Y=hi = element descriptor address (GC root)
+            sta  p8b_bstr.p8s_store_desc.p8v_dd
+            sty  p8b_bstr.p8s_store_desc.p8v_dd+1
+            ldx  p8b_vm.p8v_ssp                 ; ssval = sstack[ssp]
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_bstr.p8s_store_desc.p8v_sd
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_store_desc.p8v_sd+1
+            jmp  p8b_bstr.p8s_store_desc        ; heap-copy / steal-temp
+_ssdrop:    ldx  p8b_vm.p8v_ssp                 ; free_temp_if_top(ssval)
+            lda  p8b_vm.p8v_sstack_lsb,x
+            ldy  p8b_vm.p8v_sstack_msb,x
+            jmp  p8b_bstr.p8s_free_temp_if_top
+        }}
+    }
     sub op_rdnum() {                      ; READ into an array element: push the item as a number
                     stack[sp] = floats.parse(data_next())
                     sp++
                 }
-    sub op_rdstr() {                      ; READ into a string-array element: push the item text
-                    push_cstr(data_next())               ; off-heap DATA text -> scratch descriptor
-                }
-    sub op_scmp() {                       ; compare two strings -> numeric truth (-1/0)
-                    ubyte scid = @(pcbase + pc)
-                    pc++
-                    ssp--
-                    uword scb = sstack[ssp]              ; right operand (pushed last)
-                    ssp--
-                    uword sca = sstack[ssp]              ; left operand
-                    byte rel = bstr.bcompare(sca, scb)   ; -1 if a<b, 0 if equal, 1 if a>b (length-counted)
-                    bool scres = false
-                    when scid {
-                        pcode.SC_EQ -> scres = rel == 0
-                        pcode.SC_NE -> scres = rel != 0
-                        pcode.SC_LT -> scres = rel < 0
-                        pcode.SC_GT -> scres = rel > 0
-                        pcode.SC_LE -> scres = rel <= 0
-                        pcode.SC_GE -> scres = rel >= 0
-                    }
-                    stack[sp] = bool_to_float(scres)
-                    sp++
-                    bstr.free_temp_if_top(scb)           ; free operand temps top-first
-                    bstr.free_temp_if_top(sca)
-                }
-    sub op_open() {                        ; OPEN lfn,dev,sa,"name"
-                    sp--
-                    ubyte o_sa  = lsb(stack[sp] as uword)
-                    sp--
-                    ubyte o_dev = lsb(stack[sp] as uword)
-                    sp--
-                    ubyte o_lfn = lsb(stack[sp] as uword)
-                    ssp--
-                    uword o_name = sstack[ssp]
-                    cbm.SETNAM(bstr.dlen(o_name), bstr.dptr(o_name))
-                    cbm.SETLFS(o_lfn, o_dev, o_sa)
-                    void cbm.OPEN()
-                    bstr.free_temp_if_top(o_name)
-                }
+    asmsub op_rdstr() {                   ; READ into a string-array element: push the item text
+        %asm {{
+            jsr  p8b_vm.p8s_data_next           ; A=lo, Y=hi -> off-heap DATA text (stable)
+            jmp  p8b_vm.p8s_push_cstr           ; scratch descriptor over it
+        }}
+    }
+    asmsub op_scmp() {                    ; compare two strings -> numeric truth (-1/0)
+        ; sca=sstack[ssp], scb=sstack[ssp+1] after ssp-=2; ssp is then fixed, so both are re-read for the
+        ; top-first frees. bcompare overwrites its own ad/bd params, hence the re-read rather than reuse.
+        %asm {{
+            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            lda  (P8ZP_SCRATCH_W1)              ; scid
+            pha
+            lda  #1
+            jsr  p8b_vm.p8s_pcadd               ; pc++
+            dec  p8b_vm.p8v_ssp
+            dec  p8b_vm.p8v_ssp                 ; ssp -= 2
+            ldx  p8b_vm.p8v_ssp
+            lda  p8b_vm.p8v_sstack_lsb,x        ; sca (left) -> bcompare.ad
+            sta  p8b_bstr.p8s_bcompare.p8v_ad
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_bstr.p8s_bcompare.p8v_ad+1
+            lda  p8b_vm.p8v_sstack_lsb+1,x      ; scb (right) -> bcompare.bd
+            sta  p8b_bstr.p8s_bcompare.p8v_bd
+            lda  p8b_vm.p8v_sstack_msb+1,x
+            sta  p8b_bstr.p8s_bcompare.p8v_bd+1
+            jsr  p8b_bstr.p8s_bcompare          ; A = rel: $ff (a<b) / 0 (=) / 1 (a>b)
+            tay                                 ; rel -> Y
+            pla                                 ; A = scid (0..5)
+            beq  _sceq                          ; SC_EQ
+            cmp  #1
+            beq  _scne
+            cmp  #2
+            beq  _sclt
+            cmp  #3
+            beq  _scgt
+            cmp  #4
+            beq  _scle
+            ; SC_GE: rel >= 0
+            tya
+            bmi  _scfalse
+            bra  _sctrue
+_sceq:      tya
+            beq  _sctrue
+            bra  _scfalse
+_scne:      tya
+            bne  _sctrue
+            bra  _scfalse
+_sclt:      tya
+            bmi  _sctrue
+            bra  _scfalse
+_scgt:      tya                                 ; rel > 0
+            beq  _scfalse
+            bmi  _scfalse
+            bra  _sctrue
+_scle:      tya                                 ; rel <= 0
+            beq  _sctrue
+            bmi  _sctrue
+_scfalse:   lda  #0
+            bra  _scfin
+_sctrue:    lda  #1
+_scfin:     jsr  p8b_vm.p8s_bool_to_float       ; FAC = -1.0 (true) / 0.0 (false)
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_faddr
+            jsr  $fe66                          ; MOVMF  stack[sp] = FAC
+            inc  p8b_vm.p8v_sp
+            ldx  p8b_vm.p8v_ssp                 ; free scb (top) then sca
+            lda  p8b_vm.p8v_sstack_lsb+1,x
+            ldy  p8b_vm.p8v_sstack_msb+1,x
+            jsr  p8b_bstr.p8s_free_temp_if_top
+            ldx  p8b_vm.p8v_ssp
+            lda  p8b_vm.p8v_sstack_lsb,x
+            ldy  p8b_vm.p8v_sstack_msb,x
+            jmp  p8b_bstr.p8s_free_temp_if_top
+        }}
+    }
+    asmsub op_open() {                     ; OPEN lfn,dev,sa,"name"
+        ; sa/dev parked in shtmp, lfn in shtmp2, consumed by SETLFS; then shtmp reused for the name.
+        %asm {{
+            dec  p8b_vm.p8v_sp                  ; pop sa
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word
+            lda  P8ZP_SCRATCH_W1
+            sta  p8b_vm.p8v_shtmp
+            dec  p8b_vm.p8v_sp                  ; pop dev
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word
+            lda  P8ZP_SCRATCH_W1
+            sta  p8b_vm.p8v_shtmp+1
+            dec  p8b_vm.p8v_sp                  ; pop lfn
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word
+            lda  P8ZP_SCRATCH_W1
+            sta  p8b_vm.p8v_shtmp2
+            lda  p8b_vm.p8v_shtmp2              ; SETLFS(lfn, dev, sa)
+            ldx  p8b_vm.p8v_shtmp+1
+            ldy  p8b_vm.p8v_shtmp
+            jsr  cbm.SETLFS
+            dec  p8b_vm.p8v_ssp                 ; pop name descriptor
+            ldx  p8b_vm.p8v_ssp
+            lda  p8b_vm.p8v_sstack_lsb,x
+            sta  p8b_vm.p8v_shtmp
+            lda  p8b_vm.p8v_sstack_msb,x
+            sta  p8b_vm.p8v_shtmp+1
+            lda  p8b_vm.p8v_shtmp               ; SETNAM(dlen(name), dptr(name))
+            ldy  p8b_vm.p8v_shtmp+1
+            jsr  p8b_bstr.p8s_dptr              ; A=lo, Y=hi = body ptr
+            tax
+            phx
+            phy
+            lda  p8b_vm.p8v_shtmp
+            ldy  p8b_vm.p8v_shtmp+1
+            jsr  p8b_bstr.p8s_dlen              ; A = length
+            ply
+            plx
+            jsr  cbm.SETNAM                     ; A=len, X=lo, Y=hi
+            jsr  cbm.OPEN
+            lda  p8b_vm.p8v_shtmp               ; free_temp_if_top(name)
+            ldy  p8b_vm.p8v_shtmp+1
+            jmp  p8b_bstr.p8s_free_temp_if_top
+        }}
+    }
     asmsub op_close() {                    ; CLOSE lfn
         %asm {{
             dec  p8b_vm.p8v_sp
@@ -2060,21 +2518,28 @@ _cffnhi:    .byte >$fe84, >$fe2d, >$fe4e, >$fe30, >$fe57, >$fe42, >$fe3f, >$fe45
             jmp  cbm.CLOSE
         }}
     }
-    sub op_getch() {                       ; GET#lfn,v$ : one byte -> a 0/1-char string
-                    sp--
-                    void cbm.CHKIN(lsb(stack[sp] as uword))
-                    ubyte g_ch = cbm.CHRIN()
-                    cbm.CLRCHN()
-                    if g_ch == 0 {
-                        push_empty()                      ; no byte available -> ""
-                    } else {
-                        uword g_res = bstr.chr_temp(g_ch) ; a 1-char temp
-                        if str_error()
-                            return
-                        sstack[ssp] = g_res
-                        ssp++
-                    }
-                }
+    asmsub op_getch() {                    ; GET#lfn,v$ : one byte -> a 0/1-char string
+        %asm {{
+            dec  p8b_vm.p8v_sp
+            lda  p8b_vm.p8v_sp
+            jsr  p8b_vm.p8s_stack_word          ; W1 = stack[sp] as uword
+            ldx  P8ZP_SCRATCH_W1                ; X = lfn (low byte)
+            jsr  cbm.CHKIN
+            jsr  cbm.CHRIN                      ; A = byte (0 if none available)
+            pha
+            jsr  cbm.CLRCHN
+            pla
+            bne  _gcchar
+            jmp  p8b_vm.p8s_push_empty          ; no byte -> ""
+_gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi (1-char temp)
+            ldx  p8b_vm.p8v_ssp
+            sta  p8b_vm.p8v_sstack_lsb,x
+            tya
+            sta  p8b_vm.p8v_sstack_msb,x
+            inc  p8b_vm.p8v_ssp
+            jmp  p8b_vm.p8s_str_error
+        }}
+    }
     sub op_status() {                      ; ST : the KERNAL I/O status word
                     stack[sp] = cbm.READST() as float
                     sp++
