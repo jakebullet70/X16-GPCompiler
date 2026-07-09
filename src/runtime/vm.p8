@@ -24,11 +24,16 @@ vm {
     ; is live is fixed by the compiler's typed opcode stream, so no runtime tag is kept. Coercion opcodes
     ; (OP_ITOF/ITOF2/FTOI) move a value between the two representations at the same slot.
     word[32]  @shared istack     ; @shared: referenced only from hand-asm handlers (prog8 can't see those)
-    ; variable slots live in a slab (128 floats * 5 bytes = 640 > the 256-byte array cap),
-    ; addressed as varsf + slot*5 via peekf/pokef
-    uword     varsf = memory("vm_vars", 640, 0)
-    ; integer (`%`) variable slots: their own namespace + storage, 128 words addressed as ivarsf + slot*2
-    uword     ivarsf = memory("vm_ivars", 256, 0)
+    ; The five VM slabs (varsf, ivarsf, arrheap, arr_dims, sarr_dims -- SLAB_BYTES total) are no longer
+    ; prog8-allocated in low BSS. They're host-assigned POINTERS placed at run() time: a standalone
+    ; program parks them in free RAM just ABOVE the loaded P-code (so nothing sits between the runtime
+    ; code and the P-code, and the .PRG carries no multi-KB filler); the resident compiler pre-sets them
+    ; to its own buffer before vm.run. See run() for the layout.
+    const uword SLAB_BYTES = 640 + 256 + 2048 + 256 + 256   ; = 3456
+    ; variable slots: 128 floats * 5 bytes = 640, addressed as varsf + slot*5 via peekf/pokef
+    uword @shared varsf
+    ; integer (`%`) variable slots: 128 words addressed as ivarsf + slot*2
+    uword @shared ivarsf
     word      last_printed        ; most recent PRINTI, truncated to an integer (for headless tests)
     ; When true, emit_char also mirrors each printed byte to the x16emu debug register $9FBB so the
     ; HEADLESS test harness can capture program output on the host console. A shipped program (visual /
@@ -88,12 +93,12 @@ vm {
     ;     N-dimensional (up to pcode.MAXDIMS subscripts); the per-dimension SIZES drive the row-major
     ;     element offset (see index_of) and per-subscript bounds checks. ---
     const uword ARRHEAP_SIZE = 2048          ; ~409 float elements shared across all arrays
-    uword      arrheap = memory("vm_arrheap", ARRHEAP_SIZE, 0)
+    uword @shared arrheap                    ; host-assigned (see SLAB_BYTES / run())
     uword[32]  arr_base           ; byte offset of each array within arrheap
     uword[32]  arr_len            ; total element count of each array (0 = undimensioned/unusable)
     ubyte[32]  arr_ndims          ; number of dimensions of each array
     ; per-array dimension sizes, MAXDIMS words per array: arr_dims[slot*MAXDIMS + j] = size of dim j
-    uword      arr_dims = memory("vm_arrdims", 32 * pcode.MAXDIMS * 2, 0)
+    uword @shared arr_dims                   ; host-assigned (see SLAB_BYTES / run())
     uword      arr_top            ; bump pointer into arrheap (bytes)
 
     ; --- string arrays (DIM A$(...)): real BASIC arrays built by bstr in the ARYTAB..STREND region;
@@ -102,7 +107,7 @@ vm {
     const uword SARR_MAXELEM = 8192          ; cap on a string array's element count (dim_setup guard)
     uword[32]  sarr_len          ; total element count (0 = undimensioned/unusable)
     ubyte[32]  sarr_ndims
-    uword      sarr_dims = memory("vm_sarrdims", 32 * pcode.MAXDIMS * 2, 0)
+    uword @shared sarr_dims                  ; host-assigned (see SLAB_BYTES / run())
 
     ubyte[16]  inbuf              ; one line of INPUT text (null-terminated)
     ; OP_PASSTHRU scratch: a low-RAM copy of one tokenized statement handed to ROM BASIC. Low RAM (not
@@ -129,21 +134,27 @@ vm {
         csp = 0
         forsp = 0
         ssp = 0
-        ; place BASIC's string var table + heap in free RAM: bstr grows the var table UP from image_top
-        ; and the string heap DOWN from a ceiling (KERNAL MEMTOP, or `cap` if that sits lower). Floor
-        ; selection (heapfloor -> datatop -> progend):
-        ;   * in-process (compiler resident): the host sets heapfloor = sys.progend(), i.e. ABOVE ALL of
-        ;     the compiler's + runtime's slabs, so the heap owns the free RAM up to MEMTOP. (The Phase-5
-        ;     banked-RAM move sent the compiler's name tables to banked RAM, so the old trick of reusing
-        ;     the dead low-RAM name-table gap between datatop and varsf is gone -- progend is the room.)
-        ;   * standalone: heapfloor is 0, so the heap floors at datatop (above the loaded P-code) and runs
-        ;     to MEMTOP (varsf sits far below, so the `cap` is ignored).
-        ;   * VM selftest (hand-built P-code): heapfloor and datatop both 0 -> fall back to progend.
+        ; Place the five VM slabs + BASIC's string var table/heap in free RAM. Two regimes, keyed off
+        ; heapfloor (the host's "free RAM begins here" hint):
+        ;   * in-process (compiler resident): host sets heapfloor = progend AND pre-sets the five slab
+        ;     pointers to its own low buffer (the compiler is huge, so little RAM sits above it -- the
+        ;     slabs must stay in the compiler's BSS, not eat the small heap). The string heap then owns
+        ;     all free RAM from progend up to MEMTOP.
+        ;   * standalone / selftest: heapfloor is 0. Free RAM begins at datatop (just above the loaded
+        ;     P-code), so the slabs are parked there and the string var table/heap stack ABOVE them --
+        ;     nothing lands between the runtime code and the P-code, so the .PRG needs no filler.
         uword image_top = heapfloor
-        if image_top == 0
-            image_top = datatop
-        if image_top == 0
-            image_top = sys.progend()
+        if image_top == 0 {
+            uword sbase = datatop
+            if sbase == 0
+                sbase = sys.progend()        ; selftest: hand-built P-code, no datatop
+            varsf     = sbase                ; layout must match SLAB_BYTES: 640+256+2048+256+256
+            ivarsf    = sbase + 640
+            arrheap   = sbase + 896
+            arr_dims  = sbase + 2944
+            sarr_dims = sbase + 3200
+            image_top = sbase + SLAB_BYTES   ; string var table + heap stack above the slabs
+        }
         bstr.init(image_top, varsf)
         sys.memset(varsf, 640, 0)        ; all-zero bytes == float 0.0 (BASIC vars start at 0)
         sys.memset(ivarsf, 256, 0)       ; integer (`%`) vars start at 0 too

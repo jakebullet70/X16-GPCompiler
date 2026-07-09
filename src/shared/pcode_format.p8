@@ -238,12 +238,14 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $5600                    ; runtime finds the compiled program here. Must sit
-                                                      ; ABOVE the bundled runtime's whole memory footprint
-                                                      ; (code + vars + slabs: heap, numeric & string array
-                                                      ; heaps) so its RAM never overlaps the loaded P-code.
-                                                      ; The runtime's live RAM tops ~$5098 (grew with the X16
-                                                      ; function buffers + the integer istack/ivars slabs +
-                                                      ; the increment-2 integer compare/branch/FOR opcodes),
-                                                      ; so PCODE_BASE sits above that; leaves ~18 KB for P-code.
+    const uword PCODE_BASE = $3A00                    ; runtime finds the compiled program here. Must sit
+                                                      ; ABOVE the bundled runtime's LOW-RAM footprint (code
+                                                      ; + hot BSS: passbuf/xbuf pass-through buffers + VM
+                                                      ; state) so its RAM never overlaps the loaded P-code.
+                                                      ; Tier-1 layout: the five VM slabs and the BASIC string
+                                                      ; var table/heap now park ABOVE the P-code (see
+                                                      ; vm.run), so the low footprint tops ~$3808 (testbench)
+                                                      ; / ~$37f0 (visual). PCODE_BASE clears that with ~0.5 KB
+                                                      ; margin, so a compiled .PRG carries ~2 KB of filler
+                                                      ; instead of the old ~9.5 KB.
 }

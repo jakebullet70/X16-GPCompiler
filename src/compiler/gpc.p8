@@ -88,6 +88,11 @@ main {
     uword datapool_ptr = memory("gpc_data", DATA_SIZE, 0)
     uword data_len
 
+    ; --- resident in-process VM slabs. The VM's five slabs are host-assigned pointers now (a standalone
+    ;     program parks them above its P-code); the compiler is too big to spare RAM above progend, so it
+    ;     keeps them in this low buffer and pre-sets the VM's pointers before vm.run. ---
+    uword vmslabs = memory("gpc_vmslabs", vm.SLAB_BYTES, 0)
+
     ; --- tokenizer state ---
     uword sptr                     ; cursor into source
     uword tok_start                ; sptr at the first byte of the current token (for OP_PASSTHRU)
@@ -282,8 +287,13 @@ main {
                 vm.litbase = litpool_ptr             ; literals + DATA live in our own pools in-process
                 vm.database = datapool_ptr
                 vm.datatop = datapool_ptr + data_len
-                vm.heapfloor = sys.progend()         ; string heap goes ABOVE all slabs (name tables are
-                                                     ; banked now), using the free RAM up to MEMTOP
+                vm.varsf     = vmslabs               ; pre-place the VM slabs in our low buffer (layout
+                vm.ivarsf    = vmslabs + 640         ; must match vm.SLAB_BYTES: 640+256+2048+256+256)
+                vm.arrheap   = vmslabs + 896
+                vm.arr_dims  = vmslabs + 2944
+                vm.sarr_dims = vmslabs + 3200
+                vm.heapfloor = sys.progend()         ; heapfloor != 0 -> in-process regime: string heap
+                                                     ; owns the free RAM from progend up to MEMTOP
                 if code_len <= RUN_CAP {
                     vm.host_echo = TESTBENCH         ; host-console mirror only in the headless test build
                     cx16.rambank(PCODE_BANK0)        ; select the P-code bank; the VM never switches it,
