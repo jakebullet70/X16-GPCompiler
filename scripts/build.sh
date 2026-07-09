@@ -55,11 +55,29 @@ case "$MODE" in
         # integer-literal IF condition -- "IF 0" -- branches via IJZ, no % var needed) are CORE. Only
         # %-variable ops (iloadv/istorv/iadd.../icmp*/iand/ior/inot/ifor*/int-arrays) are opt-in.
         STRIP='prints|pushs|loads|stors|concat|poke|peek|sys|dim|aload|astore|inputv|inputs|strnum|numstr|lefts|rights|mids|read|reads|restore|sdim|saload|sastore|rdnum|rdstr|scmp|open|close|getch|status|chkout|chkin|clrch|wait|passthru|callx|callxs|iloadv|istorv|iadd|isub|imul|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore'
+        # Three-stage surgery producing build/gen/vm.p8:
+        #  1. insert the _unimpl halting stub before _optab;
+        #  2. repoint every optional-family opcode in _optab to _unimpl;
+        #  3. comment out bstr.init so prog8 dead-strips all of bstr.p8.
+        # Then a 4th awk stage COLLAPSES the body of every optional asmsub handler to a bare
+        # `rts`. prog8 dead-strips unreferenced `sub`s but KEEPS every `asmsub` regardless of
+        # references -- so stubbing _optab alone leaves ~40 dead hand-asm handlers (~2.3 KB) in
+        # the image. Collapsing their bodies reclaims that space, which in turn lets CORE_PCODE_BASE
+        # drop (the real per-program size win: pcode loads far lower). The symbol survives (points
+        # at rts), so any straggler caller still links; a genuinely-reachable collapse would fail
+        # loudly in the corpus rather than silently. Matches `asmsub op_<optional>()` and skips to
+        # the handler's closing `    }` (4-space indent; the inner `        }}` never matches).
         sed '/^_optab:/i\_unimpl:\n            pla\n            pla\n            jmp  _end' src/runtime/vm.p8 \
           | sed -E "/^_optab:/,/p8s_op_iastore/ s/p8b_vm\.p8s_op_($STRIP)\b/_unimpl/g" \
           | sed -E 's/^( *)bstr\.init\(image_top, varsf\)/\1; core tier: bstr.init(image_top, varsf)/' \
+          | awk -v strip="$STRIP" '
+              BEGIN { re = "^[[:space:]]*asmsub op_(" strip ")\\(\\)" }
+              skip { if ($0 ~ /^[[:space:]]*\}[[:space:]]*$/) skip=0; next }
+              $0 ~ re { print $0; print "        %asm {{"; print "            rts"; print "        }}"; print "    }"; skip=1; next }
+              { print }
+          ' \
           > build/gen/vm.p8
-        sed 's/const uword PCODE_BASE = \$3C80/const uword PCODE_BASE = \$2000/' src/shared/pcode_format.p8 > build/gen/pcode_format.p8
+        sed 's/const uword PCODE_BASE = \$3C80/const uword PCODE_BASE = \$1D00/' src/shared/pcode_format.p8 > build/gen/pcode_format.p8
         # build under a distinct main name so prog8 writes vm_runtime_core.prg directly -- it must
         # NOT clobber the full build/vm_runtime.prg (build order would otherwise matter). A 3rd arg
         # "visual" flips TESTBENCH off (READY-returning core runtime for the on-device demo), mirroring

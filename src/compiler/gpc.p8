@@ -124,8 +124,11 @@ main {
     ; control flow, PRINT, CALLFN, int-literal coercion) which has a much LOWER load base, so its
     ; P-code -- and therefore the whole compiled .PRG -- starts far lower. Anything else bundles the
     ; full runtime at pcode.PCODE_BASE. CORE_PCODE_BASE must clear the core runtime's own footprint
-    ; (build.sh runtime core asserts it), just as PCODE_BASE clears the full runtime's.
-    const uword CORE_PCODE_BASE = $2000
+    ; (build.sh runtime core asserts it), just as PCODE_BASE clears the full runtime's. The core
+    ; footprint tops out at ~$1be8 (dead optional-opcode asmsub bodies collapsed in the core build),
+    ; so $1D00 clears it with ~280 bytes of margin -- and every core-tier .PRG loads its P-code that
+    ; much lower, shrinking the file by $2000-$1D00 = 768 bytes over the earlier $2000.
+    const uword CORE_PCODE_BASE = $1D00
 
     ; --- standalone output ---
     bool  wrote_output             ; did this run emit a standalone out.prg?
