@@ -16,6 +16,7 @@ FS="$(mktemp -d)"
 printf '%b\n' "$SRCLINE" | python "$DIR/tokenize.py" > "$FS/source.prg"
 cp build/vm_runtime.prg "$FS/gpc.runtime.bin"      # the compiler opens it as "gpc.runtime.bin"
 [ -f build/vm_runtime_core.prg ] && cp build/vm_runtime_core.prg "$FS/gpc.rt.core.bin"   # core tier for feature-free programs
+[ -f build/vm_runtime_str.prg ]  && cp build/vm_runtime_str.prg  "$FS/gpc.rt.str.bin"    # str tier for strings-only programs
 rm -f "$FS/out.prg"
 echo "  \"$SRCLINE\"  (standalone)"
 

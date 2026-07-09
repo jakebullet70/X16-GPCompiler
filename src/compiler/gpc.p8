@@ -129,6 +129,11 @@ main {
     ; so $1D00 clears it with ~280 bytes of margin -- and every core-tier .PRG loads its P-code that
     ; much lower, shrinking the file by $2000-$1D00 = 768 bytes over the earlier $2000.
     const uword CORE_PCODE_BASE = $1D00
+    ; The intermediate "str" tier: core PLUS strings (bstr + string handlers), for programs that use
+    ; string literals/vars/functions but nothing else optional. Its runtime footprint tops out at
+    ; ~$2907 (build.sh runtime str asserts it), so $2A20 clears it with ~280 bytes of margin. A
+    ; strings-only program lands here instead of the full tier at $3C80 -- saving $3C80-$2A20 = ~4.7 KB.
+    const uword STR_PCODE_BASE = $2A20
 
     ; --- standalone output ---
     bool  wrote_output             ; did this run emit a standalone out.prg?
@@ -604,13 +609,18 @@ main {
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        ; pick the runtime tier: a core-only program (no optional features) gets the small
-        ; core runtime at the low CORE_PCODE_BASE; everything else gets the full runtime.
+        ; Pick the runtime tier: the compiler auto-selects the lowest tier whose feature set covers what
+        ; the program actually used (tracked in features_used). No optional features -> the small core
+        ; runtime at CORE_PCODE_BASE; strings ONLY -> the str runtime at STR_PCODE_BASE; anything else
+        ; (arrays, %int, X16, I/O, DATA, or a mix) -> the full runtime at PCODE_BASE.
         uword pbase = pcode.PCODE_BASE
         bool opened
         if features_used == 0 {
             pbase = CORE_PCODE_BASE
             opened = diskio.f_open("gpc.rt.core.bin")
+        } else if features_used == FEAT_STR {
+            pbase = STR_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.str.bin")
         } else {
             opened = diskio.f_open("gpc.runtime.bin")
         }
