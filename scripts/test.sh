@@ -60,6 +60,27 @@ bash "$DIR/check-basic.sh" "10 X=5:IF X>0 GOTO 30\n20 X=99\n30 PRINT X" 0400=5 |
 bash "$DIR/check-basic.sh" "10 X=0:IF X>0 GOTO 30\n20 X=7\n30 PRINT X"  0400=7 || fail=1  # not taken, falls through
 
 echo
+echo "== M4b: nested IF ... THEN IF ... (guard conjunction) =="
+# both conditions true -> body runs
+bash "$DIR/check-basic.sh" "10 A=5:B=3:IF A>0 THEN IF B>0 THEN PRINT 42" 0400=2a || fail=1
+# outer false -> body skipped (inner never evaluated)
+bash "$DIR/check-basic.sh" "10 A=0:B=3:IF A>0 THEN IF B>0 THEN PRINT 42\n20 PRINT 9" 0400=9 || fail=1
+# inner false -> body skipped
+bash "$DIR/check-basic.sh" "10 A=5:B=0:IF A>0 THEN IF B>0 THEN PRINT 42\n20 PRINT 9" 0400=9 || fail=1
+# triple nesting, all true
+bash "$DIR/check-basic.sh" "10 IF 1 THEN IF 1 THEN IF 1 THEN PRINT 7" 0400=7 || fail=1
+# triple nesting, middle false -> skipped
+bash "$DIR/check-basic.sh" "10 IF 1 THEN IF 0 THEN IF 1 THEN PRINT 7\n20 PRINT 3" 0400=3 || fail=1
+# nested with the GOTO shorthand as the innermost body (taken)
+bash "$DIR/check-basic.sh" "10 A=5:IF A>0 THEN IF A<9 GOTO 40\n20 PRINT 1\n30 GOTO 50\n40 PRINT 8\n50 REM" 0400=8 || fail=1
+# mixed integer + float conditions in one nest (IJZ guard + JZ guard), both true
+bash "$DIR/check-basic.sh" "10 A%=5:B=3.5:IF A%>3 THEN IF B<4 THEN PRINT 1" 0400=1 || fail=1
+# nested IF driving an integer loop: count to 3 only while both guards hold
+bash "$DIR/check-basic.sh" "10 I%=0\n20 I%=I%+1\n30 IF I%<9 THEN IF I%<3 THEN GOTO 20\n40 PRINT I%" 0400=3 || fail=1
+# standalone: nested guard, both true, mailbox = 5
+bash "$DIR/check-standalone.sh" mail "10 A=5:IF A>0 THEN IF A<10 THEN PRINT A" 0400=5 || fail=1
+
+echo
 echo "== M4: GOTO + forward-reference pass-2 fixup =="
 # forward GOTO 30 (line 30 not yet seen at emit time) skips line 20:
 bash "$DIR/check-basic.sh" "10 GOTO 30\n20 PRINT 99\n30 PRINT 7"  0400=7 || fail=1

@@ -170,6 +170,10 @@ main {
     const ubyte MAXLINES = 128
     ubyte nlines
 
+    ; --- nested "IF a THEN IF b THEN ..." guard patches (one JZ slot per leading IF) ---
+    const ubyte MAXIFNEST = 8
+    uword[MAXIFNEST] ifpatch       ; pcode offsets of each guard's JZ/IJZ operand, backpatched together
+
     ; --- forward-reference fixups, backpatched in pass 2 (Blitz style two-pass core) ---
     const ubyte MAXFIX = 128
     uword[MAXFIX] fix_addr         ; pcode offset of a placeholder jump operand
@@ -1414,8 +1418,8 @@ main {
         return fnnames_bptr + (idx as uword) * NAMELEN
     }
 
-    ; the body after THEN. Must NOT re-enter parse_if (Prog8 has no recursion),
-    ; so nested "IF ... THEN IF ..." is not supported yet.
+    ; the body after THEN. Nested "IF a THEN IF b THEN body" is handled by parse_if's
+    ; guard loop (not here), so a leading IF never reaches this dispatch.
     sub parse_then_body() {
         when tok {
             T_NUM -> {                          ; IF cond THEN <linenum>  ==  GOTO linenum
@@ -1463,38 +1467,58 @@ main {
         next_token()
     }
 
-    ; IF expr THEN body  --  emit JZ <past body>; body; then backpatch the JZ locally
+    ; IF expr THEN body  --  emit JZ <past body>; body; backpatch the JZ locally.
+    ; Nested "IF a THEN IF b THEN body" is a conjunction of guards: each leading IF emits
+    ; its own JZ that skips to the SAME point (just past the one shared body), so ANY false
+    ; condition skips the body -- matching the "false -> don't run the body" semantics without
+    ; recursion (Prog8 has none). The guard loop consumes each "IF <cond> THEN", collecting a
+    ; patch slot per guard, until the token after THEN is not another IF.
     sub parse_if() {
-        next_token()                            ; consume IF
-        uword before = code_len
-        expr_keep_int = true                    ; keep an integer condition raw so we can branch with IJZ
-        parse_expr()
-        if code_len == before {
-            error(E_SYNTAX)
-            return
-        }
-        ; the condition is followed by THEN, or the classic "IF cond GOTO n" shorthand (== THEN GOTO n).
-        if tok == T_THEN {
-            next_token()
-        } else {
-            if tok != T_GOTO {
+        next_token()                            ; consume the (outer) IF
+        ubyte np = 0                            ; number of guards collected
+        repeat {
+            uword before = code_len
+            expr_keep_int = true                ; keep an integer condition raw so we can branch with IJZ
+            parse_expr()
+            if code_len == before {
                 error(E_SYNTAX)
                 return
             }
-            ; leave the GOTO as the current token; parse_then_body parses it as the THEN body
+            ; the condition is followed by THEN, or the classic "IF cond GOTO n" shorthand (== THEN GOTO n).
+            if tok == T_THEN {
+                next_token()
+            } else {
+                if tok != T_GOTO {
+                    error(E_SYNTAX)
+                    return
+                }
+                ; leave the GOTO as the current token; parse_then_body parses it as the THEN body
+            }
+            if is_intish(expr_type)             ; integer condition -> branch off the int stack
+                emit_byte(pcode.OP_IJZ)
+            else
+                emit_byte(pcode.OP_JZ)
+            if np == MAXIFNEST {                 ; too many nested IFs on one line
+                error(E_SYNTAX)
+                return
+            }
+            ifpatch[np] = code_len              ; operand slot to backpatch
+            np++
+            emit_imm16(0)
+            ; another IF right after THEN? -> nested guard; consume it and loop for its condition.
+            if tok != T_IF
+                break
+            next_token()                        ; consume the nested IF
         }
-        if is_intish(expr_type)                 ; integer condition -> branch off the int stack
-            emit_byte(pcode.OP_IJZ)
-        else
-            emit_byte(pcode.OP_JZ)
-        uword patch = code_len                  ; operand slot to backpatch
-        emit_imm16(0)
         parse_then_body()
-        ; if the condition was false, JZ skips to here (just past the THEN body).
-        ; Skip the backpatch if the buffer overflowed mid-body (patch may be invalid).
+        ; if any condition was false, its JZ skips to here (just past the shared THEN body).
+        ; Skip the backpatch if the buffer overflowed mid-body (patches may be invalid).
         if not had_error {
-            pc_poke(patch,     lsb(code_len))
-            pc_poke(patch + 1, msb(code_len))
+            ubyte i
+            for i in 0 to np - 1 {
+                pc_poke(ifpatch[i],     lsb(code_len))
+                pc_poke(ifpatch[i] + 1, msb(code_len))
+            }
         }
     }
 
