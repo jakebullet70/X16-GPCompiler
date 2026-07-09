@@ -196,18 +196,46 @@ _next:
             bcs  _next
             asl  a                         ; *2 for the word table (0..91 -> 0..182)
             tax
+            ; RTS-dispatch: push _after-1 so each handler's own final rts returns to _after.
+            ; This lets _optab point STRAIGHT at the handlers -- no per-opcode "jsr h / jmp
+            ; _after" trampoline (was ~89*6 bytes). The 3 inline ops (_t0/_t1/_t2) jmp instead
+            ; of rts, so they pull the pushed address off first.
+            lda  #>(_after-1)
+            pha
+            lda  #<(_after-1)
+            pha
             jmp  (_optab,x)
 _after:
             lda  p8b_vm.p8v_halt
             beq  _next
             jmp  _end
 _optab:
-            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66, _t67, _t68, _t69, _t70, _t71, _t72, _t73, _t74, _t75, _t76, _t77, _t78, _t79, _t80, _t81, _t82, _t83, _t84, _t85, _t86, _t87, _t88, _t89, _t90, _t91
+            ; opcodes 0/1/2 stay inline (jmp, not rts); 3..91 point straight at their handler subs
+            .word _t0, _t1, _t2
+            .word p8b_vm.p8s_op_pushi, p8b_vm.p8s_op_loadv, p8b_vm.p8s_op_storv, p8b_vm.p8s_op_add, p8b_vm.p8s_op_sub, p8b_vm.p8s_op_mul, p8b_vm.p8s_op_div, p8b_vm.p8s_op_neg
+            .word p8b_vm.p8s_op_cmpeq, p8b_vm.p8s_op_cmpne, p8b_vm.p8s_op_cmplt, p8b_vm.p8s_op_cmpgt, p8b_vm.p8s_op_cmple, p8b_vm.p8s_op_cmpge, p8b_vm.p8s_op_and, p8b_vm.p8s_op_or, p8b_vm.p8s_op_not
+            .word p8b_vm.p8s_op_printi, p8b_vm.p8s_op_prints, p8b_vm.p8s_op_newline, p8b_vm.p8s_op_gosub, p8b_vm.p8s_op_ret, p8b_vm.p8s_op_forpush, p8b_vm.p8s_op_fornext
+            .word p8b_vm.p8s_op_pushs, p8b_vm.p8s_op_loads, p8b_vm.p8s_op_stors, p8b_vm.p8s_op_concat, p8b_vm.p8s_op_poke, p8b_vm.p8s_op_peek, p8b_vm.p8s_op_sys
+            .word p8b_vm.p8s_op_dim, p8b_vm.p8s_op_aload, p8b_vm.p8s_op_astore, p8b_vm.p8s_op_inputv, p8b_vm.p8s_op_inputs, p8b_vm.p8s_op_pushf, p8b_vm.p8s_op_callfn
+            .word p8b_vm.p8s_op_strnum, p8b_vm.p8s_op_numstr, p8b_vm.p8s_op_lefts, p8b_vm.p8s_op_rights, p8b_vm.p8s_op_mids, p8b_vm.p8s_op_read, p8b_vm.p8s_op_reads, p8b_vm.p8s_op_restore
+            .word p8b_vm.p8s_op_sdim, p8b_vm.p8s_op_saload, p8b_vm.p8s_op_sastore, p8b_vm.p8s_op_rdnum, p8b_vm.p8s_op_rdstr, p8b_vm.p8s_op_scmp
+            .word p8b_vm.p8s_op_open, p8b_vm.p8s_op_close, p8b_vm.p8s_op_getch, p8b_vm.p8s_op_status, p8b_vm.p8s_op_chkout, p8b_vm.p8s_op_chkin, p8b_vm.p8s_op_clrch, p8b_vm.p8s_op_pow, p8b_vm.p8s_op_wait
+            .word p8b_vm.p8s_op_passthru, p8b_vm.p8s_op_callx, p8b_vm.p8s_op_callxs
+            .word p8b_vm.p8s_op_ipushi, p8b_vm.p8s_op_iloadv, p8b_vm.p8s_op_istorv, p8b_vm.p8s_op_iadd, p8b_vm.p8s_op_isub, p8b_vm.p8s_op_imul, p8b_vm.p8s_op_ineg
+            .word p8b_vm.p8s_op_itof, p8b_vm.p8s_op_itof2, p8b_vm.p8s_op_ftoi
+            .word p8b_vm.p8s_op_icmpeq, p8b_vm.p8s_op_icmpne, p8b_vm.p8s_op_icmplt, p8b_vm.p8s_op_icmpgt, p8b_vm.p8s_op_icmple, p8b_vm.p8s_op_icmpge, p8b_vm.p8s_op_ijz, p8b_vm.p8s_op_iand, p8b_vm.p8s_op_ior, p8b_vm.p8s_op_inot
+            .word p8b_vm.p8s_op_iforpush, p8b_vm.p8s_op_ifornext, p8b_vm.p8s_op_idim, p8b_vm.p8s_op_iaload, p8b_vm.p8s_op_iastore
 _t0:                                    ; OP_END -> leave the interpreter loop
+            pla                          ; drop the RTS-dispatch return addr (we jmp, not rts)
+            pla
             jmp  _end
 _t1:                                    ; OP_JMP -> pc = target word at pcbase+pc
+            pla
+            pla
             jmp  _setpc
 _t2:                                    ; OP_JZ -> sp--; if stack[sp]==0.0 take the branch
+            pla                          ; drop the RTS-dispatch return addr (both JZ paths jmp)
+            pla
             dec  p8b_vm.p8v_sp
             lda  p8b_vm.p8v_sp
             asl  a
@@ -242,273 +270,6 @@ _setpc:                                 ; pc = word at pcbase+pc  (shared by JMP
             pla
             sta  p8b_vm.p8v_pc+1
             jmp  _next
-_t3:
-            jsr  p8b_vm.p8s_op_pushi
-            jmp  _after
-_t4:
-            jsr  p8b_vm.p8s_op_loadv
-            jmp  _after
-_t5:
-            jsr  p8b_vm.p8s_op_storv
-            jmp  _after
-_t6:
-            jsr  p8b_vm.p8s_op_add
-            jmp  _after
-_t7:
-            jsr  p8b_vm.p8s_op_sub
-            jmp  _after
-_t8:
-            jsr  p8b_vm.p8s_op_mul
-            jmp  _after
-_t9:
-            jsr  p8b_vm.p8s_op_div
-            jmp  _after
-_t10:
-            jsr  p8b_vm.p8s_op_neg
-            jmp  _after
-_t11:
-            jsr  p8b_vm.p8s_op_cmpeq
-            jmp  _after
-_t12:
-            jsr  p8b_vm.p8s_op_cmpne
-            jmp  _after
-_t13:
-            jsr  p8b_vm.p8s_op_cmplt
-            jmp  _after
-_t14:
-            jsr  p8b_vm.p8s_op_cmpgt
-            jmp  _after
-_t15:
-            jsr  p8b_vm.p8s_op_cmple
-            jmp  _after
-_t16:
-            jsr  p8b_vm.p8s_op_cmpge
-            jmp  _after
-_t17:
-            jsr  p8b_vm.p8s_op_and
-            jmp  _after
-_t18:
-            jsr  p8b_vm.p8s_op_or
-            jmp  _after
-_t19:
-            jsr  p8b_vm.p8s_op_not
-            jmp  _after
-_t20:
-            jsr  p8b_vm.p8s_op_printi
-            jmp  _after
-_t21:
-            jsr  p8b_vm.p8s_op_prints
-            jmp  _after
-_t22:
-            jsr  p8b_vm.p8s_op_newline
-            jmp  _after
-_t23:
-            jsr  p8b_vm.p8s_op_gosub
-            jmp  _after
-_t24:
-            jsr  p8b_vm.p8s_op_ret
-            jmp  _after
-_t25:
-            jsr  p8b_vm.p8s_op_forpush
-            jmp  _after
-_t26:
-            jsr  p8b_vm.p8s_op_fornext
-            jmp  _after
-_t27:
-            jsr  p8b_vm.p8s_op_pushs
-            jmp  _after
-_t28:
-            jsr  p8b_vm.p8s_op_loads
-            jmp  _after
-_t29:
-            jsr  p8b_vm.p8s_op_stors
-            jmp  _after
-_t30:
-            jsr  p8b_vm.p8s_op_concat
-            jmp  _after
-_t31:
-            jsr  p8b_vm.p8s_op_poke
-            jmp  _after
-_t32:
-            jsr  p8b_vm.p8s_op_peek
-            jmp  _after
-_t33:
-            jsr  p8b_vm.p8s_op_sys
-            jmp  _after
-_t34:
-            jsr  p8b_vm.p8s_op_dim
-            jmp  _after
-_t35:
-            jsr  p8b_vm.p8s_op_aload
-            jmp  _after
-_t36:
-            jsr  p8b_vm.p8s_op_astore
-            jmp  _after
-_t37:
-            jsr  p8b_vm.p8s_op_inputv
-            jmp  _after
-_t38:
-            jsr  p8b_vm.p8s_op_inputs
-            jmp  _after
-_t39:
-            jsr  p8b_vm.p8s_op_pushf
-            jmp  _after
-_t40:
-            jsr  p8b_vm.p8s_op_callfn
-            jmp  _after
-_t41:
-            jsr  p8b_vm.p8s_op_strnum
-            jmp  _after
-_t42:
-            jsr  p8b_vm.p8s_op_numstr
-            jmp  _after
-_t43:
-            jsr  p8b_vm.p8s_op_lefts
-            jmp  _after
-_t44:
-            jsr  p8b_vm.p8s_op_rights
-            jmp  _after
-_t45:
-            jsr  p8b_vm.p8s_op_mids
-            jmp  _after
-_t46:
-            jsr  p8b_vm.p8s_op_read
-            jmp  _after
-_t47:
-            jsr  p8b_vm.p8s_op_reads
-            jmp  _after
-_t48:
-            jsr  p8b_vm.p8s_op_restore
-            jmp  _after
-_t49:
-            jsr  p8b_vm.p8s_op_sdim
-            jmp  _after
-_t50:
-            jsr  p8b_vm.p8s_op_saload
-            jmp  _after
-_t51:
-            jsr  p8b_vm.p8s_op_sastore
-            jmp  _after
-_t52:
-            jsr  p8b_vm.p8s_op_rdnum
-            jmp  _after
-_t53:
-            jsr  p8b_vm.p8s_op_rdstr
-            jmp  _after
-_t54:
-            jsr  p8b_vm.p8s_op_scmp
-            jmp  _after
-_t55:
-            jsr  p8b_vm.p8s_op_open
-            jmp  _after
-_t56:
-            jsr  p8b_vm.p8s_op_close
-            jmp  _after
-_t57:
-            jsr  p8b_vm.p8s_op_getch
-            jmp  _after
-_t58:
-            jsr  p8b_vm.p8s_op_status
-            jmp  _after
-_t59:
-            jsr  p8b_vm.p8s_op_chkout
-            jmp  _after
-_t60:
-            jsr  p8b_vm.p8s_op_chkin
-            jmp  _after
-_t61:
-            jsr  p8b_vm.p8s_op_clrch
-            jmp  _after
-_t62:
-            jsr  p8b_vm.p8s_op_pow
-            jmp  _after
-_t63:
-            jsr  p8b_vm.p8s_op_wait
-            jmp  _after
-_t64:
-            jsr  p8b_vm.p8s_op_passthru
-            jmp  _after
-_t65:
-            jsr  p8b_vm.p8s_op_callx
-            jmp  _after
-_t66:
-            jsr  p8b_vm.p8s_op_callxs
-            jmp  _after
-_t67:
-            jsr  p8b_vm.p8s_op_ipushi
-            jmp  _after
-_t68:
-            jsr  p8b_vm.p8s_op_iloadv
-            jmp  _after
-_t69:
-            jsr  p8b_vm.p8s_op_istorv
-            jmp  _after
-_t70:
-            jsr  p8b_vm.p8s_op_iadd
-            jmp  _after
-_t71:
-            jsr  p8b_vm.p8s_op_isub
-            jmp  _after
-_t72:
-            jsr  p8b_vm.p8s_op_imul
-            jmp  _after
-_t73:
-            jsr  p8b_vm.p8s_op_ineg
-            jmp  _after
-_t74:
-            jsr  p8b_vm.p8s_op_itof
-            jmp  _after
-_t75:
-            jsr  p8b_vm.p8s_op_itof2
-            jmp  _after
-_t76:
-            jsr  p8b_vm.p8s_op_ftoi
-            jmp  _after
-_t77:
-            jsr  p8b_vm.p8s_op_icmpeq
-            jmp  _after
-_t78:
-            jsr  p8b_vm.p8s_op_icmpne
-            jmp  _after
-_t79:
-            jsr  p8b_vm.p8s_op_icmplt
-            jmp  _after
-_t80:
-            jsr  p8b_vm.p8s_op_icmpgt
-            jmp  _after
-_t81:
-            jsr  p8b_vm.p8s_op_icmple
-            jmp  _after
-_t82:
-            jsr  p8b_vm.p8s_op_icmpge
-            jmp  _after
-_t83:
-            jsr  p8b_vm.p8s_op_ijz
-            jmp  _after
-_t84:
-            jsr  p8b_vm.p8s_op_iand
-            jmp  _after
-_t85:
-            jsr  p8b_vm.p8s_op_ior
-            jmp  _after
-_t86:
-            jsr  p8b_vm.p8s_op_inot
-            jmp  _after
-_t87:
-            jsr  p8b_vm.p8s_op_iforpush
-            jmp  _after
-_t88:
-            jsr  p8b_vm.p8s_op_ifornext
-            jmp  _after
-_t89:
-            jsr  p8b_vm.p8s_op_idim
-            jmp  _after
-_t90:
-            jsr  p8b_vm.p8s_op_iaload
-            jmp  _after
-_t91:
-            jsr  p8b_vm.p8s_op_iastore
-            jmp  _after
 _end:
         }}
     }
