@@ -18,6 +18,8 @@ cp build/vm_runtime.prg "$FS/gpc.runtime.bin"      # the compiler opens it as "g
 [ -f build/vm_runtime_core.prg ] && cp build/vm_runtime_core.prg "$FS/gpc.rt.core.bin"   # core tier for feature-free programs
 [ -f build/vm_runtime_str.prg ]  && cp build/vm_runtime_str.prg  "$FS/gpc.rt.str.bin"    # str tier for strings-only programs
 [ -f build/vm_runtime_arr.prg ]  && cp build/vm_runtime_arr.prg  "$FS/gpc.rt.arr.bin"    # arr tier for arrays-only programs
+[ -f build/vm_runtime_arrstr.prg ]     && cp build/vm_runtime_arrstr.prg     "$FS/gpc.rt.arrstr.bin"      # arr+str tier
+[ -f build/vm_runtime_arrstrdata.prg ] && cp build/vm_runtime_arrstrdata.prg "$FS/gpc.rt.arrstrdata.bin"  # arr+str+data tier
 rm -f "$FS/out.prg"
 echo "  \"$SRCLINE\"  (standalone)"
 

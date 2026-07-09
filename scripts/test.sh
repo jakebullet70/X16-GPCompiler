@@ -13,6 +13,8 @@ bash "$DIR/build.sh" runtime  >/dev/null
 bash "$DIR/build.sh" runtime core >/dev/null   # feature-stripped core tier (feature-free programs)
 bash "$DIR/build.sh" runtime str  >/dev/null   # core+strings tier (strings-only programs)
 bash "$DIR/build.sh" runtime arr  >/dev/null   # core+arrays tier (numeric-arrays-only programs)
+bash "$DIR/build.sh" runtime arrstr     >/dev/null   # core+arrays+strings tier
+bash "$DIR/build.sh" runtime arrstrdata >/dev/null   # core+arrays+strings+DATA tier
 bash "$DIR/build.sh" gpc   >/dev/null
 bash "$DIR/build.sh" gpc prompt >/dev/null   # INTERACTIVE variant for the filename-prompt test
 echo "  ok"
@@ -617,6 +619,12 @@ bash "$DIR/check-standalone.sh" mail "10 X=5:IF X>3 THEN PRINT INT(41.6)+1"    0
 bash "$DIR/check-standalone.sh" out  '10 A$="BLITZ":PRINT LEFT$(A$,2)+MID$(A$,4)' "BLTZ" || fail=1
 # arrays-only -> ARR tier: DIM + indexed store/load run standalone with the intermediate runtime
 bash "$DIR/check-standalone.sh" mail "10 DIM A(9)\n20 FOR I=0 TO 4:A(I)=I*I:NEXT\n30 PRINT A(3)" 0400=9 || fail=1
+# arrays+strings -> ARRSTR tier (subset selection: STR|ARR is covered by the arrstr set, not full)
+bash "$DIR/check-standalone.sh" out  '10 DIM A(3):A(1)=7:B$="V=":PRINT B$;A(1)' "V=7" || fail=1
+# arrays+strings+DATA -> ARRSTRDATA tier
+bash "$DIR/check-standalone.sh" out  '10 DIM A(2):DATA 4,5:READ A(0),A(1):C$="S=":PRINT C$;A(0)+A(1)' "S=9" || fail=1
+# DATA-only (a subset of the arrstrdata feature set) also lands in ARRSTRDATA, not full
+bash "$DIR/check-standalone.sh" mail "10 DATA 6,7:READ P,Q:PRINT P*Q" 0400=2a || fail=1
 
 echo
 echo "== Standalone .prg: compiled programs run with NO compiler present =="

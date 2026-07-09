@@ -79,32 +79,37 @@ case "$MODE" in
         "$JAVA" -jar "$PROG8C" -target cx16 -srcdirs "$SRCDIRS" -out build "build/gen/${BASE}_prompt.p8"
         echo "built: build/${BASE}_prompt.prg (prompt-test)"
         ;;
-    core|str|arr)
+    core|str|arr|arrstr|arrstrdata)
         # Feature-stripped runtime tiers (only meaningful for the runtime target). The compiler
-        # auto-selects the lowest tier whose feature set covers what a program actually uses:
-        #   core -- float arith + control flow + PRINT + CALLFN + int-literal coercion only.
-        #   str  -- core PLUS strings (bstr + string handlers), for programs that use string
-        #           literals/vars/functions but no arrays, %int, X16 keywords, I/O, or DATA.
-        #   arr  -- core PLUS numeric arrays (DIM A()), for programs that use float arrays but no
-        #           strings, %int, X16, I/O, or DATA.
+        # auto-selects the lowest-base tier whose feature SET covers what a program actually uses
+        # (subset selection), so a program never pays for features it doesn't touch:
+        #   core        -- float arith + control flow + PRINT + CALLFN + int-literal coercion only.
+        #   arr         -- core PLUS numeric arrays (DIM A()).
+        #   str         -- core PLUS strings (bstr + string handlers).
+        #   arrstr      -- core PLUS numeric arrays AND strings.
+        #   arrstrdata  -- core PLUS numeric arrays, strings, AND DATA/READ/RESTORE.
+        # Anything using %int, X16 keywords, or I/O (or a mix outside the above sets) -> full runtime.
         # NOTE the core int boundary: IPUSHI/INEG/ITOF/ITOF2/FTOI (literal coercion) AND IJZ (a bare
         # integer-literal IF condition -- "IF 0" -- branches via IJZ, no % var needed) are CORE. Only
         # %-variable ops (iloadv/istorv/iadd.../icmp*/iand/ior/inot/ifor*/int-arrays) are opt-in.
         [ "$TARGET" = "runtime" ] || { echo "$MODE mode only applies to the runtime target"; exit 1; }
-        # The full optional set (everything the core tier strips):
+        # Opcode families (kept live by whichever tiers include that feature):
+        #   ARR  = dim aload astore                          (numeric arrays)
+        #   STR  = prints pushs loads stors concat strnum numstr lefts rights mids sdim saload sastore scmp
+        #   DATA = read reads restore rdnum rdstr             (READ/DATA/RESTORE; reads/rdstr also need bstr)
+        # Each STRIP list below is "everything optional MINUS the families that tier keeps". inputs
+        # (string INPUT) stays stripped everywhere here -- it trips the I/O bit, so it lands in full.
         CORE_STRIP='prints|pushs|loads|stors|concat|poke|peek|sys|dim|aload|astore|inputv|inputs|strnum|numstr|lefts|rights|mids|read|reads|restore|sdim|saload|sastore|rdnum|rdstr|scmp|open|close|getch|status|chkout|chkin|clrch|wait|passthru|callx|callxs|iloadv|istorv|iadd|isub|imul|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore'
-        # The str tier keeps the string opcodes (prints/pushs/loads/stors/concat/strnum/numstr/lefts/
-        # rights/mids/sdim/saload/sastore/scmp) live; it strips arrays, %int, X16, I/O, DATA. inputs/
-        # reads/rdstr stay stripped -- they couple strings to I/O or DATA, so any program using them
-        # trips those feature bits and lands in the full tier anyway.
         STR_STRIP='poke|peek|sys|dim|aload|astore|inputv|inputs|read|reads|restore|rdnum|rdstr|open|close|getch|status|chkout|chkin|clrch|wait|passthru|callx|callxs|iloadv|istorv|iadd|isub|imul|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore'
-        # The arr tier keeps the numeric-array opcodes (dim/aload/astore) live; it strips strings,
-        # %int (incl. %int arrays idim/iaload/iastore), X16, I/O, DATA.
         ARR_STRIP='prints|pushs|loads|stors|concat|poke|peek|sys|inputv|inputs|strnum|numstr|lefts|rights|mids|read|reads|restore|sdim|saload|sastore|rdnum|rdstr|scmp|open|close|getch|status|chkout|chkin|clrch|wait|passthru|callx|callxs|iloadv|istorv|iadd|isub|imul|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore'
+        ARRSTR_STRIP='poke|peek|sys|inputv|inputs|read|reads|restore|rdnum|rdstr|open|close|getch|status|chkout|chkin|clrch|wait|passthru|callx|callxs|iloadv|istorv|iadd|isub|imul|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore'
+        ARRSTRDATA_STRIP='poke|peek|sys|inputv|inputs|open|close|getch|status|chkout|chkin|clrch|wait|passthru|callx|callxs|iloadv|istorv|iadd|isub|imul|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore'
         case "$MODE" in
-            core) build_tier core "$CORE_STRIP" no  '$1D00' "$3" ;;   # keep-bstr=no: core has no strings
-            str)  build_tier str  "$STR_STRIP"  yes '$2A20' "$3" ;;   # keep-bstr=yes: str needs bstr; footprint ~$2907
-            arr)  build_tier arr  "$ARR_STRIP"  no  '$2240' "$3" ;;   # keep-bstr=no: numeric arrays only; footprint ~$2126
+            core)       build_tier core       "$CORE_STRIP"       no  '$1D00' "$3" ;;   # footprint ~$1be8
+            arr)        build_tier arr        "$ARR_STRIP"        no  '$2240' "$3" ;;   # footprint ~$2126
+            str)        build_tier str        "$STR_STRIP"        yes '$2A20' "$3" ;;   # footprint ~$2907
+            arrstr)     build_tier arrstr     "$ARRSTR_STRIP"     yes '$2CA0' "$3" ;;   # footprint ~$2b76
+            arrstrdata) build_tier arrstrdata "$ARRSTRDATA_STRIP" yes '$2D60' "$3" ;;   # footprint ~$2c46
         esac
         exit 0
         ;;

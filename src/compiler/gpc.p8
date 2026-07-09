@@ -139,6 +139,14 @@ main {
     ; so $2240 clears it with ~280 bytes of margin. An arrays-only program saves $3C80-$2240 = ~6.7 KB
     ; vs the full tier (arrays need less runtime than strings, so this tier's base is even lower).
     const uword ARR_PCODE_BASE = $2240
+    ; Combined tiers for the common multi-feature programs. arrstr = arrays + strings; arrstrdata adds
+    ; DATA/READ/RESTORE. Footprints ~$2b76 / ~$2c46 (build.sh asserts them), so these bases clear them
+    ; with ~280 bytes of margin. A program that mixes these features would otherwise pay the full $3C80;
+    ; here it saves ~4 KB. Selection is subset-based: the lowest-base tier whose feature SET covers
+    ; features_used wins, so e.g. an arrays+strings program lands in arrstr, and a DATA-only program
+    ; (a subset of arrstrdata's set) lands in arrstrdata rather than full.
+    const uword ARRSTR_PCODE_BASE     = $2CA0
+    const uword ARRSTRDATA_PCODE_BASE = $2D60
 
     ; --- standalone output ---
     bool  wrote_output             ; did this run emit a standalone out.prg?
@@ -614,21 +622,28 @@ main {
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        ; Pick the runtime tier: the compiler auto-selects the lowest tier whose feature set covers what
-        ; the program actually used (tracked in features_used). No optional features -> the small core
-        ; runtime at CORE_PCODE_BASE; strings ONLY -> the str runtime at STR_PCODE_BASE; anything else
-        ; (arrays, %int, X16, I/O, DATA, or a mix) -> the full runtime at PCODE_BASE.
+        ; Pick the runtime tier by SUBSET selection: choose the lowest-base tier whose feature SET
+        ; covers everything the program used (features_used). `features_used & ~mask == 0` means every
+        ; feature the program touched is provided by that tier. Checked in ascending base order, so the
+        ; first match is the smallest covering runtime; anything not covered by a tier (%int, X16, I/O,
+        ; or a mix outside these sets) falls through to the full runtime. Keep this order base-ascending.
         uword pbase = pcode.PCODE_BASE
         bool opened
         if features_used == 0 {
             pbase = CORE_PCODE_BASE
             opened = diskio.f_open("gpc.rt.core.bin")
-        } else if features_used == FEAT_STR {
-            pbase = STR_PCODE_BASE
-            opened = diskio.f_open("gpc.rt.str.bin")
-        } else if features_used == FEAT_ARR {
+        } else if (features_used & ~FEAT_ARR) == 0 {
             pbase = ARR_PCODE_BASE
             opened = diskio.f_open("gpc.rt.arr.bin")
+        } else if (features_used & ~FEAT_STR) == 0 {
+            pbase = STR_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.str.bin")
+        } else if (features_used & ~(FEAT_ARR | FEAT_STR)) == 0 {
+            pbase = ARRSTR_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.arrstr.bin")
+        } else if (features_used & ~(FEAT_ARR | FEAT_STR | FEAT_DATA)) == 0 {
+            pbase = ARRSTRDATA_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.arrstrdata.bin")
         } else {
             opened = diskio.f_open("gpc.runtime.bin")
         }
