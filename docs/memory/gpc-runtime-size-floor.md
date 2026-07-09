@@ -27,8 +27,16 @@ exactly in the historically bug-prone FOUT/word-cast path ([[gpc-print-large-num
 prog8 emits a `π` constant that fails without it).
 
 **Real size levers that DID land** (see [[gpc-inc2-design]] / runtime-tiers branch): feature-tiered runtime
-(core vs full) + per-tier PCODE_BASE. A standalone `.PRG` floor is `PCODE_BASE - $0801`, so lowering the
-base is the only thing that shrinks programs; shrinking runtime code below the base just grows filler.
-Collapsed dead optional-asmsub bodies (prog8 never DCEs `asmsub`s) to drop the core footprint, then
-CORE_PCODE_BASE $2000->$1D00 = 768 B off every core-tier program. Further shrink needs deep hand-asm of the
-dispatch/live handlers — diminishing returns, not a quick trick. See [[gpc-runtime-asm-conversion]].
++ per-tier PCODE_BASE. A standalone `.PRG` floor is `PCODE_BASE - $0801`, so lowering the base is the only
+thing that shrinks programs; shrinking runtime code below the base just grows filler. THREE tiers now, the
+compiler auto-picks the lowest whose feature set covers `features_used`:
+- core @ $1D00 (float/control/PRINT only; features_used==0)
+- str  @ $2A20 (core + strings/bstr; features_used==FEAT_STR) -> strings-only program saves ~4.7 KB /
+  ~18 blocks vs full (HELLO 13508->8804 B). String programs are common, so this hits the frequent case.
+- full @ $3C80 (everything else)
+
+Mechanism (build.sh `build_tier` helper): stub the tier's excluded opcodes in _optab -> _unimpl AND collapse
+their asmsub bodies to `rts` (prog8 never DCEs `asmsub`s), which drops the footprint enough to claim a lower
+PCODE_BASE; each tier's base is set empirically from its build's `prog8_program_end` (assert-pcode-base
+guards it, needs >=256 B margin). Next rung would be +ARR (numeric arrays). Further shrink of a GIVEN tier
+needs deep hand-asm of the dispatch/live handlers — diminishing returns. See [[gpc-runtime-asm-conversion]].
