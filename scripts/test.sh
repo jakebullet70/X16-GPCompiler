@@ -294,6 +294,31 @@ bash "$DIR/check-basic.sh" '10 S%=0\n20 FOR I%=1 TO 5.9\n30 S%=S%+1\n40 NEXT\n50
 bash "$DIR/check-standalone.sh" mail '10 S%=0\n20 FOR I%=1 TO 100\n30 S%=S%+2\n40 NEXT\n50 PRINT S%' 0400=c8 || fail=1
 
 echo
+echo "== Integer arrays (Phase 5 inc 2c): DIM A%() compiles to IDIM/IALOAD/IASTORE (2-byte elements) =="
+# store then read back an element
+bash "$DIR/check-basic.sh" '10 DIM A%(5):A%(2)=7:PRINT A%(2)'                     0400=7  || fail=1
+# an op AFTER a bare DIM A%() must still run (regression: the dispatch opcode-limit once ignored 89+)
+bash "$DIR/check-basic.sh" '10 DIM A%(5):PRINT 42'                                0400=2a || fail=1
+# element values above a byte round-trip as full 16-bit ints -> 300
+bash "$DIR/check-basic.sh" '10 DIM A%(5):A%(2)=300:PRINT A%(2)'                   0400=2c 0401=1 || fail=1
+# negative element -> -7 (0xfff9)
+bash "$DIR/check-basic.sh" '10 DIM A%(5):A%(2)=-7:PRINT A%(2)'                    0400=f9 0401=ff || fail=1
+# an unstored element reads 0 (op_idim zero-inits the heap)
+bash "$DIR/check-basic.sh" '10 DIM A%(5):PRINT A%(3)'                             0400=0  || fail=1
+# fill in an integer loop by variable subscript, read back -> A%(3) = 3*3 = 9
+bash "$DIR/check-basic.sh" '10 DIM A%(3)\n20 FOR I%=0 TO 3\n30 A%(I%)=I%*I%\n40 NEXT\n50 PRINT A%(3)' 0400=9 || fail=1
+# a 2-D integer array element
+bash "$DIR/check-basic.sh" '10 DIM A%(2,2):A%(1,1)=42:PRINT A%(1,1)'             0400=2a || fail=1
+# an integer-array element in a float expression coerces: 10 * 1.5 = 15
+bash "$DIR/check-basic.sh" '10 DIM A%(3):A%(0)=10:X=A%(0)*1.5:PRINT X'          0400=f  || fail=1
+# two independent integer arrays: A%(1)+B%(1) = 3+4 = 7
+bash "$DIR/check-basic.sh" '10 DIM A%(5),B%(5):A%(1)=3:B%(1)=4:PRINT A%(1)+B%(1)' 0400=7 || fail=1
+# standalone (no compiler present): int array store then load -> 99
+bash "$DIR/check-standalone.sh" mail '10 DIM A%(5):A%(4)=99:PRINT A%(4)'         0400=63 || fail=1
+# standalone loop fill then sum the elements back -> 0+2+4+6+8 = 20
+bash "$DIR/check-standalone.sh" mail '10 DIM A%(4):S%=0\n20 FOR I%=0 TO 4\n30 A%(I%)=I%*2\n40 NEXT\n50 FOR I%=0 TO 4\n60 S%=S%+A%(I%)\n70 NEXT\n80 PRINT S%' 0400=14 || fail=1
+
+echo
 echo "== Channel / file I/O (OPEN / CLOSE / PRINT# / GET# / ST, via the KERNAL device API) =="
 # round-trip: write "AB" to a file with PRINT#, read it back a byte at a time with GET#, count to EOF (ST)
 CIO='10 OPEN 1,8,1,"CIO,S,W"\n20 PRINT#1,"AB";\n30 CLOSE 1\n40 OPEN 1,8,0,"CIO"\n50 GET#1,A$:N=N+1:IF ST=0 GOTO 50\n70 PRINT N\n80 CLOSE 1'

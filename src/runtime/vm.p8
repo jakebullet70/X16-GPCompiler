@@ -29,7 +29,8 @@ vm {
     ; program parks them in free RAM just ABOVE the loaded P-code (so nothing sits between the runtime
     ; code and the P-code, and the .PRG carries no multi-KB filler); the resident compiler pre-sets them
     ; to its own buffer before vm.run. See run() for the layout.
-    const uword SLAB_BYTES = 640 + 256 + 2048 + 256 + 256   ; = 3456
+    const uword SLAB_BYTES = 640 + 256 + 2048 + 256 + 256 + 1024 + 256   ; = 4736
+                             ; varsf ivarsf arrheap arr_dims sarr_dims iarrheap iarr_dims
     ; variable slots: 128 floats * 5 bytes = 640, addressed as varsf + slot*5 via peekf/pokef
     uword @shared varsf
     ; integer (`%`) variable slots: 128 words addressed as ivarsf + slot*2
@@ -101,6 +102,17 @@ vm {
     uword @shared arr_dims                   ; host-assigned (see SLAB_BYTES / run())
     uword      arr_top            ; bump pointer into arrheap (bytes)
 
+    ; --- integer arrays (DIM A%(...)): the int twins of the numeric arrays above. Elements are 16-bit
+    ;     words (2 bytes) in their own bump heap; the same generic dim_setup/index_of drive layout. Their
+    ;     own slot namespace (the compiler's iarrnames table), so the metadata is a separate set of 32. ---
+    const uword IARRHEAP_SIZE = 1024         ; 512 int elements shared across all `%` arrays
+    uword @shared iarrheap                   ; host-assigned (see SLAB_BYTES / run())
+    uword[32]  iarr_base          ; byte offset of each int array within iarrheap
+    uword[32]  iarr_len           ; total element count (0 = undimensioned/unusable)
+    ubyte[32]  iarr_ndims         ; number of dimensions
+    uword @shared iarr_dims                  ; per-array dim sizes (MAXDIMS words/array); host-assigned
+    uword      iarr_top           ; bump pointer into iarrheap (bytes)
+
     ; --- string arrays (DIM A$(...)): real BASIC arrays built by bstr in the ARYTAB..STREND region;
     ;     each element is a 3-byte descriptor the ROM collector walks. The VM keeps only the per-array
     ;     dimension metadata (for row-major index math); bstr owns the element storage + rooting. ---
@@ -148,18 +160,22 @@ vm {
             uword sbase = datatop
             if sbase == 0
                 sbase = sys.progend()        ; selftest: hand-built P-code, no datatop
-            varsf     = sbase                ; layout must match SLAB_BYTES: 640+256+2048+256+256
+            varsf     = sbase                ; layout must match SLAB_BYTES (and gpc.p8's in-process copy)
             ivarsf    = sbase + 640
             arrheap   = sbase + 896
             arr_dims  = sbase + 2944
             sarr_dims = sbase + 3200
+            iarrheap  = sbase + 3456
+            iarr_dims = sbase + 4480
             image_top = sbase + SLAB_BYTES   ; string var table + heap stack above the slabs
         }
         bstr.init(image_top, varsf)
         sys.memset(varsf, 640, 0)        ; all-zero bytes == float 0.0 (BASIC vars start at 0)
         sys.memset(ivarsf, 256, 0)       ; integer (`%`) vars start at 0 too
         arr_top = 0
+        iarr_top = 0
         sys.memset(&arr_len, 64, 0)      ; 32 words -> 64 bytes: all numeric arrays undimensioned
+        sys.memset(&iarr_len, 64, 0)     ; all integer arrays undimensioned too
         sys.memset(&sarr_len, 64, 0)     ; all string arrays undimensioned too
         dataptr = database               ; READ starts at the first DATA item
         %asm {{
@@ -176,9 +192,9 @@ _next:
             bne  +
             inc  p8b_vm.p8v_pc+1
 +
-            cmp  #89                       ; unknown opcode -> ignore (parity with when no-match)
+            cmp  #92                       ; opcodes 0..91 valid; >=92 unknown -> ignore (when no-match)
             bcs  _next
-            asl  a                         ; *2 for the word table (0..88 -> 0..176)
+            asl  a                         ; *2 for the word table (0..91 -> 0..182)
             tax
             jmp  (_optab,x)
 _after:
@@ -186,7 +202,7 @@ _after:
             beq  _next
             jmp  _end
 _optab:
-            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66, _t67, _t68, _t69, _t70, _t71, _t72, _t73, _t74, _t75, _t76, _t77, _t78, _t79, _t80, _t81, _t82, _t83, _t84, _t85, _t86, _t87, _t88
+            .word _t0, _t1, _t2, _t3, _t4, _t5, _t6, _t7, _t8, _t9, _t10, _t11, _t12, _t13, _t14, _t15, _t16, _t17, _t18, _t19, _t20, _t21, _t22, _t23, _t24, _t25, _t26, _t27, _t28, _t29, _t30, _t31, _t32, _t33, _t34, _t35, _t36, _t37, _t38, _t39, _t40, _t41, _t42, _t43, _t44, _t45, _t46, _t47, _t48, _t49, _t50, _t51, _t52, _t53, _t54, _t55, _t56, _t57, _t58, _t59, _t60, _t61, _t62, _t63, _t64, _t65, _t66, _t67, _t68, _t69, _t70, _t71, _t72, _t73, _t74, _t75, _t76, _t77, _t78, _t79, _t80, _t81, _t82, _t83, _t84, _t85, _t86, _t87, _t88, _t89, _t90, _t91
 _t0:                                    ; OP_END -> leave the interpreter loop
             jmp  _end
 _t1:                                    ; OP_JMP -> pc = target word at pcbase+pc
@@ -483,6 +499,15 @@ _t87:
             jmp  _after
 _t88:
             jsr  p8b_vm.p8s_op_ifornext
+            jmp  _after
+_t89:
+            jsr  p8b_vm.p8s_op_idim
+            jmp  _after
+_t90:
+            jsr  p8b_vm.p8s_op_iaload
+            jmp  _after
+_t91:
+            jsr  p8b_vm.p8s_op_iastore
             jmp  _after
 _end:
         }}
@@ -1887,6 +1912,179 @@ _asok:      jsr  prog8_math.mul_word_5         ; A/Y = asoff*5  (clobbers W1,W2)
             dey
             bpl  -
 _asdone:    rts
+        }}
+    }
+    sub op_idim() {                       ; DIM A%(d0[,d1..]): allocate an integer array (2 bytes/element)
+                    ubyte idslot = @(pcbase + pc)
+                    ubyte idnd = @(pcbase + pc + 2)
+                    pc += 3
+                    uword idtot = dim_setup(iarr_dims, idslot, idnd, IARRHEAP_SIZE / 2)
+                    if idtot != 0 and iarr_top + idtot * 2 <= IARRHEAP_SIZE {
+                        iarr_base[idslot] = iarr_top
+                        iarr_len[idslot] = idtot
+                        iarr_ndims[idslot] = idnd
+                        sys.memset(iarrheap + iarr_top, idtot * 2, 0)   ; A%() elements start at 0
+                        iarr_top += idtot * 2
+                    } else {
+                        iarr_len[idslot] = 0                  ; too big / out of heap -> unusable
+                    }
+                }
+    asmsub op_iaload() {                  ; A%(i[,j..]): push int element; 0 if any subscript out of range
+        %asm {{
+            lda  p8b_vm.p8v_pcbase              ; --- operands slot@pc, nd@pc+2 ; pc += 3 ---
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            sta  p8b_vm.p8s_index_of.p8v_slot
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y
+            sta  p8b_vm.p8s_index_of.p8v_nd
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #3
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           lda  p8b_vm.p8v_iarr_dims           ; iloff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr
+            lda  p8b_vm.p8v_iarr_dims+1
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8s_index_of.p8v_first
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  p8b_vm.p8v_iarr_len_lsb,y
+            sta  p8b_vm.p8s_index_of.p8v_total
+            lda  p8b_vm.p8v_iarr_len_msb,y
+            sta  p8b_vm.p8s_index_of.p8v_total+1
+            jsr  p8b_vm.p8s_index_of            ; A=lo, Y=hi of iloff ($ffff => out of range)
+            pha
+            phy
+            lda  p8b_vm.p8v_sp                  ; sp -= nd
+            sec
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8v_sp
+            ply
+            pla
+            cmp  #$ff
+            bne  _ilok
+            cpy  #$ff
+            beq  _ilzero
+_ilok:      asl  a                              ; iloff*2 (2-byte elements) -> A=lo, Y=hi
+            sta  P8ZP_SCRATCH_W1
+            tya
+            rol  a
+            tay
+            lda  P8ZP_SCRATCH_W1               ; W1 = iarrheap + iloff*2
+            clc
+            adc  p8b_vm.p8v_iarrheap
+            sta  P8ZP_SCRATCH_W1
+            tya
+            adc  p8b_vm.p8v_iarrheap+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  p8b_vm.p8s_index_of.p8v_slot ; + iarr_base[slot]
+            lda  P8ZP_SCRATCH_W1
+            clc
+            adc  p8b_vm.p8v_iarr_base_lsb,y
+            sta  P8ZP_SCRATCH_W1
+            lda  P8ZP_SCRATCH_W1+1
+            adc  p8b_vm.p8v_iarr_base_msb,y
+            sta  P8ZP_SCRATCH_W1+1
+            ldx  p8b_vm.p8v_sp                 ; istack[sp] = word at (W1)
+            lda  (P8ZP_SCRATCH_W1)
+            sta  p8b_vm.p8v_istack_lsb,x
+            ldy  #1
+            lda  (P8ZP_SCRATCH_W1),y
+            sta  p8b_vm.p8v_istack_msb,x
+            jmp  _ildone
+_ilzero:    ldx  p8b_vm.p8v_sp                 ; out of range: istack[sp] = 0
+            lda  #0
+            sta  p8b_vm.p8v_istack_lsb,x
+            sta  p8b_vm.p8v_istack_msb,x
+_ildone:    inc  p8b_vm.p8v_sp
+            rts
+        }}
+    }
+    asmsub op_iastore() {                 ; A%(i[,j..]) = v: store int element; dropped if out of range
+        %asm {{
+            lda  p8b_vm.p8v_pcbase              ; --- operands slot@pc, nd@pc+2 ; pc += 3 ---
+            clc
+            adc  p8b_vm.p8v_pc
+            sta  P8ZP_SCRATCH_W1
+            lda  p8b_vm.p8v_pcbase+1
+            adc  p8b_vm.p8v_pc+1
+            sta  P8ZP_SCRATCH_W1+1
+            lda  (P8ZP_SCRATCH_W1)
+            sta  p8b_vm.p8s_index_of.p8v_slot
+            ldy  #2
+            lda  (P8ZP_SCRATCH_W1),y
+            sta  p8b_vm.p8s_index_of.p8v_nd
+            lda  p8b_vm.p8v_pc
+            clc
+            adc  #3
+            sta  p8b_vm.p8v_pc
+            bcc  +
+            inc  p8b_vm.p8v_pc+1
++           dec  p8b_vm.p8v_sp                  ; sp-- : value at istack[sp], subscripts below it
+            lda  p8b_vm.p8v_iarr_dims           ; isoff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr
+            lda  p8b_vm.p8v_iarr_dims+1
+            sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
+            lda  p8b_vm.p8v_sp
+            sec
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8s_index_of.p8v_first
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  p8b_vm.p8v_iarr_len_lsb,y
+            sta  p8b_vm.p8s_index_of.p8v_total
+            lda  p8b_vm.p8v_iarr_len_msb,y
+            sta  p8b_vm.p8s_index_of.p8v_total+1
+            jsr  p8b_vm.p8s_index_of            ; A=lo, Y=hi of isoff
+            pha
+            phy
+            lda  p8b_vm.p8v_sp                  ; B1 = value slot (= sp before sp-=nd)
+            sta  P8ZP_SCRATCH_B1
+            sec                                 ; sp -= nd
+            sbc  p8b_vm.p8s_index_of.p8v_nd
+            sta  p8b_vm.p8v_sp
+            ply
+            pla
+            cmp  #$ff                           ; isoff == $ffff -> drop the store
+            bne  _isok
+            cpy  #$ff
+            beq  _isdone
+_isok:      asl  a                              ; isoff*2 -> A=lo, Y=hi
+            sta  P8ZP_SCRATCH_W1
+            tya
+            rol  a
+            tay
+            lda  P8ZP_SCRATCH_W1               ; W1 = iarrheap + isoff*2
+            clc
+            adc  p8b_vm.p8v_iarrheap
+            sta  P8ZP_SCRATCH_W1
+            tya
+            adc  p8b_vm.p8v_iarrheap+1
+            sta  P8ZP_SCRATCH_W1+1
+            ldy  p8b_vm.p8s_index_of.p8v_slot ; + iarr_base[slot]
+            lda  P8ZP_SCRATCH_W1
+            clc
+            adc  p8b_vm.p8v_iarr_base_lsb,y
+            sta  P8ZP_SCRATCH_W1
+            lda  P8ZP_SCRATCH_W1+1
+            adc  p8b_vm.p8v_iarr_base_msb,y
+            sta  P8ZP_SCRATCH_W1+1
+            ldx  P8ZP_SCRATCH_B1              ; istack[value slot] -> (W1)
+            lda  p8b_vm.p8v_istack_lsb,x
+            sta  (P8ZP_SCRATCH_W1)
+            lda  p8b_vm.p8v_istack_msb,x
+            ldy  #1
+            sta  (P8ZP_SCRATCH_W1),y
+_isdone:    rts
         }}
     }
     sub op_inputv() {

@@ -136,7 +136,8 @@ main {
     const uword linenums_ptr  = BRAM + 2560      ; MAXLINES 128 * 2 =  256  -> $AA00..$AAFF  (GOTO/THEN map)
     const uword lineaddrs_ptr = BRAM + 2816      ; MAXLINES 128 * 2 =  256  -> $AB00..$ABFF
     const uword fnnames_bptr  = BRAM + 3072      ; MAXFNS    16 * 8 =  128  -> $AC00..$AC7F  (DEF FN names)
-                                                 ; (3200 bytes used of the 8 KB bank -- room to grow caps)
+    const uword iarrnames_ptr = BRAM + 3200      ; MAXIARRS  32 * 8 =  256  -> $AC80..$AD7F  (DIM A%() names)
+                                                 ; (3456 bytes used of the 8 KB bank -- room to grow caps)
     const ubyte MAXVARS = 128            ; VM has word[128] vars
     const ubyte SCRATCH_SLOT = 127       ; top numeric slot reserved for the compiler (ON selector temp)
     ubyte nvars
@@ -157,6 +158,9 @@ main {
 
     const ubyte MAXARRS = 32             ; numeric arrays (DIM); slot must fit the VM's 32 descriptors
     ubyte narr
+
+    const ubyte MAXIARRS = 32            ; integer arrays (DIM A%()); own namespace + VM iarr descriptors (32)
+    ubyte niarr
 
     const ubyte MAXSARRS = 32            ; string arrays (DIM A$(), name incl. '$'); the VM keeps 32 too
     ubyte nsarr
@@ -288,10 +292,12 @@ main {
                 vm.database = datapool_ptr
                 vm.datatop = datapool_ptr + data_len
                 vm.varsf     = vmslabs               ; pre-place the VM slabs in our low buffer (layout
-                vm.ivarsf    = vmslabs + 640         ; must match vm.SLAB_BYTES: 640+256+2048+256+256)
+                vm.ivarsf    = vmslabs + 640         ; must match vm.SLAB_BYTES / vm.run's standalone layout)
                 vm.arrheap   = vmslabs + 896
                 vm.arr_dims  = vmslabs + 2944
                 vm.sarr_dims = vmslabs + 3200
+                vm.iarrheap  = vmslabs + 3456
+                vm.iarr_dims = vmslabs + 4480
                 vm.heapfloor = sys.progend()         ; heapfloor != 0 -> in-process regime: string heap
                                                      ; owns the free RAM from progend up to MEMTOP
                 if code_len <= RUN_CAP {
@@ -402,6 +408,7 @@ main {
         niv = 0
         nsvars = 0
         narr = 0
+        niarr = 0
         nsarr = 0
         nfns = 0
         nlines = 0
@@ -916,11 +923,14 @@ main {
     sub parse_dim() {
         next_token()
         repeat {
-            bool sdim = false
+            ubyte dkind = 0                     ; 0 = float array, 1 = string array, 2 = integer array
             ubyte dslot
             if tok == T_STRVAR {
-                sdim = true
+                dkind = 1
                 dslot = intern_sarr()
+            } else if tok == T_IVAR {
+                dkind = 2                        ; DIM A%(..) -> integer array (GPC extension)
+                dslot = intern_iarr()
             } else {
                 if tok == T_IDENT {
                     dslot = intern_arr()
@@ -938,10 +948,11 @@ main {
             ubyte nd = read_subscripts()        ; push each dimension's size, consume through ')'
             if had_error
                 return
-            if sdim
-                emit_byte(pcode.OP_SDIM)
-            else
-                emit_byte(pcode.OP_DIM)
+            when dkind {
+                1 -> emit_byte(pcode.OP_SDIM)
+                2 -> emit_byte(pcode.OP_IDIM)
+                else -> emit_byte(pcode.OP_DIM)
+            }
             emit_imm16(dslot as uword)
             emit_byte(nd)                       ; number of dimensions
             if tok != T_COMMA
@@ -1605,8 +1616,25 @@ main {
         if tok == T_IVAR {                          ; integer (`%`) variable assignment (Phase 5)
             void strings.copy(&tokname, &pend_name)
             next_token()
-            if tok == T_LPAREN {                    ; A%(..) integer arrays not supported yet
-                error(E_SYNTAX)
+            if tok == T_LPAREN {                    ; A%(i)=v -> integer array element store
+                void strings.copy(&pend_name, &tokname)
+                ubyte iaslot = intern_iarr()
+                next_token()                        ; consume '('
+                ubyte ind = read_subscripts()       ; push subscripts (numeric), consume through ')'
+                if had_error
+                    return
+                if tok != T_EQ {
+                    error(E_SYNTAX)
+                    return
+                }
+                next_token()
+                expr_keep_int = true                ; keep the RHS int; coerce a float RHS below
+                parse_expr()
+                if expr_type == TY_FLOAT
+                    emit_byte(pcode.OP_FTOI)        ; float RHS truncates toward zero into the int element
+                emit_byte(pcode.OP_IASTORE)
+                emit_imm16(iaslot as uword)
+                emit_byte(ind)
                 return
             }
             void strings.copy(&pend_name, &tokname)
@@ -2060,6 +2088,28 @@ main {
         return arrnames_ptr + (idx as uword) * NAMELEN
     }
 
+    ; integer-array slot for the identifier in `tokname` (name includes the '%'; own namespace)
+    sub intern_iarr() -> ubyte {
+        cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
+        ubyte i = 0
+        while i < niarr {
+            if strings.compare(&tokname, iarr_ptr(i)) == 0
+                return i
+            i++
+        }
+        if niarr == MAXIARRS {
+            error(E_MEM)
+            return 0
+        }
+        void strings.copy(&tokname, iarr_ptr(niarr))
+        niarr++
+        return niarr - 1
+    }
+
+    sub iarr_ptr(ubyte idx) -> uword {
+        return iarrnames_ptr + (idx as uword) * NAMELEN
+    }
+
     ; string-array slot for the identifier in `tokname` (name includes the '$'; own namespace)
     sub intern_sarr() -> ubyte {
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
@@ -2167,16 +2217,57 @@ main {
                 T_IVAR -> {                          ; integer (`%`) variable: scalar load -> INT (Phase 5)
                     void strings.copy(&tokname, &pend_name)
                     next_token()
-                    if tok == T_LPAREN {             ; A%(..) integer arrays not supported yet
-                        error(E_SYNTAX)
-                        return
+                    if tok == T_LPAREN {             ; A%(i,j,..): integer array element load -> INT
+                        void strings.copy(&pend_name, &tokname)   ; restore name for intern
+                        ; each subscript re-enters parse_expr; stash the operator floor + stop flag +
+                        ; slot + count on the frame stack, out of the nested parse's reach (as OP_ALOAD does)
+                        if fr_sp == EXPRNEST {
+                            error(E_COMPLEX)
+                            return
+                        }
+                        fr_base[fr_sp] = mybase
+                        fr_stoprp[fr_sp] = stop_rp
+                        fr_tbase[fr_sp] = tbase
+                        fr_keepint[fr_sp] = keep_int
+                        fr_slot[fr_sp] = intern_iarr()
+                        fr_nd[fr_sp] = 0
+                        fr_sp++
+                        next_token()                              ; consume '('
+                        repeat {
+                            parse_index()                         ; one subscript; stops at ',' or ')'
+                            fr_nd[fr_sp-1]++
+                            if had_error
+                                return
+                            if tok != T_COMMA
+                                break
+                            next_token()
+                        }
+                        fr_sp--
+                        mybase = fr_base[fr_sp]
+                        stop_rp = fr_stoprp[fr_sp]
+                        tbase = fr_tbase[fr_sp]
+                        keep_int = fr_keepint[fr_sp]
+                        ubyte iaslot = fr_slot[fr_sp]
+                        ubyte indim = fr_nd[fr_sp]
+                        if tok != T_RPAREN {
+                            error(E_SYNTAX)
+                            return
+                        }
+                        next_token()                              ; consume ')'
+                        emit_byte(pcode.OP_IALOAD)
+                        emit_imm16(iaslot as uword)
+                        emit_byte(indim)
+                        type_popn(indim)                          ; IALOAD consumes indim subscripts,
+                        type_push(TY_INT)                         ; pushes one int element
+                        expect_value = false
+                    } else {
+                        void strings.copy(&pend_name, &tokname)
+                        emit_byte(pcode.OP_ILOADV)
+                        emit_imm16(intern_ivar() as uword)
+                        type_push(TY_INT)
+                        expect_value = false
+                        ; tok already advanced past the identifier
                     }
-                    void strings.copy(&pend_name, &tokname)
-                    emit_byte(pcode.OP_ILOADV)
-                    emit_imm16(intern_ivar() as uword)
-                    type_push(TY_INT)
-                    expect_value = false
-                    ; tok already advanced past the identifier
                 }
                 T_ST -> {                            ; ST: the KERNAL I/O status word (a read-only number)
                     emit_byte(pcode.OP_STATUS)

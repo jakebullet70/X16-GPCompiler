@@ -193,6 +193,15 @@ pcode {
     const ubyte OP_IFORPUSH = 87 ; (imm16 slot) pop step then limit (int); open an integer FOR frame
     const ubyte OP_IFORNEXT = 88 ; ()           step the innermost (integer) FOR; loop to top or pop frame
 
+    ; --- integer arrays (Phase 5 inc 2c): DIM A%(...) -- the integer twins of OP_DIM/ALOAD/ASTORE. Each
+    ;     element is a 16-bit word (2 bytes) in a separate int-array heap, addressed row-major by the same
+    ;     dim_setup/index_of math as the float arrays (shared, generic). Loads push to the int stack and are
+    ;     typed TY_INT by the compiler, so array reads join the native-integer fast path. V2 has no `A%()`,
+    ;     so this is a pure GPC extension; out-of-range reads give 0 and out-of-range stores are dropped. ---
+    const ubyte OP_IDIM    = 89  ; (imm16 slot)(ubyte nd) pop nd max-indices; allocate an integer array
+    const ubyte OP_IALOAD  = 90  ; (imm16 slot)(ubyte nd) pop nd subscripts; push int element (0 if out of range)
+    const ubyte OP_IASTORE = 91  ; (imm16 slot)(ubyte nd) pop int value then nd subscripts; store the element
+
     ; Element addressing for both array families is ROW-MAJOR over dimension SIZES s_j = (max index j)+1:
     ; for subscripts i_0..i_{nd-1}, offset = (((i_0)*s_1 + i_1)*s_2 + i_2)... (Horner). The compiler emits
     ; the same subscripts for DIM and for access, so the exact layout only has to be self-consistent.
@@ -238,14 +247,18 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $3A00                    ; runtime finds the compiled program here. Must sit
+    const uword PCODE_BASE = $3E00                    ; runtime finds the compiled program here. Must sit
                                                       ; ABOVE the bundled runtime's LOW-RAM footprint (code
                                                       ; + hot BSS: passbuf/xbuf pass-through buffers + VM
                                                       ; state) so its RAM never overlaps the loaded P-code.
-                                                      ; Tier-1 layout: the five VM slabs and the BASIC string
-                                                      ; var table/heap now park ABOVE the P-code (see
-                                                      ; vm.run), so the low footprint tops ~$3808 (testbench)
-                                                      ; / ~$37f0 (visual). PCODE_BASE clears that with ~0.5 KB
-                                                      ; margin, so a compiled .PRG carries ~2 KB of filler
-                                                      ; instead of the old ~9.5 KB.
+                                                      ; Tier-1 layout: the five numeric/int/string slabs and
+                                                      ; the BASIC string var table/heap park ABOVE the P-code
+                                                      ; (see vm.run), so only code + hot BSS stays low --
+                                                      ; topping ~$3b5a (testbench) / ~$3b42 (visual) after the
+                                                      ; inc-2c integer arrays. PCODE_BASE clears that with
+                                                      ; ~0.7 KB margin. INVARIANT: keep PCODE_BASE above the
+                                                      ; runtime's BSS top -- if BSS grows past it, loaded
+                                                      ; P-code is silently corrupted at run time (standalone
+                                                      ; only; in-process runs P-code from banked RAM). The
+                                                      ; build.sh runtime map's last BSS gap end is that top.
 }
