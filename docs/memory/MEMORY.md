@@ -13,3 +13,4 @@
 - [GPC runtime asm conversion](gpc-runtime-asm-conversion.md) — branch runtime-asm: Prog8->hand-asm VM, phases/sizes; P7b string handlers + Tier-1 slab-relocation (C.DIR 80->52 blocks); ~8-9KB floor
 - [GPC IF semantics](gpc-if-semantics.md) — false IF skips the whole LINE (CBM V2); verified against ref/x16-rom ROM source
 - [Memory is git-tracked](memory-is-git-tracked.md) — this memory folder is a junction into the repo (docs/memory); notes auto-version with the project
+- [GPC runtime size floor](gpc-runtime-size-floor.md) — 64tass omits unreferenced .proc; prog8 cx16 floats already ROM wrappers; the floats "lever" was a false premise
