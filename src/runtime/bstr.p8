@@ -37,7 +37,9 @@ bstr {
     uword svartab                        ; base of the NVARS*7 scalar string-var table
     uword htmp                           ; scratch: KERNAL MEMTOP read during init()
     uword htmp2                          ; scratch: computed heap ceiling during init()
-    uword[NSARR] sarr_hdr                ; BASIC array-header address per string-array slot (0 = none)
+    uword[NSARR] @shared sarr_hdr        ; BASIC array-header address per string-array slot (0 = none)
+                                         ; @shared: sarr_desc reads it only from asm, and its lone prog8
+                                         ; reader (sarr_dimmed) is dead-stripped in TESTBENCH=false builds
     ubyte gsbank                         ; scratch: saved ROM bank across a getspa call
     bool  err_toolong                    ; set on a >255 concat (?STRING TOO LONG)
     bool  err_complex                    ; set on a >3-deep string temp (?FORMULA TOO COMPLEX)
