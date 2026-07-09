@@ -10,7 +10,7 @@
 ; SYSes into start(), which simply interprets the P-code sitting at PCODE_BASE.
 ; No compiler is present -- this is what makes a compiled program self-contained.
 ;
-; Built once into gpc.runtime.prg; the compiler loads that file and prepends it to
+; Built once into gpc.runtime.bin; the compiler loads that file and prepends it to
 ; the P-code to produce out.prg. Keep this small: it must fit (code + variables)
 ; below PCODE_BASE.
 

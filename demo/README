@@ -6,7 +6,7 @@ you get the resident BASIC->P-code compiler plus sample programs to compile and 
 with no PC toolchain involved.
 
   gpc.prg          the compiler (prompts you for file names)
-  gpc.runtime.prg  the little VM the compiler bundles into a standalone build
+  gpc.runtime.bin  the little VM the compiler bundles into a standalone build
   HELLO        \
   SQUARES       \  sample programs, as classic tokenized BASIC -- type one of these
   LOGIC          } names at the compiler's "compile file:" prompt. The readable
@@ -55,5 +55,5 @@ compiler, runtime, or a sample, re-stage with:
 
   scripts/stage-demo.sh
 
-That rebuilds gpc.prg + gpc.runtime.prg, re-tokenizes src/*.bas, and refreshes c.HELLO.
+That rebuilds gpc.prg + gpc.runtime.bin, re-tokenizes src/*.bas, and refreshes c.HELLO.
 DIR.PRG is a hand-authored utility and is preserved as-is (not regenerated).

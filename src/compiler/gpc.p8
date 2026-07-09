@@ -288,7 +288,7 @@ main {
         if had_error {
             txt.print("compile failed\n")
         } else {
-            wrote_output = write_output()         ; emit standalone out.prg (if gpc.runtime.prg present)
+            wrote_output = write_output()         ; emit standalone out.prg (if gpc.runtime.bin present)
             if INTERACTIVE and not TESTBENCH {
                 report_output()                   ; a real compile run: name the file, don't auto-run
             } else {
@@ -399,7 +399,7 @@ main {
             txt.print(&out_name)
             txt.nl()
         } else {
-            txt.print("no gpc.runtime.prg?\n")
+            txt.print("no gpc.runtime.bin?\n")
         }
     }
 
@@ -544,19 +544,19 @@ main {
     }
 
     ; ---- standalone output: write out.prg = [runtime][ @PCODE_BASE: litaddr:2, pcode, litpool ] ----
-    ; The bundled runtime (gpc.runtime.prg) is loaded from disk and prepended to the compiled
+    ; The bundled runtime (gpc.runtime.bin) is loaded from disk and prepended to the compiled
     ; P-code, producing a self-contained program that runs with no compiler present -- the
     ; whole point of a compiler. A 6-byte header at PCODE_BASE tells the runtime where the literal
     ; and data pools ended up (both float right after the P-code, keeping the file compact). The
     ; P-code itself lives in banked RAM now, so it's streamed out bank by bank (write_pcode).
-    ; Returns false (and simply skips) if gpc.runtime.prg is absent, so plain compile-and-run
+    ; Returns false (and simply skips) if gpc.runtime.bin is absent, so plain compile-and-run
     ; keeps working when there's nothing to bundle.
     sub write_output() -> bool {
         ; The compile is done, so reuse the source banks (SRC_BANK0..) as scratch to hold the runtime
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        if not diskio.f_open("gpc.runtime.prg")  ; fixed internal dependency, not a user file
+        if not diskio.f_open("gpc.runtime.bin")  ; fixed internal dependency, not a user file
             return false
         uword rt_len = 0
         ubyte rbank = SRC_BANK0

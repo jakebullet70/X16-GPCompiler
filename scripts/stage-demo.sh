@@ -3,7 +3,7 @@
 #
 # Populates demo/ deterministically from the canonical BASIC sources in demo/src/*.bas:
 #   demo/gpc.prg       - the resident compiler, built INTERACTIVE (prompts for file names)
-#   demo/gpc.runtime.prg   - the VM runtime the compiler bundles (opened as gpc.runtime.prg) into a standalone build
+#   demo/gpc.runtime.bin   - the VM runtime the compiler bundles (opened as gpc.runtime.bin) into a standalone build
 #   demo/<NAME>        - each src/<NAME>.bas tokenized to classic BASIC (what you type at
 #                        the "compile file:" prompt), e.g. HELLO, SQUARES, INTMATH, ...
 #   demo/c.HELLO       - a ready-to-run standalone: HELLO already compiled (LOAD + RUN it
@@ -28,18 +28,18 @@ echo "== clean stale demo payload (keep src/ and README) =="
 # NB: DIR.PRG (the plain-BASIC source) is a hand-authored utility, NOT regenerated from src/ --
 # it is deliberately preserved. Its COMPILED form C.DIR.PRG *is* rebuilt below.
 # Globs are case-sensitive here, so remove both cases of the compiled outputs explicitly.
-rm -f "$DEMO"/gpc.prg "$DEMO"/gpc.runtime.prg "$DEMO"/runtime.prg "$DEMO"/c.* "$DEMO"/C.* "$DEMO"/blitzc*.prg "$DEMO"/source.prg
+rm -f "$DEMO"/gpc.prg "$DEMO"/gpc.runtime.bin "$DEMO"/gpc.runtime.prg "$DEMO"/runtime.prg "$DEMO"/c.* "$DEMO"/C.* "$DEMO"/blitzc*.prg "$DEMO"/source.prg
 for f in "$SRCDIR"/*.bas; do rm -f "$DEMO/$(basename "$f" .bas)"; done
 
 # Compile a tokenized-BASIC .prg (already at demo/) to a self-contained standalone via the headless
 # (testbench) compiler, bundling the VISUAL runtime so the emitted program returns to READY.
-# Fixed on-disk names source.prg/gpc.runtime.prg -> out.prg; mirrors scripts/check-standalone.sh.
+# Fixed on-disk names source.prg/gpc.runtime.bin -> out.prg; mirrors scripts/check-standalone.sh.
 #   compile_standalone <input-prg-basename> <output-basename>
 compile_standalone() {
     local in="$1" out="$2"
     local fs; fs="$(mktemp -d)"
     cp "$DEMO/$in" "$fs/source.prg"
-    cp "$ROOT/build/vm_runtime.prg" "$fs/gpc.runtime.prg"
+    cp "$ROOT/build/vm_runtime.prg" "$fs/gpc.runtime.bin"
     rm -f "$fs/out.prg"
     local centry; centry="$(bash "$DIR/entry-addr.sh" "$ROOT/build/gpc.prg")"
     printf 'RUN %s\n' "$centry" | timeout 40 "$X16EMU" -testbench -warp -fsroot "$fs" -prg "$ROOT/build/gpc.prg" >/dev/null 2>&1 || true
@@ -54,7 +54,7 @@ compile_standalone() {
 
 echo "== build runtime (visual: a standalone build returns to READY, not mailbox+STP) =="
 bash "$DIR/build.sh" runtime visual >/dev/null
-cp "$ROOT/build/vm_runtime.prg" "$DEMO/gpc.runtime.prg"
+cp "$ROOT/build/vm_runtime.prg" "$DEMO/gpc.runtime.bin"
 
 echo "== tokenize demo/src/*.bas -> demo/<NAME> (classic BASIC the compiler reads) =="
 for f in "$SRCDIR"/*.bas; do
