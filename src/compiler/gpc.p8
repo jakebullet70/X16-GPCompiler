@@ -134,6 +134,11 @@ main {
     ; ~$2907 (build.sh runtime str asserts it), so $2A20 clears it with ~280 bytes of margin. A
     ; strings-only program lands here instead of the full tier at $3C80 -- saving $3C80-$2A20 = ~4.7 KB.
     const uword STR_PCODE_BASE = $2A20
+    ; The intermediate "arr" tier: core PLUS numeric arrays (DIM A()), for programs that use float
+    ; arrays but nothing else optional. Footprint tops out at ~$2126 (build.sh runtime arr asserts it),
+    ; so $2240 clears it with ~280 bytes of margin. An arrays-only program saves $3C80-$2240 = ~6.7 KB
+    ; vs the full tier (arrays need less runtime than strings, so this tier's base is even lower).
+    const uword ARR_PCODE_BASE = $2240
 
     ; --- standalone output ---
     bool  wrote_output             ; did this run emit a standalone out.prg?
@@ -621,6 +626,9 @@ main {
         } else if features_used == FEAT_STR {
             pbase = STR_PCODE_BASE
             opened = diskio.f_open("gpc.rt.str.bin")
+        } else if features_used == FEAT_ARR {
+            pbase = ARR_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.arr.bin")
         } else {
             opened = diskio.f_open("gpc.runtime.bin")
         }

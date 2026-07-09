@@ -23,6 +23,7 @@ printf '%b\n' "$SRCLINE" | python "$DIR/tokenize.py" > "$FS/source.prg"
 cp build/vm_runtime.prg "$FS/gpc.runtime.bin"
 [ -f build/vm_runtime_core.prg ] && cp build/vm_runtime_core.prg "$FS/gpc.rt.core.bin"   # core tier
 [ -f build/vm_runtime_str.prg ]  && cp build/vm_runtime_str.prg  "$FS/gpc.rt.str.bin"    # str tier
+[ -f build/vm_runtime_arr.prg ]  && cp build/vm_runtime_arr.prg  "$FS/gpc.rt.arr.bin"    # arr tier
 rm -f "$FS/out.prg"
 echo "  input='$INPUT'  \"$SRCLINE\""
 
