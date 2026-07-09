@@ -10,6 +10,7 @@ fail=0
 echo "== build compiler + VM + runtime once =="
 bash "$DIR/build.sh" selftest >/dev/null
 bash "$DIR/build.sh" runtime  >/dev/null
+bash "$DIR/build.sh" runtime core >/dev/null   # feature-stripped core tier (feature-free programs)
 bash "$DIR/build.sh" gpc   >/dev/null
 bash "$DIR/build.sh" gpc prompt >/dev/null   # INTERACTIVE variant for the filename-prompt test
 echo "  ok"
@@ -593,6 +594,22 @@ bash "$DIR/check-prompt.sh" correction "10 PRINT 42" 0400=2a || fail=1
 # a non-existent input is caught BEFORE the output prompt -> FILE NOT FOUND, and a stale c.<name>
 # is NOT deleted (default_out_name would otherwise wipe it for a typo'd input)
 bash "$DIR/check-notfound.sh" || fail=1
+
+echo
+echo "== Runtime tiers: compiler tracks features_used (\$0407) + auto-picks the core vs full runtime =="
+# features_used bitmask: STR=1 ARR=2 INT=4 X16=8 IO=16 DATA=32 ; 0 = core-only (float/control/PRINT)
+bash "$DIR/check-basic.sh" "10 PRINT 2+3*4:X=5:IF X>2 THEN PRINT X:FOR I=1 TO 3:NEXT" 0407=0 || fail=1  # pure core
+bash "$DIR/check-basic.sh" '10 A$="HI":PRINT A$'               0407=1  || fail=1   # STR
+bash "$DIR/check-basic.sh" "10 DIM A(3):A(1)=7:PRINT A(1)"     0407=2  || fail=1   # ARR
+bash "$DIR/check-basic.sh" "10 A%=5:PRINT A%"                  0407=4  || fail=1   # INT
+bash "$DIR/check-basic.sh" "10 VPOKE 0,0,1"                    0407=8  || fail=1   # X16 pass-through
+bash "$DIR/check-basic.sh" "10 POKE 1024,5:PRINT PEEK(1024)"   0407=10 || fail=1   # IO
+bash "$DIR/check-basic.sh" "10 DATA 7:READ A:PRINT A"          0407=20 || fail=1   # DATA
+bash "$DIR/check-basic.sh" '10 A%=5:B$="X":PRINT A%'           0407=5  || fail=1   # INT|STR
+# a feature-free program bundles the CORE runtime (loads at \$2000) and still runs standalone;
+# check-standalone stages both gpc.runtime.bin and gpc.rt.core.bin so the compiler can pick.
+bash "$DIR/check-standalone.sh" mail "10 S=0:FOR I=1 TO 10:S=S+I:NEXT:PRINT S" 0400=37 || fail=1
+bash "$DIR/check-standalone.sh" mail "10 X=5:IF X>3 THEN PRINT INT(41.6)+1"    0400=2a || fail=1
 
 echo
 echo "== Standalone .prg: compiled programs run with NO compiler present =="

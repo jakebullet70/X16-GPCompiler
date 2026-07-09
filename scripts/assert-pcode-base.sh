@@ -14,7 +14,8 @@
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIST="$1"
-FMT="$ROOT/src/shared/pcode_format.p8"
+# optional 2nd arg: pcode_format to read PCODE_BASE from (core tier builds a lowered base in build/gen)
+FMT="${2:-$ROOT/src/shared/pcode_format.p8}"
 
 if [ ! -f "$LIST" ]; then
     echo "assert-pcode-base: map not found: $LIST" >&2

@@ -108,6 +108,25 @@ main {
     ubyte err_code                 ; first error's category (0 = none); see E_* below
     uword err_line                 ; BASIC line number where the first error occurred
 
+    ; --- runtime-tier feature tracking (which optional runtime families this program uses) ---
+    ; Set as opcodes are emitted (at the intern_*/parse_* choke points). write_output picks the
+    ; smallest bundled runtime variant that covers these bits. Core (float arith, control flow,
+    ; PRINT, CALLFN, int-literal coercion) is always present and needs no bit.
+    const ubyte FEAT_STR  = %00000001   ; strings / string arrays / string funcs (bstr)
+    const ubyte FEAT_ARR  = %00000010   ; numeric arrays (DIM A())
+    const ubyte FEAT_INT  = %00000100   ; % integer vars / arrays / arithmetic
+    const ubyte FEAT_X16  = %00001000   ; X16 keyword pass-through (sound/video/...)
+    const ubyte FEAT_IO   = %00010000   ; file/channel I/O + SYS/POKE/PEEK/WAIT + INPUT
+    const ubyte FEAT_DATA = %00100000   ; READ / DATA / RESTORE
+    ubyte features_used            ; OR of the FEAT_* bits emitted (0 => core-only program)
+
+    ; runtime tiers: a features_used==0 program bundles the small "core" runtime (float arith,
+    ; control flow, PRINT, CALLFN, int-literal coercion) which has a much LOWER load base, so its
+    ; P-code -- and therefore the whole compiled .PRG -- starts far lower. Anything else bundles the
+    ; full runtime at pcode.PCODE_BASE. CORE_PCODE_BASE must clear the core runtime's own footprint
+    ; (build.sh runtime core asserts it), just as PCODE_BASE clears the full runtime's.
+    const uword CORE_PCODE_BASE = $2000
+
     ; --- standalone output ---
     bool  wrote_output             ; did this run emit a standalone out.prg?
 
@@ -330,6 +349,7 @@ main {
             @(MAILBOX + 4) = lsb(err_line)            ; M6: original BASIC line of first error
             @(MAILBOX + 5) = msb(err_line)
             @(MAILBOX + 6) = wrote_output as ubyte    ; standalone: 1 if out.prg was written
+            @(MAILBOX + 7) = features_used            ; runtime-tier feature bitmask (FEAT_*)
             %asm {{
                 stp
             }}
@@ -441,6 +461,7 @@ main {
         err_code = 0
         err_line = 0
         cur_line = 0
+        features_used = 0                       ; runtime-tier tracker: assume core-only until proven otherwise
 
         ; load the tokenized program from disk (HostFS device 8) into banked RAM
         if not load_source() {
@@ -580,7 +601,17 @@ main {
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        if not diskio.f_open("gpc.runtime.bin")  ; fixed internal dependency, not a user file
+        ; pick the runtime tier: a core-only program (no optional features) gets the small
+        ; core runtime at the low CORE_PCODE_BASE; everything else gets the full runtime.
+        uword pbase = pcode.PCODE_BASE
+        bool opened
+        if features_used == 0 {
+            pbase = CORE_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.core.bin")
+        } else {
+            opened = diskio.f_open("gpc.runtime.bin")
+        }
+        if not opened                           ; fixed internal dependency, not a user file
             return false
         uword rt_len = 0
         ubyte rbank = SRC_BANK0
@@ -596,7 +627,7 @@ main {
         if rt_len < 3
             return false                        ; not a real .prg
         uword rt_body_len = rt_len - 2          ; drop the 2-byte load address
-        if $0801 + rt_body_len > pcode.PCODE_BASE
+        if $0801 + rt_body_len > pbase
             return false                        ; runtime would overlap the P-code region
         debrand_stub()                          ; make the bundled BASIC stub LIST like X16 BASIC, not Prog8
 
@@ -619,10 +650,10 @@ main {
             wbank++
             woff = 0
         }
-        write_filler(pcode.PCODE_BASE - ($0801 + rt_body_len))   ; pad up to PCODE_BASE
+        write_filler(pbase - ($0801 + rt_body_len))              ; pad up to the tier's base
         ; 6-byte header at PCODE_BASE: litpool addr, data-pool addr, data-pool length. Both pools
         ; float right after the P-code (litpool then data pool), so the file stays compact.
-        uword litaddr  = pcode.PCODE_BASE + pcode.HEADER_SIZE + code_len
+        uword litaddr  = pbase + pcode.HEADER_SIZE + code_len
         uword dataaddr = litaddr + lit_len
         ubyte[6] hdr
         hdr[0] = lsb(litaddr)
@@ -763,6 +794,7 @@ main {
     ; unsupported -- but no regression): quoted strings, hex/binary literals ($FF / %1010), string vars
     ; (A$), integer vars (A%), and array/function arguments (A(I)) -- a name followed by $ % or '('.
     sub parse_passthru() {
+        features_used |= FEAT_X16
         uword s = tok_start                     ; first byte of the statement (in low-RAM linebuf)
         uword e = s
         bool inq = false
@@ -850,6 +882,7 @@ main {
 
     ; POKE addr, val  -- write a byte to memory (stack: addr then val, OP_POKE pops val first)
     sub parse_poke() {
+        features_used |= FEAT_IO
         next_token()
         parse_expr()                            ; address
         if tok != T_COMMA {
@@ -863,6 +896,7 @@ main {
 
     ; SYS addr  -- call a machine-language routine
     sub parse_sys() {
+        features_used |= FEAT_IO
         next_token()
         parse_expr()                            ; address
         emit_byte(pcode.OP_SYS)
@@ -872,6 +906,7 @@ main {
 
     ; OPEN lfn, dev [, sa [, "name"]]  -- a missing secondary address defaults to 0, a missing name to "".
     sub parse_open() {
+        features_used |= FEAT_IO
         next_token()
         parse_expr()                            ; logical file number
         if tok != T_COMMA {
@@ -898,6 +933,7 @@ main {
 
     ; CLOSE lfn
     sub parse_close() {
+        features_used |= FEAT_IO
         next_token()
         parse_expr()                            ; logical file number
         emit_byte(pcode.OP_CLOSE)
@@ -905,6 +941,7 @@ main {
 
     ; GET#lfn, v$  -- read one byte from a channel into a string variable ("" at end of file / null byte)
     sub parse_get() {
+        features_used |= FEAT_IO
         next_token()
         if tok != T_HASH {                      ; only GET# (from a channel) is supported, not plain GET
             error(E_SYNTAX)
@@ -930,6 +967,7 @@ main {
 
     ; PRINT#lfn [, item ; item ...]  -- redirect PRINT output to a channel, then restore default I/O
     sub parse_printch() {
+        features_used |= FEAT_IO
         next_token()
         parse_expr()                            ; logical file number
         emit_byte(pcode.OP_CHKOUT)              ; redirect output to the channel (pops lfn)
@@ -998,6 +1036,7 @@ main {
 
     ; INPUT ["prompt";] var   -- read a line from the keyboard into a numeric or string variable
     sub parse_input() {
+        features_used |= FEAT_IO
         next_token()
         if tok == T_STRLIT {                    ; optional prompt string, printed before reading
             emit_byte(pcode.OP_PUSHS)
@@ -1027,6 +1066,7 @@ main {
     ; parses on demand -- exactly the classic BASIC model. We scan the raw line here (bypassing the
     ; lexer's number parsing) so a numeric item keeps its original text for VAL-style parsing.
     sub parse_data() {
+        features_used |= FEAT_DATA
         repeat {
             while @(sptr) == ' '                        ; skip leading spaces
                 sptr++
@@ -1089,6 +1129,7 @@ main {
     ; reads the next DATA item onto the stack, then an array-store writes it -- exactly the pieces
     ; the compiler already emits for A(i)=... , just with the value coming from DATA.
     sub parse_read() {
+        features_used |= FEAT_DATA
         next_token()
         repeat {
             if tok == T_STRVAR {
@@ -1163,6 +1204,7 @@ main {
 
     ; RESTORE  -- rewind the DATA cursor to the first item (no-argument, CBM V2 form)
     sub parse_restore() {
+        features_used |= FEAT_DATA
         emit_byte(pcode.OP_RESTORE)
         next_token()
     }
@@ -1356,6 +1398,7 @@ main {
             emit_byte(pcode.OP_PUSHI)               ; default xor = 0
             emit_imm16(0)
         }
+        features_used |= FEAT_IO
         emit_byte(pcode.OP_WAIT)
     }
 
@@ -1815,6 +1858,7 @@ main {
     }
 
     sub emit_string_factor() {
+        features_used |= FEAT_STR
         when tok {
             T_STRLIT -> {
                 emit_byte(pcode.OP_PUSHS)
@@ -1936,6 +1980,7 @@ main {
                         return
                     }
                 }
+                features_used |= FEAT_X16
                 emit_byte(pcode.OP_CALLXS)
                 emit_byte(xssub)
                 emit_byte(xsn)
@@ -2015,6 +2060,7 @@ main {
 
     ; string variable slot (separate namespace from numeric vars)
     sub intern_svar() -> ubyte {
+        features_used |= FEAT_STR
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nsvars {
@@ -2059,6 +2105,7 @@ main {
 
     ; slot for the integer (`%`) variable in `tokname` (name incl. '%'; its own namespace + VM storage)
     sub intern_ivar() -> ubyte {
+        features_used |= FEAT_INT
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < niv {
@@ -2106,6 +2153,7 @@ main {
 
     ; array slot for the identifier in `tokname` (separate namespace from scalars/strings)
     sub intern_arr() -> ubyte {
+        features_used |= FEAT_ARR
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < narr {
@@ -2128,6 +2176,7 @@ main {
 
     ; integer-array slot for the identifier in `tokname` (name includes the '%'; own namespace)
     sub intern_iarr() -> ubyte {
+        features_used |= FEAT_INT
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < niarr {
@@ -2150,6 +2199,7 @@ main {
 
     ; string-array slot for the identifier in `tokname` (name includes the '$'; own namespace)
     sub intern_sarr() -> ubyte {
+        features_used |= FEAT_STR
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nsarr {
@@ -2308,6 +2358,7 @@ main {
                     }
                 }
                 T_ST -> {                            ; ST: the KERNAL I/O status word (a read-only number)
+                    features_used |= FEAT_IO
                     emit_byte(pcode.OP_STATUS)
                     type_push(TY_FLOAT)
                     expect_value = false
@@ -2547,6 +2598,7 @@ main {
                             return
                         }
                     }
+                    features_used |= FEAT_X16
                     emit_byte(pcode.OP_CALLX)
                     emit_byte(xsub)
                     emit_byte(xn)
@@ -2711,6 +2763,7 @@ main {
             T_PEEK -> {                            ; unary float ops: coerce an int operand first
                 t1 = type_pop()
                 if is_intish(t1)  emit_byte(pcode.OP_ITOF)
+                features_used |= FEAT_IO
                 emit_byte(pcode.OP_PEEK)
                 type_push(TY_FLOAT)
             }

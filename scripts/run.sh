@@ -26,6 +26,7 @@ if [ "$TARGET" = "interactive" ]; then
     bash "$DIR/build.sh" gpc  interactive
     printf '%b\n' "$BASIC" | python "$DIR/tokenize.py" > "$FS/source.prg"
     cp build/vm_runtime.prg "$FS/gpc.runtime.bin"
+    [ -f build/vm_runtime_core.prg ] && cp build/vm_runtime_core.prg "$FS/gpc.rt.core.bin"
     rm -f "$FS/out.prg"
     echo "launching the interactive compiler; at its prompts type:  source.prg  then  out.prg"
     "$X16EMU" -run -prg build/gpc.prg -fsroot "$FS"
@@ -38,6 +39,7 @@ if [ "$TARGET" = "standalone" ]; then
     bash "$DIR/build.sh" gpc  visual
     printf '%b\n' "$BASIC" | python "$DIR/tokenize.py" > "$FS/source.prg"
     cp build/vm_runtime.prg "$FS/gpc.runtime.bin"        # the compiler bundles this into out.prg
+    [ -f build/vm_runtime_core.prg ] && cp build/vm_runtime_core.prg "$FS/gpc.rt.core.bin"
     rm -f "$FS/out.prg"
     echo "compiling to a standalone out.prg:"; printf '%b\n' "$BASIC"
     "$X16EMU" -run -prg build/gpc.prg -fsroot "$FS"
