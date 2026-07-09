@@ -170,9 +170,16 @@ main {
     const ubyte MAXLINES = 128
     ubyte nlines
 
-    ; --- nested "IF a THEN IF b THEN ..." guard patches (one JZ slot per leading IF) ---
-    const ubyte MAXIFNEST = 8
-    uword[MAXIFNEST] ifpatch       ; pcode offsets of each guard's JZ/IJZ operand, backpatched together
+    ; --- IF guard patches for the current source line ---
+    ; CBM/X16 BASIC V2: a FALSE `IF` skips to the end of the LINE (the ROM runs the same
+    ; `remn` REM-skip; see ref/x16-rom/basic/code5.s `if`), not just past the THEN body.
+    ; So EVERY guard JZ/IJZ on a line -- whether from a leading "IF a THEN IF b" chain
+    ; (nested) or from colon-separated "IF a THEN .. : IF b THEN .." -- is backpatched to
+    ; the SAME end-of-line target by the line loop, not locally in parse_if. parse_if only
+    ; appends each guard's operand slot here; the loop resolves them all when the line ends.
+    const ubyte MAXIFLINE = 16
+    uword[MAXIFLINE] if_line_patch  ; pcode offsets of each guard's JZ/IJZ operand
+    ubyte n_if_line                 ; guards collected on the current line
 
     ; --- forward-reference fixups, backpatched in pass 2 (Blitz style two-pass core) ---
     const ubyte MAXFIX = 128
@@ -448,6 +455,7 @@ main {
             record_line(cur_line, code_len)      ; cur_line was set by next_src_line
             sptr = &linebuf                      ; the lexer runs over the low-RAM copy
             next_token()
+            n_if_line = 0                         ; no IF guards collected on this line yet
             repeat {
                 if had_error {
                     break
@@ -459,6 +467,15 @@ main {
                     next_token()                 ; ':' -> next statement on the same line
                 } else {
                     parse_statement()
+                }
+            }
+            ; end of line: a false IF condition skips the WHOLE rest of the line (CBM V2),
+            ; so backpatch every guard collected on this line to here (start of next line).
+            if not had_error and n_if_line != 0 {
+                ubyte gi
+                for gi in 0 to n_if_line - 1 {
+                    pc_poke(if_line_patch[gi],     lsb(code_len))
+                    pc_poke(if_line_patch[gi] + 1, msb(code_len))
                 }
             }
         }
@@ -1467,15 +1484,14 @@ main {
         next_token()
     }
 
-    ; IF expr THEN body  --  emit JZ <past body>; body; backpatch the JZ locally.
-    ; Nested "IF a THEN IF b THEN body" is a conjunction of guards: each leading IF emits
-    ; its own JZ that skips to the SAME point (just past the one shared body), so ANY false
-    ; condition skips the body -- matching the "false -> don't run the body" semantics without
-    ; recursion (Prog8 has none). The guard loop consumes each "IF <cond> THEN", collecting a
-    ; patch slot per guard, until the token after THEN is not another IF.
+    ; IF expr THEN body  --  emit a guard JZ per leading IF, then the THEN body. The guards
+    ; are NOT backpatched here: a false condition must skip the whole rest of the LINE (CBM V2),
+    ; so each guard's operand slot is appended to if_line_patch[] and the line loop backpatches
+    ; them all to end-of-line. This makes both "IF a THEN IF b THEN body" (nested, handled by the
+    ; loop below without recursion -- Prog8 has none) and "IF a THEN .. : IF b THEN .." (colon-
+    ; separated, each a fresh parse_if that just appends more guards) fold into the same target.
     sub parse_if() {
         next_token()                            ; consume the (outer) IF
-        ubyte np = 0                            ; number of guards collected
         repeat {
             uword before = code_len
             expr_keep_int = true                ; keep an integer condition raw so we can branch with IJZ
@@ -1498,12 +1514,12 @@ main {
                 emit_byte(pcode.OP_IJZ)
             else
                 emit_byte(pcode.OP_JZ)
-            if np == MAXIFNEST {                 ; too many nested IFs on one line
+            if n_if_line == MAXIFLINE {          ; too many IF guards on one line
                 error(E_SYNTAX)
                 return
             }
-            ifpatch[np] = code_len              ; operand slot to backpatch
-            np++
+            if_line_patch[n_if_line] = code_len ; operand slot; the line loop backpatches to end-of-line
+            n_if_line++
             emit_imm16(0)
             ; another IF right after THEN? -> nested guard; consume it and loop for its condition.
             if tok != T_IF
@@ -1511,15 +1527,6 @@ main {
             next_token()                        ; consume the nested IF
         }
         parse_then_body()
-        ; if any condition was false, its JZ skips to here (just past the shared THEN body).
-        ; Skip the backpatch if the buffer overflowed mid-body (patches may be invalid).
-        if not had_error {
-            ubyte i
-            for i in 0 to np - 1 {
-                pc_poke(ifpatch[i],     lsb(code_len))
-                pc_poke(ifpatch[i] + 1, msb(code_len))
-            }
-        }
     }
 
     ; ---- line map + forward-reference fixups ----

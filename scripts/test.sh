@@ -81,6 +81,22 @@ bash "$DIR/check-basic.sh" "10 I%=0\n20 I%=I%+1\n30 IF I%<9 THEN IF I%<3 THEN GO
 bash "$DIR/check-standalone.sh" mail "10 A=5:IF A>0 THEN IF A<10 THEN PRINT A" 0400=5 || fail=1
 
 echo
+echo "== M4c: false IF skips the REST OF THE LINE (CBM V2: ref/x16-rom code5.s 'if' -> remn) =="
+# a false IF must skip all colon-separated statements after THEN, not just the first
+bash "$DIR/check-basic.sh" "10 A=5:IF 0 THEN A=1:A=2\n20 PRINT A" 0400=5 || fail=1   # both A=1,A=2 skipped -> 5
+bash "$DIR/check-basic.sh" "10 A=5:IF 1 THEN A=1:A=2\n20 PRINT A" 0400=2 || fail=1   # true -> both run -> 2
+# a statement BEFORE the IF on the same line always runs
+bash "$DIR/check-basic.sh" "10 A=7:IF 0 THEN A=1\n20 PRINT A"     0400=7 || fail=1
+# false IF skips a trailing GOTO too (whole rest of line)
+bash "$DIR/check-basic.sh" "10 A=1:B=1:IF 0 THEN A=2:B=2:GOTO 30\n20 PRINT A+B\n30 END" 0400=2 || fail=1
+# colon-separated IFs on one line = independent guards, all skipping to end-of-line
+bash "$DIR/check-basic.sh" "10 S=0:IF 0 THEN S=1:IF 1 THEN S=2\n20 PRINT S" 0400=0 || fail=1  # outer false -> nothing
+bash "$DIR/check-basic.sh" "10 S=0:IF 1 THEN S=1:IF 0 THEN S=3\n20 PRINT S" 0400=1 || fail=1  # inner false -> S=3 skipped
+bash "$DIR/check-basic.sh" "10 S=0:IF 1 THEN S=1:IF 1 THEN S=3\n20 PRINT S" 0400=3 || fail=1  # all true
+# standalone: false IF skips rest of line
+bash "$DIR/check-standalone.sh" mail "10 A=5:IF 0 THEN A=1:A=2\n20 PRINT A" 0400=5 || fail=1
+
+echo
 echo "== M4: GOTO + forward-reference pass-2 fixup =="
 # forward GOTO 30 (line 30 not yet seen at emit time) skips line 20:
 bash "$DIR/check-basic.sh" "10 GOTO 30\n20 PRINT 99\n30 PRINT 7"  0400=7 || fail=1
