@@ -1,7 +1,7 @@
 # Memory Index
 
 - [GPC project](gpc-project.md) — what the Greased Piglet Compiler is + locked design decisions
-- [GPC increment 2 design](gpc-inc2-design.md) — 2a int-compare/IJZ + 2b int-FOR SHIPPED; 2c int-arrays reverted; banked-RAM tables kept
+- [GPC increment 2 design](gpc-inc2-design.md) — 2a int-compare/IJZ + 2b int-FOR + 2c int-arrays (DIM A%()) all SHIPPED; banked-RAM tables kept
 - [GPC array-load-loop bug](gpc-array-load-loop-bug.md) — RESOLVED: was DIM not zero-initing elements; garbage float hung ROM FOUT on PRINT. Fixed in op_dim.
 - [GPC print-large-number bug](gpc-print-large-number-bug.md) — RESOLVED: PRINT of any n>=32768 crashed ?ILLEGAL QUANTITY; op_printi's range-checked float->word mailbox cast. Guarded.
 - [GPC gating requirement](gpc-gating-requirement.md) — GARBAG + pass-through must work (no-go otherwise); both PROVEN on R49

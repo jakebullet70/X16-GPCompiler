@@ -61,6 +61,18 @@ strips the write-only array → asm ref dangles (`undefined p8v_sarr_hdr_lsb/msb
 `interactive`+`visual` variants, not just the corpus.** Demo staging = `bash scripts/stage-demo.sh` →
 `demo/gpc.prg` (interactive), run via `run.bat`.
 
+**ADDING A NEW VM OPCODE — checklist (learned the hard way landing int arrays 2c, e5a8f5a).** Three
+places, miss any and it fails SILENTLY: (1) **`run()`'s asm dispatch has a hard opcode-count bound**
+`cmp #N ; bcs _next` — opcodes >= N are treated as "unknown -> ignore", so a new handler runs as a NO-OP
+and its operand bytes get mis-decoded as the next opcodes (symptom: program runs but the op does nothing +
+downstream corruption; a `00` operand reads as OP_END). Bump N to new_opcode_count. (2) add `.word _tN` to
+`_optab` AND a `_tN: jsr p8s_op_x / jmp _after` trampoline. (3) **re-check `PCODE_BASE` still clears the
+runtime's BSS top** — new handler code + new BSS grows the low footprint; if BSS crosses PCODE_BASE the
+STANDALONE loaded P-code is silently corrupted (in-process is immune — it runs P-code from banked RAM, so
+the corpus's check-basic passes while check-standalone fails). The `build.sh runtime` map's last BSS gap end
+is the top; raise PCODE_BASE above it. [[gpc-inc2-design]] (2c: opcodes 89-91 IDIM/IALOAD/IASTORE; both bugs
+bit at once — cmp #89 ignored them, then BSS $3b5a > old PCODE_BASE $3A00; fixed to cmp #92 / $3E00.)
+
 **Tier 1 — compiled-program size (1ff971d, the Blitz layout fix; separate axis from runtime CODE size).**
 A compiled `.PRG` = `[$0801 runtime code][filler up to PCODE_BASE][pcode+pools @ PCODE_BASE]` — the compiler
 (`gpc.p8` write_output) pads the FILE contiguously to the FIXED `PCODE_BASE`, so the file spans the runtime's

@@ -1,11 +1,20 @@
 ---
 name: gpc-inc2-design
-description: Integer-first increment 2 outcome — 2a (int compare/IJZ) + 2b (int FOR) SHIPPED; 2c (int arrays) reverted; a critical pre-existing array bug found
+description: Integer-first increment 2 — 2a (int compare/IJZ) + 2b (int FOR) SHIPPED; 2c (int arrays DIM A%()) now ALSO SHIPPED (e5a8f5a, branch int-arrays) after Tier-1 RAM freed it
 metadata: 
   node_type: memory
   type: project
   originSessionId: 481504f0-31d5-4658-a8c1-3b05e8802238
 ---
+
+**2c SHIPPED (2026-07-09, branch `int-arrays`, commit e5a8f5a):** integer arrays `DIM A%()` re-landed.
+Opcodes IDIM/IALOAD/IASTORE = 89/90/91; 2-byte elements in their own iarrheap (host-assigned slab like the
+others post-Tier-1); reuses the generic dim_setup/index_of; loads typed TY_INT (native-int fast path). The
+two blockers that killed it in inc2 are BOTH gone: the RAM (runtime asm-shrink + Tier-1 slabs-above-pcode
+freed the in-process string heap) and the array zero-init bug (fixed). Corpus 286/286. Two fresh gotchas hit
++ recorded in [[gpc-runtime-asm-conversion]] (the dispatch `cmp #N` opcode bound + the PCODE_BASE-above-BSS
+invariant). NOTE: the opcode numbers here (89-91, PCODE_BASE $3E00) SUPERSEDE the "recoverable from transcript"
+89-91/$5800 mention below.
 
 Increment 2 of [[gpc-project]] integer-first arithmetic. Outcome (2026-07-08):
 
