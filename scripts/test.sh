@@ -10,6 +10,7 @@ fail=0
 echo "== build compiler + VM + runtime once =="
 bash "$DIR/build.sh" selftest >/dev/null
 bash "$DIR/build.sh" runtime  >/dev/null
+bash "$DIR/build.sh" runtime nosarr >/dev/null   # nosarr tier (programs with no DIM A$())
 bash "$DIR/build.sh" gpc   >/dev/null
 bash "$DIR/build.sh" gpc prompt >/dev/null   # INTERACTIVE variant for the filename-prompt test
 echo "  ok"
@@ -418,8 +419,11 @@ bash "$DIR/check-out.sh"   '10 DIM A$(2,2):A$(1,2)="X":PRINT A$(1,2)'           
 bash "$DIR/check-out.sh"   '10 DIM N$(2)\n20 FOR I=0 TO 2\n30 READ N$(I)\n40 NEXT I\n50 PRINT N$(0);N$(2)\n60 DATA A,B,C' "AC" || fail=1
 # standalone: a 2-D numeric array survives bundling, no compiler present -> A(3,3) = 9
 bash "$DIR/check-standalone.sh" mail "10 DIM A(3,3)\n20 FOR I=1 TO 3\n30 FOR J=1 TO 3\n40 A(I,J)=I*J\n50 NEXT J\n60 NEXT I\n70 PRINT A(3,3)" 0400=9 || fail=1
-# standalone: a string array filled by READ from the bundled DATA pool
+# standalone: a string array filled by READ from the bundled DATA pool -> bundles the FULL runtime ($3A80)
 bash "$DIR/check-standalone.sh" out '10 DIM N$(1)\n20 READ N$(0),N$(1)\n30 PRINT N$(0)+N$(1)\n40 DATA HI,BYE' "HIBYE" || fail=1
+# Phase 2 runtime tier: a program with SCALAR strings + string funcs but NO DIM A$() bundles the smaller
+# "nosarr" runtime (loads at $3740, not the full $3A80) -- proving the sarr-stripped VM runs standalone.
+bash "$DIR/check-standalone.sh" out '10 A$="NOSARR":PRINT LEFT$(A$,2)+MID$(A$,3,1)' "NOS" || fail=1
 
 echo
 echo "== INPUT (keyboard fed headlessly by priming the queue via kbdbuf_put) =="

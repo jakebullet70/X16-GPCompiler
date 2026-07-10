@@ -111,6 +111,15 @@ main {
     ; --- standalone output ---
     bool  wrote_output             ; did this run emit a standalone out.prg?
 
+    ; --- Phase 2 runtime-tier: string arrays (DIM A$()) are a removable runtime feature. A program that
+    ; never DIMs a string array bundles the smaller "nosarr" runtime (sarr handlers + sarr_alloc/sarr_desc
+    ; stripped, ~0.8-1 KB), which loads its P-code at a LOWER base -- shrinking the whole compiled .PRG.
+    ; Tracked at the sole string-array choke point (intern_sarr); the auto-select is correct BY
+    ; CONSTRUCTION because every OP_SDIM/SALOAD/SASTORE/RDSTR emit site is gated behind intern_sarr().
+    ; NOSARR_PCODE_BASE must clear the nosarr runtime's own footprint (build.sh runtime nosarr asserts it).
+    bool  uses_sarr                ; did this program DIM any string array? (true => needs the full runtime)
+    const uword NOSARR_PCODE_BASE = $3740   ; nosarr footprint tops ~$360f; $3740 = +305 B margin (guard-checked)
+
     ; one-shot: when set, parse_expr stops at a top-level ')' instead of erroring, leaving it
     ; for the caller to consume (used to parse an array index we've already opened with '(')
     bool  expr_stop_rparen
@@ -434,6 +443,7 @@ main {
         err_code = 0
         err_line = 0
         cur_line = 0
+        uses_sarr = false                       ; runtime-tier tracker: no string arrays until intern_sarr proves otherwise
 
         ; load the tokenized program from disk (HostFS device 8) into banked RAM
         if not load_source() {
@@ -573,7 +583,22 @@ main {
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        if not diskio.f_open("gpc.runtime.bin")  ; fixed internal dependency, not a user file
+        ; Pick the runtime tier: a program that never DIMs a string array gets the smaller "nosarr"
+        ; runtime at the lower NOSARR_PCODE_BASE; a DIM A$() program gets the full runtime. If the nosarr
+        ; image isn't staged, fall back to full -- never fail a compile over a missing tier file.
+        uword pbase = pcode.PCODE_BASE
+        bool opened
+        if uses_sarr {
+            opened = diskio.f_open("gpc.runtime.bin")
+        } else {
+            pbase = NOSARR_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.nosarr.bin")
+            if not opened {
+                pbase = pcode.PCODE_BASE
+                opened = diskio.f_open("gpc.runtime.bin")
+            }
+        }
+        if not opened                            ; fixed internal dependency, not a user file
             return false
         uword rt_len = 0
         ubyte rbank = SRC_BANK0
@@ -589,7 +614,7 @@ main {
         if rt_len < 3
             return false                        ; not a real .prg
         uword rt_body_len = rt_len - 2          ; drop the 2-byte load address
-        if $0801 + rt_body_len > pcode.PCODE_BASE
+        if $0801 + rt_body_len > pbase
             return false                        ; runtime would overlap the P-code region
         debrand_stub()                          ; make the bundled BASIC stub LIST like X16 BASIC, not Prog8
 
@@ -612,10 +637,10 @@ main {
             wbank++
             woff = 0
         }
-        write_filler(pcode.PCODE_BASE - ($0801 + rt_body_len))   ; pad up to PCODE_BASE
+        write_filler(pbase - ($0801 + rt_body_len))              ; pad up to the tier's base
         ; 6-byte header at PCODE_BASE: litpool addr, data-pool addr, data-pool length. Both pools
         ; float right after the P-code (litpool then data pool), so the file stays compact.
-        uword litaddr  = pcode.PCODE_BASE + pcode.HEADER_SIZE + code_len
+        uword litaddr  = pbase + pcode.HEADER_SIZE + code_len
         uword dataaddr = litaddr + lit_len
         ubyte[6] hdr
         hdr[0] = lsb(litaddr)
@@ -2143,6 +2168,7 @@ main {
 
     ; string-array slot for the identifier in `tokname` (name includes the '$'; own namespace)
     sub intern_sarr() -> ubyte {
+        uses_sarr = true                    ; DIM A$()/A$(i) => this program needs the full runtime (sarr tier)
         cx16.rambank(NAMES_BANK)            ; name tables live in banked RAM; next emit/read re-asserts its bank
         ubyte i = 0
         while i < nsarr {

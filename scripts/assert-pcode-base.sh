@@ -14,7 +14,10 @@
 set -e
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIST="$1"
-FMT="$ROOT/src/shared/pcode_format.p8"
+# optional 2nd arg: the pcode_format to read PCODE_BASE from -- a stripped runtime tier builds a
+# lowered base into build/gen/pcode_format.p8, so its footprint must be checked against THAT base,
+# not the full src one, or a tier program silently overlaps its own loaded P-code.
+FMT="${2:-$ROOT/src/shared/pcode_format.p8}"
 
 if [ ! -f "$LIST" ]; then
     echo "assert-pcode-base: map not found: $LIST" >&2

@@ -15,6 +15,7 @@ MODE="$1"; SRCLINE="$2"; shift 2
 FS="$(mktemp -d)"
 printf '%b\n' "$SRCLINE" | python "$DIR/tokenize.py" > "$FS/source.prg"
 cp build/vm_runtime.prg "$FS/gpc.runtime.bin"      # the compiler opens it as "gpc.runtime.bin"
+[ -f build/vm_runtime_nosarr.prg ] && cp build/vm_runtime_nosarr.prg "$FS/gpc.rt.nosarr.bin"   # nosarr tier for no-DIM-A$() programs
 rm -f "$FS/out.prg"
 echo "  \"$SRCLINE\"  (standalone)"
 
