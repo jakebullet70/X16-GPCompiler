@@ -75,7 +75,8 @@ main {
     ;     runs in place. A program larger than that is a standalone job anyway (out.prg is written). This
     ;     is what reclaimed the old ~4 KB `codebuf` slab back to the $9F00 ceiling. ---
     const ubyte PCODE_BANK0 = SRC_BANK0 + MAXSRCBANKS     ; first RAM bank holding emitted P-code (= 7)
-    const uword CODE_CAP = 16384                          ; 2 * 8 KB banks of P-code; overflow -> OUT OF MEMORY
+    const uword CODE_CAP = 32768                          ; 4 * 8 KB banks (7..10) of P-code; overflow -> OUT OF MEMORY
+                                                          ; (pc_poke's msb>>5 bank select scales to 8 banks/64 KB)
     const uword RUN_CAP = 8000                            ; in-process run must fit ONE bank window (with a
                                                           ; margin for operand over-reads); bigger -> standalone
     uword code_len                                        ; emitted P-code length (bytes, into banked RAM)
@@ -146,7 +147,7 @@ main {
     ;     first; every P-code emit (pc_poke) and source read (next_src_line) re-asserts ITS own bank, so
     ;     the switch is self-correcting. The tables are compile-time only (a run reads P-code by slot,
     ;     never by name), so clobbering NAMES_BANK during the standalone output pass would be harmless. ---
-    const ubyte NAMES_BANK = PCODE_BANK0 + 2     ; = 9: a free bank above source (1..6) and P-code (7..8)
+    const ubyte NAMES_BANK = PCODE_BANK0 + 4     ; = 11: a free bank above source (1..6) and P-code (7..10)
     ; byte offsets of each table within the NAMES_BANK window (BRAM = $A000); NAMELEN bytes per entry:
     const uword varnames_ptr  = BRAM + 0         ; MAXVARS  128 * 8 = 1024  -> $A000..$A3FF
     const uword ivarnames_ptr = BRAM + 1024      ; MAXIVARS  64 * 8 =  512  -> $A400..$A5FF
@@ -154,11 +155,11 @@ main {
     const uword arrnames_ptr  = BRAM + 2048      ; MAXARRS   32 * 8 =  256  -> $A800..$A8FF
     const uword sarrnames_ptr = BRAM + 2304      ; MAXSARRS  32 * 8 =  256  -> $A900..$A9FF
     ; compile-time-only maps also live in the bank (same reason -- a run never reads them):
-    const uword linenums_ptr  = BRAM + 2560      ; MAXLINES 128 * 2 =  256  -> $AA00..$AAFF  (GOTO/THEN map)
-    const uword lineaddrs_ptr = BRAM + 2816      ; MAXLINES 128 * 2 =  256  -> $AB00..$ABFF
-    const uword fnnames_bptr  = BRAM + 3072      ; MAXFNS    16 * 8 =  128  -> $AC00..$AC7F  (DEF FN names)
-    const uword iarrnames_ptr = BRAM + 3200      ; MAXIARRS  32 * 8 =  256  -> $AC80..$AD7F  (DIM A%() names)
-                                                 ; (3456 bytes used of the 8 KB bank -- room to grow caps)
+    const uword linenums_ptr  = BRAM + 2560      ; MAXLINES 512 * 2 = 1024  -> $AA00..$ADFF  (GOTO/THEN map)
+    const uword lineaddrs_ptr = BRAM + 3584      ; MAXLINES 512 * 2 = 1024  -> $AE00..$B1FF
+    const uword fnnames_bptr  = BRAM + 4608      ; MAXFNS    16 * 8 =  128  -> $B200..$B27F  (DEF FN names)
+    const uword iarrnames_ptr = BRAM + 4736      ; MAXIARRS  32 * 8 =  256  -> $B280..$B37F  (DIM A%() names)
+                                                 ; (4992 bytes used of the 8 KB bank -- still room to grow caps)
     const ubyte MAXVARS = 128            ; VM has word[128] vars
     const ubyte SCRATCH_SLOT = 127       ; top numeric slot reserved for the compiler (ON selector temp)
     ubyte nvars
@@ -188,8 +189,8 @@ main {
 
     ; --- line-number map (linenum -> pcode offset) for GOTO / THEN targets; lives in NAMES_BANK
     ;     (linenums_ptr/lineaddrs_ptr) -- record_line/find_line_addr page it in, compile-time only ---
-    const ubyte MAXLINES = 128
-    ubyte nlines
+    const uword MAXLINES = 512           ; GOTO/THEN targets (banked line map); uword since > 255
+    uword nlines
 
     ; --- IF guard patches for the current source line ---
     ; CBM/X16 BASIC V2: a FALSE `IF` skips to the end of the LINE (the ROM runs the same
@@ -1552,7 +1553,16 @@ main {
                 next_token()
             }
             T_ON -> parse_on()                      ; IF cond THEN ON x GOTO ...
-            else -> error(E_SYNTAX)
+            T_GET -> parse_get()                    ; IF cond THEN GET A$  (keyboard poll in a guard)
+            else -> {
+                ; same as parse_statement's else-arm: an X16 keyword GPC doesn't compile ($CE escape,
+                ; e.g. IF cond THEN LOCATE Y,X / COLOR c) passes through to ROM BASIC; stray punctuation
+                ; (a non-keyword first byte) is a real syntax error. The IF guard skips it when false.
+                if @(tok_start) >= $80
+                    parse_passthru()
+                else
+                    error(E_SYNTAX)
+            }
         }
     }
 
@@ -1639,7 +1649,7 @@ main {
 
     sub find_line_addr(uword num) -> uword {
         cx16.rambank(NAMES_BANK)                ; line map is banked; caller re-asserts its bank on the next emit
-        ubyte i = 0
+        uword i = 0
         while i < nlines {
             if peekw(linenums_ptr + (i as uword) * 2) == num
                 return peekw(lineaddrs_ptr + (i as uword) * 2)

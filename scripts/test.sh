@@ -169,9 +169,11 @@ bash "$DIR/check-basic.sh" "10 NEXT"                        0403=5 0404=0a || fa
 # FORMULA TOO COMPLEX (6): 33 nested '(' overflow the 32-slot operator stack
 COMPLEX="10 PRINT $(printf '(%.0s' $(seq 33))1$(printf ')%.0s' $(seq 33))"
 bash "$DIR/check-basic.sh" "$COMPLEX"                       0403=6 0404=0a || fail=1
-# OUT OF MEMORY (4): enough P-code to overflow the 16 KB banked P-code ceiling -- 250 lines x 15
-# PRINTs (~19 KB). Each line is a realistic length (<=160 chars), so it fits the per-line buffer.
-OOM=""; for i in $(seq 1 250); do OOM="$OOM$i $(printf 'PRINT 1:%.0s' $(seq 1 14))PRINT 1\n"; done
+# OUT OF MEMORY (4): more program lines than the banked line-number map holds (MAXLINES=512). 520
+# single-PRINT lines stay tiny in P-code (~2 KB, far under CODE_CAP=32 KB) and source (~5 KB, under the
+# 48 KB source cap), so this cleanly exercises the line-map ceiling -- record_line's clean OUT OF MEMORY
+# at line 513 rather than silent corruption. (nlines/MAXLINES are uword now, so 512 is a real boundary.)
+OOM=""; for i in $(seq 1 520); do OOM="$OOM$i PRINT 1\n"; done
 bash "$DIR/check-basic.sh" "$OOM"                           0403=4 || fail=1
 
 echo
@@ -198,12 +200,15 @@ bash "$DIR/check-out.sh" '10 A$="AB":A$=A$+"CD":A$=A$+"EF":PRINT A$' "ABCDEF" ||
 
 echo
 echo "== String garbage collection (ROM garba2 reclaims abandoned concat temporaries) =="
-# 200-char accumulation: without GC this OOM'd at ~45 chars (heap full of dead intermediates); garba2 reclaims
-bash "$DIR/check-basic.sh" '10 B$="X"\n20 FOR I=1 TO 200\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=c8 0401=00 || fail=1
-# grows right up to BASIC's 255-char string ceiling
-bash "$DIR/check-basic.sh" '10 B$="X"\n20 FOR I=1 TO 255\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=ff 0401=00 || fail=1
-# past 255 is a clean ?STRING TOO LONG (as the ROM does), not a heap overrun / hang
-bash "$DIR/check-out.sh"   '10 B$="X"\n20 FOR I=1 TO 300\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' '?STRING TOO LONG' || fail=1
+# in-process GC: 180-char accumulation forces ~180 garba2 collections (without GC this OOM'd at ~45 chars).
+# The self-hosted compiler's IN-PROCESS string heap is small (~1 KB = progend..MEMTOP $9F00, squeezed by the
+# resident compiler), so the 255-char ceiling + the >255 overflow are exercised on the STANDALONE path just
+# below, where the string heap is the whole free RAM above the program. (Real programs run standalone.)
+bash "$DIR/check-basic.sh" '10 B$="X"\n20 FOR I=1 TO 180\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=b4 0401=00 || fail=1
+# standalone (big heap): grow right up to BASIC's 255-char string ceiling
+bash "$DIR/check-standalone.sh" mail '10 B$="X"\n20 FOR I=1 TO 255\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' 0400=ff 0401=00 || fail=1
+# standalone: past 255 is a clean ?STRING TOO LONG (as the ROM does), not a heap overrun / hang
+bash "$DIR/check-standalone.sh" out '10 B$="X"\n20 FOR I=1 TO 300\n30 A$=A$+B$\n40 NEXT\n50 PRINT LEN(A$)' '?STRING TOO LONG' || fail=1
 # aliasing: C$=A$ shares A$'s heap string; as A$ grows through many collections, C$ must stay pinned to "HELLO"
 bash "$DIR/check-basic.sh" '10 B$="HELLO"\n20 A$=B$+""\n30 C$=A$\n40 FOR I=1 TO 100\n50 A$=A$+"Z"\n60 NEXT\n70 PRINT LEN(C$)' 0400=05 || fail=1
 # content survives compaction byte-for-byte: MID$(A$,2,1) is still 'B' ($42) after 150 collections
@@ -241,6 +246,11 @@ bash "$DIR/check-basic.sh" '10 B=100:VPOKE 0,B*40,55:PRINT VPEEK(0,4000)' 0400=3
 bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,$FF:PRINT VPEEK(0,4660)' 0400=ff || fail=1
 # standalone: variable substitution happens in the runtime, so it works with no compiler present too
 bash "$DIR/check-standalone.sh" mail '10 A=4660:VPOKE 0,A,66:PRINT VPEEK(0,A)' 0400=42 || fail=1
+# a pass-through statement INSIDE an IF..THEN body: parse_then_body routes an X16 keyword to OP_PASSTHRU
+# just like a top-level statement (was ?SYNTAX before -- broke IF..THEN LOCATE/COLOR/etc). True guard runs
+# it; a false guard skips the whole rest of the line (so the VPOKE below never fires -> VRAM stays 11).
+bash "$DIR/check-basic.sh" '10 IF 1 THEN VPOKE 0,4660,66\n20 PRINT VPEEK(0,4660)' 0400=42 || fail=1
+bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,11:IF 0 THEN VPOKE 0,4660,66\n20 PRINT VPEEK(0,4660)' 0400=0b || fail=1
 
 echo
 echo "== X16 expression functions: VPEEK/JOY/... run via ROM frmevl in expression context (OP_CALLX) =="
