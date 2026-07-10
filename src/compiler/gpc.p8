@@ -81,18 +81,37 @@ main {
                                                           ; margin for operand over-reads); bigger -> standalone
     uword code_len                                        ; emitted P-code length (bytes, into banked RAM)
 
-    ; --- string-literal pool; OP_PUSHS stores pool-relative offsets (vm.litbase resolves
-    ;     them), so the same P-code works in-process and in a standalone out.prg ---
-    const uword LIT_SIZE = 768            ; string-literal pool (low RAM freed by banked-RAM name tables)
-    uword litpool_ptr = memory("gpc_lit", LIT_SIZE, 0)
+    ; --- string-literal + DATA pools now live in BANKED RAM (POOLS_BANK's $A000 window), so they
+    ;     can grow far past the exhausted compiler low RAM. Both are WRITE-ONLY during compile
+    ;     (store_literal/store_data append into the bank). OP_PUSHS/READ store pool-relative offsets
+    ;     (vm.litbase/database resolve them), so the same P-code works in-process and in out.prg.
+    ;     vm.p8 stays bank-UNAWARE: an in-process run copies the used bytes down to low-RAM scratch
+    ;     (below) and points vm.litbase/database there; a standalone write streams them from the bank.
+    const ubyte POOLS_BANK = NAMES_BANK + 1   ; = 12: a free bank above source (1..6), P-code (7..10), names (11)
+    const uword LIT_SIZE = 2048           ; string-literal pool: POOLS_BANK $A000..$A7FF
+    const uword litpool_bptr = BRAM + 0    ; litpool base within the POOLS_BANK window
     uword lit_len
     ubyte[64] tokstr               ; string-literal text when tok == T_STRLIT (also DATA-item text)
 
     ; --- DATA pool: item texts (null-terminated, in line order) that READ walks at run time.
-    ;     Bundled after the literal pool in a standalone out.prg; resolved via vm.database. ---
-    const uword DATA_SIZE = 768           ; DATA-item pool (low RAM freed by banked-RAM name tables)
-    uword datapool_ptr = memory("gpc_data", DATA_SIZE, 0)
+    ;     Sits right after the literal pool in the SAME bank; bundled after litpool in out.prg. ---
+    const uword DATA_SIZE = 2048          ; DATA-item pool: POOLS_BANK $A800..$AFFF (LIT_SIZE+DATA_SIZE = 4 KB of 8)
+    const uword datapool_bptr = BRAM + LIT_SIZE   ; data pool base within the POOLS_BANK window
     uword data_len
+
+    ; --- low-RAM scratch for an IN-PROCESS run only: the used pool bytes are copied here so the VM
+    ;     reads litbase/database from flat low RAM (the $A000 window is busy holding P-code during a
+    ;     run). Sized for the RUN_CAP-bounded in-process regime; a program whose pools exceed these is
+    ;     "too big to run" in-process (out.prg is still written and has the full banked pools). ---
+    ; The in-process run is ONLY the headless testbench (a real INTERACTIVE build writes out.prg and the
+    ; user RUNs that separately -- see start()), so these need only cover the tiny self-run test programs.
+    ; Keeping them SMALL frees ~1.1 KB of low RAM vs the old 768+768 pools, GROWING the in-process string
+    ; heap (progend..MEMTOP) -- which is what the string-GC stress tests need. A self-run program whose
+    ; pools exceed these prints "too big to run" (out.prg still holds the full banked pools).
+    const uword LITSCRATCH_SIZE = 256
+    const uword DATASCRATCH_SIZE = 128
+    uword litscratch = memory("gpc_litscr", LITSCRATCH_SIZE, 0)
+    uword datascratch = memory("gpc_datascr", DATASCRATCH_SIZE, 0)
 
     ; --- resident in-process VM slabs. The VM's five slabs are host-assigned pointers now (a standalone
     ;     program parks them above its P-code); the compiler is too big to spare RAM above progend, so it
@@ -323,9 +342,6 @@ main {
             if INTERACTIVE and not TESTBENCH {
                 report_output()                   ; a real compile run: name the file, don't auto-run
             } else {
-                vm.litbase = litpool_ptr             ; literals + DATA live in our own pools in-process
-                vm.database = datapool_ptr
-                vm.datatop = datapool_ptr + data_len
                 vm.varsf     = vmslabs               ; pre-place the VM slabs in our low buffer (layout
                 vm.ivarsf    = vmslabs + 640         ; must match vm.SLAB_BYTES / vm.run's standalone layout)
                 vm.arrheap   = vmslabs + 896
@@ -335,7 +351,17 @@ main {
                 vm.iarr_dims = vmslabs + 4480
                 vm.heapfloor = sys.progend()         ; heapfloor != 0 -> in-process regime: string heap
                                                      ; owns the free RAM from progend up to MEMTOP
-                if code_len <= RUN_CAP {
+                if code_len <= RUN_CAP and lit_len <= LITSCRATCH_SIZE and data_len <= DATASCRATCH_SIZE {
+                    ; the pools live in POOLS_BANK; copy the used bytes down to low-RAM scratch so the VM
+                    ; reads litbase/database flat (the $A000 window is about to hold P-code for the run).
+                    cx16.rambank(POOLS_BANK)
+                    if lit_len != 0
+                        sys.memcopy(litpool_bptr, litscratch, lit_len)
+                    if data_len != 0
+                        sys.memcopy(datapool_bptr, datascratch, data_len)
+                    vm.litbase  = litscratch
+                    vm.database = datascratch
+                    vm.datatop  = datascratch + data_len
                     vm.host_echo = TESTBENCH         ; host-console mirror only in the headless test build
                     cx16.rambank(PCODE_BANK0)        ; select the P-code bank; the VM never switches it,
                     txt.print("run:\n")              ; so it reads the P-code straight from the $A000 window
@@ -675,10 +701,11 @@ main {
         hdr[5] = msb(data_len)
         void diskio.f_write(&hdr, 6)                             ; -> PCODE_BASE
         write_pcode()                                            ; banked P-code -> PCODE_BASE+6..
+        cx16.rambank(POOLS_BANK)                                 ; both pools stream from this bank's window
         if lit_len != 0
-            void diskio.f_write(litpool_ptr, lit_len)            ; literal pool -> litaddr..
+            void diskio.f_write(litpool_bptr, lit_len)           ; literal pool -> litaddr..
         if data_len != 0
-            void diskio.f_write(datapool_ptr, data_len)          ; data pool -> dataaddr..
+            void diskio.f_write(datapool_bptr, data_len)         ; data pool -> dataaddr..
         diskio.f_close_w()
         return true
     }
@@ -728,13 +755,13 @@ main {
 
     ; write `count` throwaway bytes to the open output file. Filler lands in the runtime's
     ; BSS region (which its own startup re-zeroes), so the content is irrelevant -- we source
-    ; it from the literal pool simply because that's valid, readable low RAM.
+    ; it from the low-RAM scratch buffer simply because that's valid, readable low RAM.
     sub write_filler(uword count) {
         while count != 0 {
             uword chunk = count
-            if chunk > LIT_SIZE
-                chunk = LIT_SIZE
-            void diskio.f_write(litpool_ptr, chunk)
+            if chunk > LITSCRATCH_SIZE
+                chunk = LITSCRATCH_SIZE
+            void diskio.f_write(litscratch, chunk)
             count -= chunk
         }
     }
@@ -1155,7 +1182,8 @@ main {
             error(E_MEM)
             return
         }
-        ubyte n = strings.copy(&tokstr, datapool_ptr + data_len)
+        cx16.rambank(POOLS_BANK)                        ; pool lives in banked RAM; next pc_poke/read re-pages
+        ubyte n = strings.copy(&tokstr, datapool_bptr + data_len)
         data_len += n
         data_len++
     }
@@ -2110,7 +2138,8 @@ main {
             return 0                    ; safe offset; had_error aborts before running
         }
         uword off = lit_len             ; offset of this literal within the pool
-        ubyte n = strings.copy(&tokstr, litpool_ptr + off)
+        cx16.rambank(POOLS_BANK)        ; pool lives in banked RAM; next pc_poke/read re-pages
+        ubyte n = strings.copy(&tokstr, litpool_bptr + off)
         lit_len += n
         lit_len++                       ; the terminating null
         return off

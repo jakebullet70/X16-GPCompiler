@@ -52,14 +52,27 @@ Progress via the $0403 err-cat / $0404-5 err-line mailbox, one capacity/gap ceil
 - line 149: **IF..THEN + an X16 keyword** was ?SYNTAX (parse_then_body had no OP_PASSTHRU else-arm like
   parse_statement). Fixed: THEN routes unknown keyword-first stmts to pass-through; false guard still skips.
 - line ~363: **LIT_SIZE=768** string-literal pool (X16FONTS totals 828 literal bytes; cumulative crosses
-  768 at line 362). NOT yet fixed. Ruled out: ~25 vars (<127), 70 fwd-refs (<128 MAXFIX), 0 DATA.
+  768 at line 362). **FIXED by the banked-pool relocation (below).** Ruled out on the way: ~25 vars (<127),
+  70 fwd-refs (<128 MAXFIX), 0 DATA.
 
-**The wall (architectural, [[gpc-project]] locked-design territory):** litpool + datapool (768 B each) live
-in the compiler's LOW RAM, which is EXHAUSTED — the self-hosted compiler leaves only ~1 KB (progend..MEMTOP
-$9F00), and that same ~1 KB IS the in-process string heap. Growing litpool shrinks that heap, which spirals
-the in-process string-GC stress tests smaller (already had to recalibrate them: 255-char ceiling + >255
-overflow moved to the STANDALONE path, in-process kept at 180 concats). Even the uword MAXLINES code cost
-~80 B of heap. So further X16FONTS progress needs the pools (and/or the in-process heap) MOVED to banked RAM
-— a moderate vm.p8 + gpc.p8 change (make in-process litbase/database access bank-aware). NOTE: this heap
-limit is an IN-PROCESS (testbench) artifact only — the interactive compiler + standalone output have the
-whole free RAM. See [[gpc-project]] [[gpc-engine-shrink]].
+**X16FONTS NOW COMPILES END-TO-END** (all 492 lines): $0403 err-cat = 0, $0404/5 err-line = 0, $0406 = 1
+(out.prg written, ~17.7 KB). Verified headless: stage demo/X16FONTS.PRG as source.prg + gpc.runtime.bin
+(+ gpc.rt.nosarr.bin) in an fsroot, run gpc.prg, read the mailbox. This is GPC's proof case: a real native
+X16 BASIC program ($hex + TAB(/SPC(/GET throughout) compiles to a standalone .prg. (Interactive RUN of the
+editor is a manual/visual check — not headless-scriptable.)
+
+**The wall — BROKEN by the banked-pool relocation** (gpc.p8 only; vm.p8 UNCHANGED, protecting its ~58 B
+runtime margin): litpool + datapool moved OUT of exhausted low RAM into **POOLS_BANK (= NAMES_BANK+1 = 12)**,
+litpool at BRAM+0, datapool at BRAM+LIT_SIZE, both grown to 2048 B (4 KB of the 8 KB window; room to double).
+Pools are WRITE-ONLY during compile, so store_literal/store_data just `cx16.rambank(POOLS_BANK)` before the
+`strings.copy` (self-correcting: the next pc_poke/next_src_line/intern_* re-pages its own bank — same
+invariant NAMES_BANK already relies on; safe because `sptr` lexes the low-RAM `linebuf` copy, not the bank).
+write_output pages POOLS_BANK before streaming the pools to out.prg. **vm.p8 stays bank-UNAWARE:** the
+IN-PROCESS run (headless testbench ONLY — a real INTERACTIVE build writes out.prg and the user RUNs it
+separately) copies the used pool bytes down to small low-RAM scratch (litscratch 256 / datascratch 128) and
+points vm.litbase/database there ($A000 window holds P-code during the run, so pools can't live there). The
+guard `lit_len<=256 and data_len<=128` (+ RUN_CAP) gates in-process self-run; over that → "too big to run"
+(out.prg still complete). Shrinking scratch from the old 768+768 pools FREED ~1.1 KB of low RAM → the
+in-process string heap (progend $978c..MEMTOP $9F00) GREW to ~1.9 KB (was ~0.8 KB), so the reverse of the
+old spiral — GC stress tests got MORE headroom. Full suite: 337 PASS / 0 FAIL. See [[gpc-project]]
+[[gpc-engine-shrink]] [[x16-rom-internal-calls]].
