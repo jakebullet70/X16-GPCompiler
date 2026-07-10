@@ -247,18 +247,19 @@ pcode {
     ; Both pools float right after the P-code (litpool then data pool), so the file stays compact.
     ; The runtime reads the header, sets vm.litbase/database/datatop, and runs P-code at PCODE_BASE+6.
     const ubyte HEADER_SIZE = 6                       ; litaddr:2, dataaddr:2, datalen:2
-    const uword PCODE_BASE = $3C80                    ; runtime finds the compiled program here. Must sit
+    const uword PCODE_BASE = $3A80                    ; runtime finds the compiled program here. Must sit
                                                       ; ABOVE the bundled runtime's LOW-RAM footprint (code
                                                       ; + hot BSS: passbuf/xbuf pass-through buffers + VM
                                                       ; state) so its RAM never overlaps the loaded P-code.
                                                       ; Tier-1 layout: the five numeric/int/string slabs and
                                                       ; the BASIC string var table/heap park ABOVE the P-code
                                                       ; (see vm.run), so only code + hot BSS stays low --
-                                                      ; topping ~$3b5a (testbench) / ~$3b42 (visual) after the
-                                                      ; inc-2c integer arrays. Tightened to $3c80 = footprint
-                                                      ; top + 293 B, now that scripts/assert-pcode-base.sh
-                                                      ; guards this at build time (was $3e00 w/ ~0.7 KB slack;
-                                                      ; the extra 384 B were dead file bytes in every program).
+                                                      ; topping $3951 (testbench) / $3939 (visual+interactive)
+                                                      ; after the asm-shrink. Tightened $3e00->$3c80->$3a80 =
+                                                      ; footprint top + 303 B, guarded by scripts/assert-pcode-
+                                                      ; base.sh at build time. Each tightening reclaims dead
+                                                      ; filler bytes present in EVERY compiled .PRG (the file
+                                                      ; is padded to PCODE_BASE): $3c80->$3a80 = -512 B/program.
                                                       ; INVARIANT (build-enforced): keep PCODE_BASE above the
                                                       ; runtime's BSS top -- if BSS grows past it, loaded
                                                       ; P-code is silently corrupted at run time (standalone
