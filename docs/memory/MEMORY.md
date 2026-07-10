@@ -12,5 +12,6 @@
 - [Blitz-X16 prior attempt](blitz-x16-prior-attempt.md) — the ~90%-done sibling compiler GPC ports proven code from
 - [GPC runtime asm conversion](gpc-runtime-asm-conversion.md) — branch runtime-asm: Prog8->hand-asm VM, phases/sizes; P7b string handlers + Tier-1 slab-relocation (C.DIR 80->52 blocks); ~8-9KB floor
 - [GPC engine shrink](gpc-engine-shrink.md) — branch engine-shrink: 3-phase tiered runtime (universal base tighten + nosarr auto-tier + noint compiler-mode tier); build_tier strip mechanism; PCODE_BASE is the size lever
+- [GPC X16 BASIC coverage](gpc-x16-basic-coverage.md) — what GPC compiles vs real X16 BASIC; 7 lexer blockers FIXED (hex/bin/dot/big-int/exp/long-name/reversed-relops); remaining function gaps (TAB/SPC/MOD/GET); passthru covers the rest
 - [GPC IF semantics](gpc-if-semantics.md) — false IF skips the whole LINE (CBM V2); verified against ref/x16-rom ROM source
 - [Memory is git-tracked](memory-is-git-tracked.md) — this memory folder is a junction into the repo (docs/memory); notes auto-version with the project
