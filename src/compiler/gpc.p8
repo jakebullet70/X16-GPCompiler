@@ -2872,17 +2872,22 @@ main {
             err_code = ecode
             err_line = cur_line
         }
+        ; Message text is LOWERCASE in source on purpose: the rest of the UI (banner, "compile
+        ; failed", the prompts) is lowercase too, and GPC preserves the caller's charset/case mode
+        ; (no_sysinit -- see start()). Uppercase-in-source letters render as PETSCII graphics in the
+        ; mode most callers are in, so an uppercase error line came out garbled; lowercase matches the
+        ; rest and renders as plain readable text (the ROM shows it in whatever case mode is active).
         txt.chrout('?')
         when ecode {
-            E_SYNTAX  -> txt.print("SYNTAX")
-            E_UNDEF   -> txt.print("UNDEF'D STATEMENT")
-            E_TYPE    -> txt.print("TYPE MISMATCH")
-            E_MEM     -> txt.print("OUT OF MEMORY")
-            E_NEXT    -> txt.print("NEXT WITHOUT FOR")
-            E_COMPLEX -> txt.print("FORMULA TOO COMPLEX")
-            else      -> txt.print("FILE NOT FOUND")
+            E_SYNTAX  -> txt.print("syntax")
+            E_UNDEF   -> txt.print("undef'd statement")
+            E_TYPE    -> txt.print("type mismatch")
+            E_MEM     -> txt.print("out of memory")
+            E_NEXT    -> txt.print("next without for")
+            E_COMPLEX -> txt.print("formula too complex")
+            else      -> txt.print("file not found")
         }
-        txt.print(" ERROR IN ")
+        txt.print(" error in ")
         txt.print_uw(cur_line)
         txt.nl()
         had_error = true
