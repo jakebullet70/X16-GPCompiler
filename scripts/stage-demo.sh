@@ -28,22 +28,24 @@ echo "== clean stale demo payload (keep src/ and README) =="
 # NB: DIR.PRG (the plain-BASIC source) is a hand-authored utility, NOT regenerated from src/ --
 # it is deliberately preserved. Its COMPILED form C.DIR.PRG *is* rebuilt below.
 # Globs are case-sensitive here, so remove both cases of the compiled outputs explicitly.
-rm -f "$DEMO"/gpc.prg "$DEMO"/gpc.runtime.bin "$DEMO"/gpc.rt.nosarr.bin "$DEMO"/gpc.runtime.prg "$DEMO"/runtime.prg "$DEMO"/c.* "$DEMO"/C.* "$DEMO"/blitzc*.prg "$DEMO"/source.prg
+rm -f "$DEMO"/gpc.prg "$DEMO"/gpc.noint.prg "$DEMO"/gpc.runtime.bin "$DEMO"/gpc.rt.nosarr.bin "$DEMO"/gpc.rt.noint.bin "$DEMO"/gpc.runtime.prg "$DEMO"/runtime.prg "$DEMO"/c.* "$DEMO"/C.* "$DEMO"/blitzc*.prg "$DEMO"/source.prg
 for f in "$SRCDIR"/*.bas; do rm -f "$DEMO/$(basename "$f" .bas)"; done
 
 # Compile a tokenized-BASIC .prg (already at demo/) to a self-contained standalone via the headless
 # (testbench) compiler, bundling the VISUAL runtime so the emitted program returns to READY.
-# Fixed on-disk names source.prg/gpc.runtime.bin -> out.prg; mirrors scripts/check-standalone.sh.
-#   compile_standalone <input-prg-basename> <output-basename>
+# Fixed on-disk name source.prg -> out.prg; mirrors scripts/check-standalone.sh. The compiler +
+# bundled runtime default to the full pair, but can be overridden to build a noint standalone:
+#   compile_standalone <input-prg> <output> [compiler.prg] [runtime.prg] [runtime-on-disk-name]
 compile_standalone() {
     local in="$1" out="$2"
+    local gpc="${3:-$ROOT/build/gpc.prg}" rt="${4:-$ROOT/build/vm_runtime.prg}" rtname="${5:-gpc.runtime.bin}"
     local fs; fs="$(mktemp -d)"
     cp "$DEMO/$in" "$fs/source.prg"
-    cp "$ROOT/build/vm_runtime.prg" "$fs/gpc.runtime.bin"
+    cp "$rt" "$fs/$rtname"                                   # the compiler opens the runtime under this name
     [ -f "$ROOT/build/vm_runtime_nosarr.prg" ] && cp "$ROOT/build/vm_runtime_nosarr.prg" "$fs/gpc.rt.nosarr.bin"
     rm -f "$fs/out.prg"
-    local centry; centry="$(bash "$DIR/entry-addr.sh" "$ROOT/build/gpc.prg")"
-    printf 'RUN %s\n' "$centry" | timeout 40 "$X16EMU" -testbench -warp -fsroot "$fs" -prg "$ROOT/build/gpc.prg" >/dev/null 2>&1 || true
+    local centry; centry="$(bash "$DIR/entry-addr.sh" "$gpc")"
+    printf 'RUN %s\n' "$centry" | timeout 40 "$X16EMU" -testbench -warp -fsroot "$fs" -prg "$gpc" >/dev/null 2>&1 || true
     if [ -s "$fs/out.prg" ]; then
         cp "$fs/out.prg" "$DEMO/$out"
         echo "  $out ($(wc -c < "$DEMO/$out") bytes)"
@@ -58,6 +60,8 @@ bash "$DIR/build.sh" runtime visual >/dev/null
 cp "$ROOT/build/vm_runtime.prg" "$DEMO/gpc.runtime.bin"
 bash "$DIR/build.sh" runtime nosarr visual >/dev/null       # nosarr tier: programs with no DIM A$() bundle this smaller runtime
 cp "$ROOT/build/vm_runtime_nosarr.prg" "$DEMO/gpc.rt.nosarr.bin"
+bash "$DIR/build.sh" runtime noint visual >/dev/null        # noint tier: the int-optional compiler bundles this (loads at $3400)
+cp "$ROOT/build/vm_runtime_noint.prg" "$DEMO/gpc.rt.noint.bin"
 
 echo "== tokenize demo/src/*.bas -> demo/<NAME> (classic BASIC the compiler reads) =="
 for f in "$SRCDIR"/*.bas; do
@@ -70,13 +74,22 @@ echo "== pre-compile standalones (HELLO + the DIR.PRG file lister) =="
 bash "$DIR/build.sh" gpc >/dev/null                       # testbench gpc (auto-runnable, fixed names)
 compile_standalone HELLO   c.HELLO      # the payoff: a ready-to-run compiled program
 compile_standalone DIR.PRG C.DIR.PRG    # "same as BASIC, MUCH faster" -- compiled directory lister
+compile_standalone INTMATH C.INTMATH    # native-int build (% = 16-bit int ops), for the size compare below
+
+echo "== int-optional (noint) compiler: same INTMATH, % degrades to float -> a SMALLER standalone =="
+bash "$DIR/build.sh" gpc noint >/dev/null                 # testbench noint compiler (INTSUPPORT=false)
+compile_standalone INTMATH C.INTMATH.NI "$ROOT/build/gpc_noint.prg" "$ROOT/build/vm_runtime_noint.prg" gpc.rt.noint.bin
 
 echo "== build gpc INTERACTIVE -> demo/gpc.prg (the on-device compiler that prompts) =="
 bash "$DIR/build.sh" gpc interactive >/dev/null
 cp "$ROOT/build/gpc.prg" "$DEMO/gpc.prg"
+echo "== build gpc INTERACTIVE (int-optional) -> demo/gpc.noint.prg =="
+bash "$DIR/build.sh" gpc noint interactive >/dev/null
+cp "$ROOT/build/gpc_noint.prg" "$DEMO/gpc.noint.prg"
 
-echo "== restore build/gpc.prg to the default testbench build (dev/test state) =="
+echo "== restore build/gpc.prg + build/gpc_noint.prg to the default testbench builds (dev/test state) =="
 bash "$DIR/build.sh" gpc >/dev/null
+bash "$DIR/build.sh" gpc noint >/dev/null
 
 echo
 echo "staged demo/ :"
@@ -85,3 +98,7 @@ echo
 echo "try it:  $X16EMU -fsroot demo -prg demo/gpc.prg -run"
 echo "  at 'compile file:' type  SQUARES   then RETURN at 'write to:'  -> writes c.SQUARES"
 echo "  back at READY:  LOAD \"C.SQUARES\",8  then  RUN"
+echo
+echo "int-optional (noint) compiler:  $X16EMU -fsroot demo -prg demo/gpc.noint.prg -run"
+echo "  compiles the same BASIC but % vars/literals become float; its output bundles the smaller"
+echo "  noint runtime. Compare block counts in DIR:  C.INTMATH (native int)  vs  C.INTMATH.NI (noint)"
