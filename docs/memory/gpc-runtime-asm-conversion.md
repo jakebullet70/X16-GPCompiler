@@ -38,6 +38,30 @@ hold a live pointer across it. `faddr` uses only REG (safe across it). Ran a 4-l
 **Recalibrated floor: realistic ~8-9 KB, NOT the 5 KB Blitz target** — fat is spread across handlers, not
 concentrated; the label-delta size method over-attributes (counts shared temps). Communicate this at a checkpoint.
 
+**MEASURED 2026-07-10 — THE "2x" IS REAL; there are TWO different "Blitz"es, don't conflate them (I did, and
+was briefly wrong).** (a) **Prog8 `BLITZ-COMPILER` reimplementation** (the sibling GPC ported from): VM runtime
+= **8,841 B** (all inline in one 7,021-B `p8s_run` when()-cascade; string/GC = `gc_collect`/`gc_rewrite`/`gc_ensure`/
+`substr` inside vm), 64 opcodes. GPC VM = **9,644 B** (vm 7,748 + bstr 1,896), 92 opcodes, 104.8 vs 138.1 B/op —
+so vs THIS Blitz we're +9% for 28 more opcodes (int subsystem 1,662 B + passthru bridge 771 B) and denser per op.
+That comparison is real but IRRELEVANT to the user's size goal. (b) **The genuine 1986 SuperSoft Blitz!** (C64,
+`demo-c64/blitz_compiler.d64`, run via `run64.bat` in VICE) — THIS is the "~5 KB" aspiration and it is NOT a
+phantom: its whole standalone compiled `c/dir` = **6,244 B / 25 blocks, contiguous, no padding** (SYS $081c);
+the DIR logic itself is ~0.4 KB (`z/dir`=444 B), so the **real Blitz runtime ≈ 5.5-6 KB**. GPC's runtime is
+**10.6 KB = ~1.85x** that. The 2x the user keeps citing is against the 1986 product, and it's genuine. My prior
+"phantom" note compared (a) not (b) — deleted. Method: `awk` label-delta by `p8b_<mod>` (`:` sep); real-Blitz via
+VICE `c1541 -read`.
+
+**COMPILED-PROGRAM SIZE is gated by PCODE_BASE, NOT runtime code size — this is why runtime shrink stopped moving
+blocks (2026-07-10).** A compiled `.prg` = `[code $0801..$318B][low BSS $318B..$3939][margin..$3C80][pcode@$3C80]`;
+the compiler PADS the file to fixed `PCODE_BASE=$3C80`, so DIR's 281-B pcode rides on ~13.4 KB fixed overhead =
+~55 blocks (measured `C.DIR.PRG` 13,722 B — but it's STALE, embeds the old ~13.5 KB pre-shrink runtime; a fresh
+compile is the same block count, just filler instead of old code). The asm-shrink already cashed its size win ONCE
+(let PCODE_BASE fall $5600→$3C80 = 80→52 blocks). Now PCODE_BASE is gated by the **BSS footprint top $3939**, not
+the code top $318B (code has ~2.8 KB headroom below PCODE_BASE), so **further code-only shrink can't lower blocks.**
+Levers to beat 52: (1) reclaim margin PCODE_BASE $3C80→~$3A40 = ~2 blocks free; (2) relocate low BSS above pcode
+→ ~43 blocks (investigated + REJECTED, see below); (3) shrink runtime code 10.6→~6 KB = the real parity lever, hard.
+TODO: re-stage `demo/C.DIR.PRG` (stale). Interactive runtime rebuild: `bash scripts/build.sh runtime interactive`.
+
 **Hard constraints (unchanged):** ROM string GC (garba2) + command pass-through MANDATORY (gating,
 [[gpc-gating-requirement]]); acts-like-BASIC startup preserved ([[gpc-x16basic-look-act]]); standalone must work.
 
@@ -86,7 +110,7 @@ remaining low footprint = code + hot BSS top ~$3808, +0.5KB margin). **c.HELLO 7
 -7KB each).** Corpus 275 green. **INVARIANT: PCODE_BASE MUST stay above the runtime's low-RAM BSS top** (passbuf/
 xbuf pass-through buffers MUST stay low for ROM CHRGET/TXTPTR reach) — if BSS grows past it, loaded pcode is
 silently corrupted at runtime. Full Blitz parity (pcode right after code, ~43 blocks) needs the hot BSS moved
-out of low RAM too — deferred. Residual: runtime CODE still ~10.4KB vs Blitz ~5KB (the long-tail 2x).
+out of low RAM too — deferred. Residual: runtime CODE ~10.6KB vs the genuine 1986 SuperSoft Blitz! runtime ~5.7KB = the real ~1.85x (this "~5KB Blitz / long-tail 2x" is CORRECT — it's the C64 product, not the Prog8 reimpl; see the MEASURED 2026-07-10 note above).
 
 **PCODE_BASE invariant now BUILD-ENFORCED + tightened (2026-07-09, branch `harden-and-tier2`).** Both int-array
 bugs were silent; one was the BSS-crosses-PCODE_BASE trap (in-process immune, so corpus passes while standalone
