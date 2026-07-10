@@ -24,11 +24,22 @@ Hex/binary emit an ordinary T_NUM (reuse the existing literal path; works in ful
 Added is_hexdigit/hexval. Tests: test.sh "M2b" block. NOTE: PRINT of a value >32767 leaves the
 mailbox 0 by design (op_printi), so assert those via printed output, not the mailbox.
 
-**Still missing (NOT yet fixed) — expression-position functions that can't pass through:**
-- COMMON: `TAB(` `SPC(` (PRINT formatting), `MOD` (X16, actively rejected ~gpc.p8:3166), plain `GET`
-  (rejected ~gpc.p8:948 — only GET# is compiled).
-- niche: `FRE` `POS` `USR` `POINTER` `STRPTR`, and the pi glyph constant.
-These need parser/codegen work, not just the lexer.
+**4 common function/statement gaps — ALL FIXED (commit 8277fca):**
+- `MOD(a,b)` — an X16 two-arg numeric function ($CE $DE). Just added $DE to is_xfunc: it rides the
+  existing OP_CALLX/frmevl path (ROM evaluates it). This also FIXED a latent OP_CALLX bug for EVERY
+  xfunc: a negative arg's sign was formatted as raw ASCII '-', which frmevl (reads TOKENS) can't parse
+  as unary minus → it wedged. xbuild now emits the tokenized MINUS ($AB); the doc example MOD(-17,5) works.
+- `TAB(` / `SPC(` — PRINT-context cursor control. New UNIVERSAL opcodes OP_TAB (93) / OP_SPC (94);
+  handled in print_items via parse_index (the '(' is baked into the $A3/$A6 token). TAB reads the live
+  cursor column via KERNAL PLOT ($FFF0); both take a 0..255 byte arg (clamp_byte).
+- plain `GET var[,var...]` — new UNIVERSAL opcode OP_GETKEY (92): GETIN (non-blocking → ""/0 idle).
+  String target → OP_STORS; numeric/int target → OP_STRNUM(VAL) [→ OP_FTOI/ISTORV]. GET# unchanged.
+New opcodes sit AFTER op_iastore in _optab so the nosarr/noint strip ranges miss them (all tiers keep
+them); dispatch gate raised to <95. tokenize.py learns TAB(/SPC(. Tests: test.sh MOD/TAB-SPC/GET blocks.
+
+**Still missing — niche expression-position functions:** `FRE` `POS` `USR` `POINTER` `STRPTR`, and the
+pi glyph constant. These need per-function parser/codegen work (POINTER/STRPTR need a var ADDRESS, not
+its value, so OP_CALLX can't carry them). Low priority — rarely hit ordinary programs.
 
 **Correctly omitted (these WORK via OP_PASSTHRU to ROM):** all FM/PSG sound, sprites, VERA bitmap
 graphics (SCREEN/LINE/RECT/...), VPOKE/TILE/VLOAD, BLOAD/BSAVE, tooling (LIST/MON/EXEC/BASLOAD/DOS).
