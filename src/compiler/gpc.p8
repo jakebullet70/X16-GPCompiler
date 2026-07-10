@@ -282,6 +282,8 @@ main {
     const ubyte T_XFUNC   = 64     ; X16 escape function (numeric): VPEEK/JOY/MX/... ($CE sub-token in tok_funcid)
     const ubyte T_XSFUNC  = 65     ; X16 escape function (string-returning): HEX$/BIN$ ($CE sub-token in tok_funcid)
     const ubyte T_IVAR    = 66     ; integer variable A% (name incl. '%' in tokname; own namespace, Phase 5)
+    const ubyte T_TAB     = 67     ; TAB( -> advance to a column   (PRINT-context pseudo-function, token $A3)
+    const ubyte T_SPC     = 68     ; SPC( -> emit N spaces          (PRINT-context pseudo-function, token $A6)
     const ubyte T_BAD     = 255
 
     ; sub-ids for T_STRSLICE (compiler-only; each maps to its own VM opcode)
@@ -942,29 +944,63 @@ main {
         emit_byte(pcode.OP_CLOSE)
     }
 
-    ; GET#lfn, v$  -- read one byte from a channel into a string variable ("" at end of file / null byte)
+    ; GET#lfn, v$          -- read one byte from a channel into a string var ("" at EOF / null byte).
+    ; GET var[, var ...]   -- poll the keyboard for one keystroke per variable (non-blocking: "" / 0 when
+    ;   nothing is waiting). Each target may be a string (A$), a float scalar (A), or an int var (A%).
     sub parse_get() {
         next_token()
-        if tok != T_HASH {                      ; only GET# (from a channel) is supported, not plain GET
-            error(E_SYNTAX)
+        if tok == T_HASH {                      ; --- GET# : one byte from an open channel ---
+            next_token()
+            parse_expr()                        ; logical file number -> numeric stack
+            if tok != T_COMMA {
+                error(E_SYNTAX)
+                return
+            }
+            next_token()
+            if tok != T_STRVAR {
+                error(E_SYNTAX)
+                return
+            }
+            ubyte gslot = intern_svar()
+            next_token()
+            emit_byte(pcode.OP_GETCH)           ; pop lfn, push the 0/1-char string
+            emit_byte(pcode.OP_STORS)
+            emit_imm16(gslot as uword)
             return
         }
-        next_token()
-        parse_expr()                            ; logical file number -> numeric stack
-        if tok != T_COMMA {
-            error(E_SYNTAX)
-            return
+        ; --- plain GET : poll the keyboard, one keystroke per variable in the list ---
+        repeat {
+            if tok == T_STRVAR {
+                ubyte kslot = intern_svar()
+                next_token()
+                emit_byte(pcode.OP_GETKEY)      ; push the keystroke as a 0/1-char string
+                emit_byte(pcode.OP_STORS)
+                emit_imm16(kslot as uword)
+            } else if tok == T_IDENT {
+                ubyte nslot = intern_var()
+                next_token()
+                emit_byte(pcode.OP_GETKEY)      ; keystroke -> string...
+                emit_byte(pcode.OP_STRNUM)      ; ...VAL it to a number (""/non-digit -> 0)
+                emit_byte(pcode.SN_VAL)
+                emit_byte(pcode.OP_STORV)
+                emit_imm16(nslot as uword)
+            } else if tok == T_IVAR {
+                ubyte islot = intern_ivar()
+                next_token()
+                emit_byte(pcode.OP_GETKEY)      ; keystroke -> string -> VAL...
+                emit_byte(pcode.OP_STRNUM)
+                emit_byte(pcode.SN_VAL)
+                emit_byte(pcode.OP_FTOI)        ; ...truncate into the 16-bit int variable
+                emit_byte(pcode.OP_ISTORV)
+                emit_imm16(islot as uword)
+            } else {
+                error(E_SYNTAX)
+                return
+            }
+            if tok != T_COMMA
+                break
+            next_token()
         }
-        next_token()
-        if tok != T_STRVAR {
-            error(E_SYNTAX)
-            return
-        }
-        ubyte gslot = intern_svar()
-        next_token()
-        emit_byte(pcode.OP_GETCH)               ; pop lfn, push the 0/1-char string
-        emit_byte(pcode.OP_STORS)
-        emit_imm16(gslot as uword)
     }
 
     ; PRINT#lfn [, item ; item ...]  -- redirect PRINT output to a channel, then restore default I/O
@@ -1660,7 +1696,25 @@ main {
                 next_token()
             } else {
                 suppress_nl = false
-                if is_str_start(tok) {
+                if tok == T_TAB or tok == T_SPC {
+                    ; TAB(n) / SPC(n): cursor control, not a printed value. The '(' is baked into the
+                    ; token, so the argument follows immediately and a ')' closes it. Emit the numeric
+                    ; arg (auto-coerced to float by parse_expr), then the side-effecting op that pops it.
+                    ubyte is_tab = 0
+                    if tok == T_TAB
+                        is_tab = 1
+                    next_token()                    ; consume TAB( / SPC(
+                    parse_index()                   ; the column (TAB) / space count (SPC); stops at ')'
+                    if tok != T_RPAREN {
+                        error(E_SYNTAX)
+                        return
+                    }
+                    next_token()                    ; consume ')'
+                    if is_tab != 0
+                        emit_byte(pcode.OP_TAB)
+                    else
+                        emit_byte(pcode.OP_SPC)
+                } else if is_str_start(tok) {
                     parse_string_expr()
                     if is_cmp(tok) {                    ; PRINT A$="X" prints the truth value, not the string
                         ubyte pcmp = cmp_id(tok)
@@ -3191,6 +3245,8 @@ main {
             $a1 -> return T_GET             ; GET / GET# (the '#' follows as a separate byte)
             $98 -> return T_PRINTCH         ; PRINT# is its own token (not PRINT + '#')
             $84 -> return T_INPUTCH         ; INPUT# is its own token
+            $a3 -> return T_TAB             ; TAB(  (the '(' is part of the token; a value + ')' follow)
+            $a6 -> return T_SPC             ; SPC(  (likewise)
             $a4 -> return T_TO
             $a7 -> return T_THEN
             $a9 -> return T_STEP
@@ -3248,7 +3304,8 @@ main {
     ; the numeric-result functions whose arguments are plain numbers passed by value (or that take no
     ; arguments), since OP_CALLX evaluates the args itself and reads back a numeric FAC. Deliberately
     ; NOT accepted: the string-returning HEX$/BIN$/RPT$ ($D5/$D6/$DA), and POINTER/STRPTR ($D8/$D9)
-    ; which need a variable's address rather than its value; and the bannex TDATA/TATTR/MOD ($DC..$DE).
+    ; which need a variable's address rather than its value; and the tile readers TDATA/TATTR ($DC/$DD).
+    ; MOD ($DE) IS accepted -- it's an ordinary two-numeric-arg function, evaluated by ROM like VPEEK.
     ; Anything rejected here becomes T_BAD -> a clean SYNTAX error instead of a wrong-typed result.
     sub is_xfunc(ubyte s) -> bool {
         when s {
@@ -3256,7 +3313,8 @@ main {
             $d1, $d2, $d3,  ; MX / MY / MB          (no arguments)
             $d4,        ; JOY(n)
             $d7,        ; I2CPEEK(dev,addr)
-            $db -> return true  ; MWHEEL             (no arguments)
+            $db,        ; MWHEEL                     (no arguments)
+            $de -> return true  ; MOD(dividend,divisor)  -> ROM's frmevl computes the signed remainder
         }
         return false
     }

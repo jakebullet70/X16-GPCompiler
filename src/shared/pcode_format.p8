@@ -202,6 +202,12 @@ pcode {
     const ubyte OP_IALOAD  = 90  ; (imm16 slot)(ubyte nd) pop nd subscripts; push int element (0 if out of range)
     const ubyte OP_IASTORE = 91  ; (imm16 slot)(ubyte nd) pop int value then nd subscripts; store the element
 
+    ; --- keyboard input + PRINT formatting (X16/CBM BASIC coverage). UNIVERSAL (all runtime tiers): these
+    ;     sit AFTER the integer block so the noint strip range (_optab..op_iastore) never touches them. ---
+    const ubyte OP_GETKEY  = 92  ; ()          poll the keyboard (GETIN); push a 0- or 1-char string (plain GET)
+    const ubyte OP_TAB     = 93  ; ()          pop n (numeric); print spaces to reach absolute column n (TAB()
+    const ubyte OP_SPC     = 94  ; ()          pop n (numeric); print n spaces (SPC()
+
     ; Element addressing for both array families is ROW-MAJOR over dimension SIZES s_j = (max index j)+1:
     ; for subscripts i_0..i_{nd-1}, offset = (((i_0)*s_1 + i_1)*s_2 + i_2)... (Horner). The compiler emits
     ; the same subscripts for DIM and for access, so the exact layout only has to be self-consistent.

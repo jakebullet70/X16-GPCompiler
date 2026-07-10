@@ -256,6 +256,29 @@ bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,55:PRINT VPEEK(0,4096+564)' 0400=37 
 bash "$DIR/check-basic.sh" '10 VPOKE 0,4660,40:PRINT VPEEK(0,4660)+2' 0400=2a || fail=1
 # standalone: VPEEK bundled into out.prg and evaluated via ROM frmevl with no compiler present
 bash "$DIR/check-standalone.sh" mail '10 VPOKE 0,4660,66:PRINT VPEEK(0,4660)' 0400=42 || fail=1
+# MOD(a,b): the X16 signed-16-bit remainder, evaluated by ROM frmevl like VPEEK. The ROM's OWN doc example
+# is MOD(-17,5) -- a NEGATIVE arg, whose sign xbuild must emit as the tokenized minus ($AB), not a raw '-',
+# or frmevl wedges. The result takes the dividend's sign (per the ROM).
+bash "$DIR/check-basic.sh" '10 PRINT MOD(17,5)'       0400=02   || fail=1   # 2
+bash "$DIR/check-out.sh"   '10 PRINT MOD(-17,5)'      "-2"      || fail=1   # negative dividend -> -2
+bash "$DIR/check-out.sh"   '10 PRINT MOD(17,-5)'      "2"       || fail=1   # negative divisor
+bash "$DIR/check-basic.sh" '10 A=MOD(10,3)+1:PRINT A' 0400=02   || fail=1   # inside an expression
+bash "$DIR/check-standalone.sh" out '10 PRINT MOD(-17,5)' "-2"  || fail=1   # bundled, no compiler present
+
+echo
+echo "== PRINT formatting: TAB( / SPC( (cursor control inside PRINT; TAB reads the KERNAL cursor via PLOT) =="
+bash "$DIR/check-out.sh" '10 PRINT SPC(3);"X"'        "   X"     || fail=1   # SPC(n): n spaces (relative)
+bash "$DIR/check-out.sh" '10 PRINT "AB";TAB(5);"X"'   "AB   X"   || fail=1   # TAB(n): pad to absolute column n
+bash "$DIR/check-out.sh" '10 PRINT TAB(5);"X"'        "     X"   || fail=1   # from column 0
+bash "$DIR/check-out.sh" '10 PRINT 5;SPC(2);6'        "5  6"     || fail=1   # SPC between numeric items
+bash "$DIR/check-standalone.sh" out '10 PRINT SPC(3);"X"' "   X" || fail=1   # bundled OP_SPC, no compiler present
+
+echo
+echo "== plain GET: poll the keyboard (non-blocking). Headless => no key => \"\" (string) / 0 (numeric) =="
+bash "$DIR/check-basic.sh" '10 GET A$:IF A$="" THEN PRINT 9'     0400=09 || fail=1   # the GET A$:IF A$="" idiom
+bash "$DIR/check-basic.sh" '10 GET A:PRINT A'                    0400=00 || fail=1   # numeric GET, no key -> 0
+bash "$DIR/check-basic.sh" '10 GET A$,B$:IF B$="" THEN PRINT 3'  0400=03 || fail=1   # variable list
+bash "$DIR/check-standalone.sh" mail '10 GET A$:IF A$="" THEN PRINT 9' 0400=09 || fail=1  # bundled OP_GETKEY
 
 echo
 echo "== X16 string functions: HEX\$/BIN\$ run via ROM frmevl, result adopted as a GPC string (OP_CALLXS) =="

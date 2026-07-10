@@ -21,6 +21,8 @@ TOKENS = {
     # channel / file I/O.  'PRINT#'/'INPUT#' are single tokens (incl. the '#'); 'GET' is separate
     # from a following '#'.  Sorted longest-first below, so 'PRINT#' wins over 'PRINT'.
     'OPEN': 0x9f, 'CLOSE': 0xa0, 'GET': 0xa1, 'PRINT#': 0x98, 'INPUT#': 0x84,
+    # TAB( / SPC( carry the '(' in the token, exactly as the ROM crunch does (token2.s tabtk/spctk)
+    'TAB(': 0xa3, 'SPC(': 0xa6,
     'TO': 0xa4, 'THEN': 0xa7, 'STEP': 0xa9,
     'NOT': 0xa8, 'AND': 0xaf, 'OR': 0xb0,
     # built-in functions

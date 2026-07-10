@@ -192,9 +192,9 @@ _next:
             bne  +
             inc  p8b_vm.p8v_pc+1
 +
-            cmp  #92                       ; opcodes 0..91 valid; >=92 unknown -> ignore (when no-match)
+            cmp  #95                       ; opcodes 0..94 valid; >=95 unknown -> ignore (when no-match)
             bcs  _next
-            asl  a                         ; *2 for the word table (0..91 -> 0..182)
+            asl  a                         ; *2 for the word table (0..94 -> 0..188)
             tax
             ; RTS-dispatch: push _after-1 so each handler's own final rts returns to _after.
             ; This lets _optab point STRAIGHT at the handlers -- no per-opcode "jsr h / jmp
@@ -225,6 +225,8 @@ _optab:
             .word p8b_vm.p8s_op_itof, p8b_vm.p8s_op_itof2, p8b_vm.p8s_op_ftoi
             .word p8b_vm.p8s_op_icmpeq, p8b_vm.p8s_op_icmpne, p8b_vm.p8s_op_icmplt, p8b_vm.p8s_op_icmpgt, p8b_vm.p8s_op_icmple, p8b_vm.p8s_op_icmpge, p8b_vm.p8s_op_ijz, p8b_vm.p8s_op_iand, p8b_vm.p8s_op_ior, p8b_vm.p8s_op_inot
             .word p8b_vm.p8s_op_iforpush, p8b_vm.p8s_op_ifornext, p8b_vm.p8s_op_idim, p8b_vm.p8s_op_iaload, p8b_vm.p8s_op_iastore
+            ; universal (kept in every tier -- placed after op_iastore so the noint strip range misses them)
+            .word p8b_vm.p8s_op_getkey, p8b_vm.p8s_op_tab, p8b_vm.p8s_op_spc
 _t0:                                    ; OP_END -> leave the interpreter loop
             pla                          ; drop the RTS-dispatch return addr (we jmp, not rts)
             pla
@@ -2510,6 +2512,53 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
             jmp  p8b_vm.p8s_str_error
         }}
     }
+    ; plain GET var$ : poll the keyboard for ONE keystroke and push a 0/1-char string. Non-blocking --
+    ; GETIN returns 0 when the queue is empty, which maps to "" (the idiomatic GET A$:IF A$=""..:GOTO).
+    sub op_getkey() {
+        ubyte ch = cbm.GETIN2()
+        if ch == 0 {
+            push_empty()
+            return
+        }
+        sstack[ssp] = bstr.chr_temp(ch)
+        ssp++
+        void str_error()
+    }
+    ; SPC(n) : print n spaces. n is taken as a 0..255 byte, like the ROM (relative cursor move).
+    sub op_spc() {
+        sp--
+        ubyte n = clamp_byte(stack[sp])
+        while n != 0 {
+            emit_char(' ')
+            n--
+        }
+    }
+    ; TAB(n) : advance to absolute column n by emitting spaces (no move if already at/past it). The live
+    ; cursor column comes from the KERNAL (PLOT with carry set -> row in X, column in Y); GPC prints via
+    ; CHROUT so that column stays accurate. n is a 0..255 byte, as in the ROM.
+    sub op_tab() {
+        sp--
+        ubyte target = clamp_byte(stack[sp])
+        ubyte col
+        %asm {{
+            sec
+            jsr  $fff0                            ; KERNAL PLOT (read): X=row, Y=column
+            sty  p8b_vm.p8s_op_tab.p8v_col
+        }}
+        while col < target {
+            emit_char(' ')
+            col++
+        }
+    }
+    ; a PRINT-formatting column/count, taken as an X16 BASIC byte argument: negatives -> 0, >255 -> 255.
+    sub clamp_byte(float f) -> ubyte {
+        if f < 0.0
+            return 0
+        if f > 255.0
+            return 255
+        word w = f as word                        ; 0..255 is safe for the range-checked ROM float->word
+        return lsb(w)
+    }
     sub op_status() {                      ; ST : the KERNAL I/O status word
                     stack[sp] = cbm.READST() as float
                     sp++
@@ -2670,7 +2719,13 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
                     w++
                 }
                 uword ds = floats.tostr(xargs[a])         ; null-terminated PETSCII; a leading space (for
-                ubyte j = 0                               ; non-negatives) is harmless -- CHRGET skips it
+                                                          ; non-negatives) is harmless -- CHRGET skips it
+                if @(ds) == '-' {                         ; a NEGATIVE sign must be the tokenized MINUS
+                    xbuf[w] = $ab                         ; ($AB), not raw ASCII '-': frmevl parses tokens,
+                    w++                                   ; and an untokenized '-' is not unary minus to it
+                    ds++                                  ; -- it wedges (e.g. the doc example MOD(-17,5)).
+                }                                         ; (an interior E-exponent '-' stays raw; FIN reads it)
+                ubyte j = 0
                 while @(ds + j) != 0 {
                     xbuf[w] = @(ds + j)
                     w++
