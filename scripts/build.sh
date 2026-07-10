@@ -91,6 +91,30 @@ case "$MODE" in
         build_tier nosarr 'sdim|saload|sastore|rdstr' yes '$3740' "$3"
         exit 0
         ;;
+    noint)
+        # Phase 3 "int optional" -- two shapes by target:
+        #  runtime: a tier that strips the 25 native-integer opcodes (67..91, ipushi..iastore). op_ftoi and
+        #    op_idim are plain subs prog8 DCEs once the _optab repoint orphans them; the other 23 are asmsubs
+        #    the awk collapses to rts. keep-bstr=yes (strings/float/numeric+string arrays all stay). Its
+        #    P-code loads at NOINT_PCODE_BASE. NOTE: the $3400 base MUST match NOINT_PCODE_BASE in gpc.p8.
+        #  gpc: the noint compiler (INTSUPPORT=false) -- `%` vars/literals degrade to float and no integer
+        #    opcode is emitted, so its output bundles the noint runtime. Composes with visual/interactive ($3).
+        if [ "$TARGET" = "runtime" ]; then
+            build_tier noint 'ipushi|iloadv|istorv|iadd|isub|imul|ineg|itof2|itof|ftoi|icmpeq|icmpne|icmplt|icmpgt|icmple|icmpge|ijz|iand|ior|inot|iforpush|ifornext|idim|iaload|iastore' yes '$3400' "$3"
+            exit 0
+        fi
+        [ "$TARGET" = "gpc" ] || { echo "noint mode only applies to the runtime or gpc target"; exit 1; }
+        rm -rf build/gen && mkdir -p build/gen
+        NISEDS='s/const bool INTSUPPORT = true/const bool INTSUPPORT = false/'
+        case "$3" in
+            visual)      NISEDS="$NISEDS; s/const bool TESTBENCH = true/const bool TESTBENCH = false/" ;;
+            interactive) NISEDS="$NISEDS; s/const bool TESTBENCH = true/const bool TESTBENCH = false/; s/const bool INTERACTIVE = false/const bool INTERACTIVE = true/" ;;
+        esac
+        sed "$NISEDS" "$SRC" > "build/gen/${BASE}_noint.p8"
+        "$JAVA" -jar "$PROG8C" -target cx16 -srcdirs "$SRCDIRS" -out build "build/gen/${BASE}_noint.p8"
+        echo "built: build/${BASE}_noint.prg (noint${3:+ $3})"
+        exit 0
+        ;;
     *)
         "$JAVA" -jar "$PROG8C" -target cx16 -srcdirs "$SRCDIRS" -out build "$SRC"
         echo "built: build/$BASE.prg (test)"

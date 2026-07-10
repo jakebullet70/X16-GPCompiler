@@ -11,7 +11,9 @@ echo "== build compiler + VM + runtime once =="
 bash "$DIR/build.sh" selftest >/dev/null
 bash "$DIR/build.sh" runtime  >/dev/null
 bash "$DIR/build.sh" runtime nosarr >/dev/null   # nosarr tier (programs with no DIM A$())
+bash "$DIR/build.sh" runtime noint  >/dev/null   # noint tier (int subsystem stripped; loads at $3400)
 bash "$DIR/build.sh" gpc   >/dev/null
+bash "$DIR/build.sh" gpc noint >/dev/null    # noint compiler (INTSUPPORT=false; % degrades to float)
 bash "$DIR/build.sh" gpc prompt >/dev/null   # INTERACTIVE variant for the filename-prompt test
 echo "  ok"
 
@@ -424,6 +426,19 @@ bash "$DIR/check-standalone.sh" out '10 DIM N$(1)\n20 READ N$(0),N$(1)\n30 PRINT
 # Phase 2 runtime tier: a program with SCALAR strings + string funcs but NO DIM A$() bundles the smaller
 # "nosarr" runtime (loads at $3740, not the full $3A80) -- proving the sarr-stripped VM runs standalone.
 bash "$DIR/check-standalone.sh" out '10 A$="NOSARR":PRINT LEFT$(A$,2)+MID$(A$,3,1)' "NOS" || fail=1
+
+echo
+echo "== Phase 3 runtime tier: noint compiler (INTSUPPORT=false) + noint runtime (25 int opcodes stripped) =="
+# The noint compiler emits NO native-integer opcode -- `%` vars/literals degrade to float -- so its output
+# bundles the smaller noint runtime at $3400 (below the full $3A80 and the nosarr $3740). These prove the
+# int-stripped VM runs standalone AND that `%` programs still compute correctly (in float), that the shared
+# array helpers survive the strip (float + A%() arrays), and that string arrays still work (sarr kept).
+NIENV="GPC=build/gpc_noint.prg RT=build/vm_runtime_noint.prg RTNAME=gpc.rt.noint.bin"
+env $NIENV bash "$DIR/check-standalone.sh" out '10 A%=7:B%=3:PRINT A%+B%'                 "10" || fail=1  # % scalars -> float
+env $NIENV bash "$DIR/check-standalone.sh" out '10 S=0:FOR I%=1 TO 5:S=S+I%:NEXT:PRINT S' "15" || fail=1  # FOR I% -> float FOR
+env $NIENV bash "$DIR/check-standalone.sh" out '10 DIM A%(3):A%(1)=9:PRINT A%(1)'          "9" || fail=1  # A%() -> float array
+env $NIENV bash "$DIR/check-standalone.sh" out '10 DIM A$(2):A$(1)="OK":PRINT A$(1)'      "OK" || fail=1  # string array kept
+env $NIENV bash "$DIR/check-standalone.sh" out '10 PRINT 30000+3000'                   "33000" || fail=1  # >32767 fine in float
 
 echo
 echo "== INPUT (keyboard fed headlessly by priming the queue via kbdbuf_put) =="

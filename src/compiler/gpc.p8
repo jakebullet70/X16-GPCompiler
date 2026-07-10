@@ -47,6 +47,11 @@
 main {
     const bool TESTBENCH = true          ; headless: write a result mailbox and halt with STP
     const bool INTERACTIVE = false        ; prompt the user for the file names (real-hardware use)
+    ; INTSUPPORT=false builds the "noint" compiler: `%` integer vars/literals degrade to float and NO
+    ; native-integer opcode (67..91) is ever emitted, so its output bundles the smaller noint runtime at
+    ; a lower base. It works by rerouting the only two int SOURCES -- integer literals and `%` variables
+    ; (the tokenizer stops producing T_IVAR) -- to float; every is_intish() path is then naturally dead.
+    const bool INTSUPPORT = true          ; native 16-bit integer subsystem (A%, FOR I%, int literals)
     const uword MAILBOX = $0400
 
     ; --- source: tokenized BASIC loaded into BANKED RAM ($A000-$BFFF over banks 1..), so a program
@@ -119,6 +124,13 @@ main {
     ; NOSARR_PCODE_BASE must clear the nosarr runtime's own footprint (build.sh runtime nosarr asserts it).
     bool  uses_sarr                ; did this program DIM any string array? (true => needs the full runtime)
     const uword NOSARR_PCODE_BASE = $3740   ; nosarr footprint tops ~$360f; $3740 = +305 B margin (guard-checked)
+
+    ; --- Phase 3 runtime-tier: the native-integer subsystem (opcodes 67..91) is a removable feature. The
+    ; noint compiler (INTSUPPORT=false) never emits any of them, so its output bundles the smaller noint
+    ; runtime at NOINT_PCODE_BASE. Unlike nosarr this is NOT auto-selected per program (nearly every
+    ; program has an int literal, which the full compiler emits as OP_IPUSHI) -- it is a whole-compiler
+    ; mode. NOINT_PCODE_BASE must clear the noint runtime's footprint (build.sh runtime noint asserts it).
+    const uword NOINT_PCODE_BASE = $3400    ; noint footprint tops $32d7 (testbench); $3400 = +297 B margin
 
     ; one-shot: when set, parse_expr stops at a top-level ')' instead of erroring, leaving it
     ; for the caller to consume (used to parse an array index we've already opened with '(')
@@ -583,12 +595,21 @@ main {
         ; image while we prepend it to the P-code. The runtime has OUTGROWN a single 8 KB bank, so it
         ; must be read across banks -- a short read marks end-of-file and gives the true total length.
         ; (Reading only one bank silently truncated the bundled runtime, hanging every standalone .prg.)
-        ; Pick the runtime tier: a program that never DIMs a string array gets the smaller "nosarr"
-        ; runtime at the lower NOSARR_PCODE_BASE; a DIM A$() program gets the full runtime. If the nosarr
-        ; image isn't staged, fall back to full -- never fail a compile over a missing tier file.
+        ; Pick the runtime tier + its P-code base. The noint compiler always bundles the noint runtime;
+        ; otherwise a program that never DIMs a string array gets the smaller "nosarr" runtime and a
+        ; DIM A$() program gets the full runtime. Any missing tier image falls back to the full runtime at
+        ; the full base -- never fail a compile over a missing tier file (a noint/nosarr program still runs
+        ; correctly on the full runtime, just loaded higher).
         uword pbase = pcode.PCODE_BASE
         bool opened
-        if uses_sarr {
+        if not INTSUPPORT {
+            pbase = NOINT_PCODE_BASE
+            opened = diskio.f_open("gpc.rt.noint.bin")
+            if not opened {
+                pbase = pcode.PCODE_BASE
+                opened = diskio.f_open("gpc.runtime.bin")
+            }
+        } else if uses_sarr {
             opened = diskio.f_open("gpc.runtime.bin")
         } else {
             pbase = NOSARR_PCODE_BASE
@@ -2252,13 +2273,13 @@ main {
         repeat {
             when tok {
                 T_NUM -> {
-                    if tok_num >= 0 {                ; 0..32767: an integer literal (may combine with %)
+                    if INTSUPPORT and tok_num >= 0 {  ; 0..32767: an integer literal (may combine with %)
                         emit_byte(pcode.OP_IPUSHI)
                         emit_imm16(tok_num as uword)
                         type_push(TY_ILIT)
-                    } else {                         ; 32768..65535 (word wrapped -ve): keep a float literal
-                        emit_byte(pcode.OP_PUSHI)
-                        emit_imm16(tok_num as uword)
+                    } else {                         ; 32768..65535 wrapped -ve, or noint: a float literal.
+                        emit_byte(pcode.OP_PUSHI)    ; OP_PUSHI pushes the UNSIGNED imm word as a float,
+                        emit_imm16(tok_num as uword) ; so 0..65535 all land correctly on the float stack
                         type_push(TY_FLOAT)
                     }
                     expect_value = false
@@ -3025,7 +3046,11 @@ main {
                 }
                 sptr++
                 tokname[nlen] = 0
-                tok = T_IVAR
+                if INTSUPPORT {
+                    tok = T_IVAR
+                } else {
+                    tok = T_IDENT               ; noint build: `%` var degrades to a distinct float var
+                }                               ; (name still carries the '%', so A% stays separate from A)
                 return
             }
             tokname[nlen] = 0
