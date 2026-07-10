@@ -2950,24 +2950,33 @@ main {
                 return
             }
             tok = map_token(c)
-            ; relational operators are stored as token pairs: <= is '<' '=', etc.
+            ; Fold two-byte relational operators. CBM stores each of  <  =  >  as its own token byte
+            ; ($b3 $b2 $b1); the ROM's comparison evaluator OR-accumulates them in ANY order, so
+            ; <= and =< , >= and => , <> and >< are ALL legal. Recombine every ordering.
+            ubyte n2 = @(sptr)
             if tok == T_LT {
-                ubyte n2 = @(sptr)
-                if n2 == $b2 {
+                if n2 == $b2 {                  ; <=
                     sptr++
                     tok = T_LE
-                } else {
-                    if n2 == $b1 {
-                        sptr++
-                        tok = T_NE
-                    }
+                } else if n2 == $b1 {           ; <>
+                    sptr++
+                    tok = T_NE
                 }
-            } else {
-                if tok == T_GT {
-                    if @(sptr) == $b2 {
-                        sptr++
-                        tok = T_GE
-                    }
+            } else if tok == T_GT {
+                if n2 == $b2 {                  ; >=
+                    sptr++
+                    tok = T_GE
+                } else if n2 == $b3 {           ; ><
+                    sptr++
+                    tok = T_NE
+                }
+            } else if tok == T_EQ {
+                if n2 == $b3 {                  ; =<
+                    sptr++
+                    tok = T_LE
+                } else if n2 == $b1 {           ; =>
+                    sptr++
+                    tok = T_GE
                 }
             }
             return
@@ -2994,8 +3003,37 @@ main {
             tok = T_STRLIT
             return
         }
-        if is_digit(c) {
-            ; collect the literal; a '.' makes it a float (a second '.' ends the number)
+        if c == '$' {                           ; X16 BASIC hexadecimal literal ($FF, $A000) -> 16-bit word
+            sptr++
+            c = @(sptr)
+            word hv = 0
+            while is_hexdigit(c) {
+                hv <<= 4
+                hv |= hexval(c) as word
+                sptr++
+                c = @(sptr)
+            }
+            tok_num = hv                        ; >32767 wraps -ve; the T_NUM emit path pushes it unsigned
+            tok = T_NUM
+            return
+        }
+        if c == '%' {                           ; X16 BASIC binary literal (%1010) -> 16-bit word.
+            sptr++                              ; a leading '%' never reaches the is_alpha branch, so this
+            c = @(sptr)                         ; can't collide with the A% integer-var SUFFIX (handled there)
+            word bv = 0
+            while c == '0' or c == '1' {
+                bv <<= 1
+                if c == '1'
+                    bv |= 1
+                sptr++
+                c = @(sptr)
+            }
+            tok_num = bv
+            tok = T_NUM
+            return
+        }
+        if is_digit(c) or c == '.' {            ; decimal literal (incl. leading-dot .5) / exponent form
+            ; collect the mantissa; a '.' makes it a float (a second '.' ends the number)
             ubyte ni = 0
             bool isflt = false
             while (is_digit(c) or c == '.') and ni < 23 {
@@ -3009,20 +3047,63 @@ main {
                 sptr++
                 c = @(sptr)
             }
+            ; exponent: E/e [+/-] digits (X16 scientific notation, e.g. 9.2E5). Peek first so a bare 'E'
+            ; that isn't an exponent (followed by a non-digit) is left for the next token, not swallowed.
+            if (c == 'E' or c == 'e') and ni < 23 {
+                ubyte e1 = @(sptr + 1)
+                if is_digit(e1) or ((e1 == '+' or e1 == '-') and is_digit(@(sptr + 2))) {
+                    isflt = true
+                    numbuf[ni] = c
+                    ni++
+                    sptr++
+                    c = @(sptr)
+                    if c == '+' or c == '-' {
+                        numbuf[ni] = c
+                        ni++
+                        sptr++
+                        c = @(sptr)
+                    }
+                    while is_digit(c) and ni < 23 {
+                        numbuf[ni] = c
+                        ni++
+                        sptr++
+                        c = @(sptr)
+                    }
+                }
+            }
             numbuf[ni] = 0
             if isflt {
                 tok_fnum = floats.parse(&numbuf)
                 tok = T_FLOAT
             } else {
-                word n = 0
+                ; accumulate unsigned 16-bit; a value that overflows 16 bits (>= 65536) is a valid X16
+                ; float literal, NOT a wrap -- route it through the float parser so it isn't silently
+                ; miscompiled (e.g. 1000000 must stay 1000000, not 16960).
+                uword uv = 0
+                bool over = false
                 ubyte di = 0
+                ubyte dg = 0
                 while numbuf[di] != 0 {
-                    n *= 10
-                    n += (numbuf[di] - '0') as word
+                    if uv > 6553 {              ; uv*10 would exceed 65535
+                        over = true
+                        break
+                    }
+                    uv *= 10
+                    dg = numbuf[di] - '0'
+                    if uv > 65535 - dg {        ; uv+dg would overflow
+                        over = true
+                        break
+                    }
+                    uv += dg
                     di++
                 }
-                tok_num = n
-                tok = T_NUM
+                if over {
+                    tok_fnum = floats.parse(&numbuf)
+                    tok = T_FLOAT
+                } else {
+                    tok_num = uv as word
+                    tok = T_NUM
+                }
             }
             return
         }
@@ -3032,6 +3113,10 @@ main {
                 tokname[nlen] = c
                 nlen++
                 sptr++
+                c = @(sptr)
+            }
+            while is_alpha(c) or is_digit(c) {  ; drain an over-long name's tail (only NAMELEN-1 chars
+                sptr++                          ; are significant) so it stays ONE token, not two
                 c = @(sptr)
             }
             if c == '$' {                       ; '$' suffix -> string variable
@@ -3197,6 +3282,18 @@ main {
 
     sub is_digit(ubyte c) -> bool {
         return c >= '0' and c <= '9'
+    }
+
+    ; hex-literal helpers (X16 BASIC $-literals). cx16 PETSCII: 'A'..'F' = $41..$46, 'a'..'f' = $C1..$C6.
+    sub is_hexdigit(ubyte c) -> bool {
+        return is_digit(c) or (c >= 'A' and c <= 'F') or (c >= 'a' and c <= 'f')
+    }
+    sub hexval(ubyte c) -> ubyte {
+        if c <= '9'
+            return c - '0'
+        if c >= 'a'                             ; lowercase a-f
+            return c - 'a' + 10
+        return c - 'A' + 10                     ; uppercase A-F
     }
 
     sub is_alpha(ubyte c) -> bool {

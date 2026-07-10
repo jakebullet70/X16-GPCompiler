@@ -38,6 +38,29 @@ bash "$DIR/check-basic.sh" "10 PRINT -5+8"     0400=3            || fail=1  # un
 bash "$DIR/check-basic.sh" "10 PRINT 10*-2"    0400=ec 0401=ff || fail=1  # -20
 
 echo
+echo "== M2b: X16 BASIC literal + operator forms (lexer must accept valid X16 BASIC) =="
+# hex literals ($): common in POKE/SYS/VPOKE addresses. Values >32767 leave the mailbox 0 by design
+# (op_printi), so those are checked via printed output.
+bash "$DIR/check-basic.sh" '10 A=$FF:PRINT A'        0400=ff        || fail=1  # $FF = 255
+bash "$DIR/check-basic.sh" '10 A=$ff:PRINT A'        0400=ff        || fail=1  # lowercase hex digits
+bash "$DIR/check-out.sh"   '10 PRINT $A000'          "40960"        || fail=1  # $A000 (>32767)
+bash "$DIR/check-out.sh"   '10 PRINT $FFFF'          "65535"        || fail=1  # full 16-bit hex
+bash "$DIR/check-basic.sh" '10 POKE $033C,42:PRINT PEEK($033C)' 0400=2a || fail=1  # hex in a compiled stmt
+# binary literals (%): the leading % is a literal; A% stays the integer-var suffix
+bash "$DIR/check-basic.sh" '10 A=%1010:PRINT A'      0400=0a        || fail=1  # %1010 = 10
+bash "$DIR/check-basic.sh" '10 A=%11111111:PRINT A'  0400=ff        || fail=1  # 8-bit binary = 255
+# leading-dot floats, big decimals (>=65536 must NOT wrap), and E-exponent scientific notation
+bash "$DIR/check-out.sh"   '10 PRINT .5'             ".5"           || fail=1  # leading-dot float
+bash "$DIR/check-out.sh"   '10 PRINT 1000000'        "1000000"      || fail=1  # was silently wrapping to 16960
+bash "$DIR/check-out.sh"   '10 PRINT 9.2E5'          "920000"       || fail=1  # scientific notation
+# identifiers longer than 7 chars must not split into two tokens
+bash "$DIR/check-basic.sh" '10 COUNTER1=5:PRINT COUNTER1'  0400=05  || fail=1
+# reversed two-char relational operators (all order-independent in CBM/X16 BASIC)
+bash "$DIR/check-basic.sh" '10 IF 3=<5 THEN PRINT 7'  0400=07       || fail=1  # =<  same as <=
+bash "$DIR/check-basic.sh" '10 IF 5=>3 THEN PRINT 7'  0400=07       || fail=1  # =>  same as >=
+bash "$DIR/check-basic.sh" '10 IF 3><5 THEN PRINT 7'  0400=07       || fail=1  # ><  same as <>
+
+echo
 echo "== M3: variables + LET =="
 bash "$DIR/check-basic.sh" "10 A=5:PRINT A"            0400=5  || fail=1
 bash "$DIR/check-basic.sh" "10 A=5:B=A*2:PRINT B"      0400=0a || fail=1  # 10
