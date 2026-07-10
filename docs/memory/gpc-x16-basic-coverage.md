@@ -44,11 +44,22 @@ its value, so OP_CALLX can't carry them). Low priority — rarely hit ordinary p
 **Correctly omitted (these WORK via OP_PASSTHRU to ROM):** all FM/PSG sound, sprites, VERA bitmap
 graphics (SCREEN/LINE/RECT/...), VPOKE/TILE/VLOAD, BLOAD/BSAVE, tooling (LIST/MON/EXEC/BASLOAD/DOS).
 
-Reality check: X16FONTS.PRG (a 492-line BASLOAD font editor: renumbered 1..492, full of $hex + TAB(/SPC(/
-GET) failed on its FIRST code line before any fix. After the 7 lexer fixes + MOD/TAB/SPC/GET it compiles
-through **line 129** and then hits err_code 4 (OUT OF MEMORY) — a CAPACITY ceiling, NOT a language gap.
-Diagnosed (via the $0403 err-cat / $0404-5 err-line mailbox): it overflows the **16 KB P-code buffer
-(CODE_CAP, gpc.p8 ~line 78, "2 x 8 KB banks")**. Ruled out the other E_MEM limits: only ~25 distinct vars
-in lines 1..128 (SCRATCH_SLOT=127) and 113 total GOTO/GOSUB (MAXFIX=128 forward-refs). So the remaining
-X16FONTS work is GROWING the P-code buffer (more banked RAM), a memory-layout change in [[gpc-project]]'s
-locked-design territory — not more feature/lexer work. See [[gpc-project]] [[gpc-engine-shrink]].
+**X16FONTS.PRG campaign** (492-line BASLOAD font editor, renumbered 1..492, full of $hex + TAB(/SPC(/GET).
+Progress via the $0403 err-cat / $0404-5 err-line mailbox, one capacity/gap ceiling at a time (commit 05eeb1b):
+- line 129: **MAXLINES=128** line-number map (NOT CODE_CAP — I mis-diagnosed that first; growing CODE_CAP
+  16->32 KB did NOT move line 129). Fixed: MAXLINES 128->512 (nlines/find_line_addr index -> uword, banked
+  line-map pointers grow to 1 KB each). Also grew CODE_CAP 16->32 KB anyway (banks 7..10, NAMES_BANK 9->11).
+- line 149: **IF..THEN + an X16 keyword** was ?SYNTAX (parse_then_body had no OP_PASSTHRU else-arm like
+  parse_statement). Fixed: THEN routes unknown keyword-first stmts to pass-through; false guard still skips.
+- line ~363: **LIT_SIZE=768** string-literal pool (X16FONTS totals 828 literal bytes; cumulative crosses
+  768 at line 362). NOT yet fixed. Ruled out: ~25 vars (<127), 70 fwd-refs (<128 MAXFIX), 0 DATA.
+
+**The wall (architectural, [[gpc-project]] locked-design territory):** litpool + datapool (768 B each) live
+in the compiler's LOW RAM, which is EXHAUSTED — the self-hosted compiler leaves only ~1 KB (progend..MEMTOP
+$9F00), and that same ~1 KB IS the in-process string heap. Growing litpool shrinks that heap, which spirals
+the in-process string-GC stress tests smaller (already had to recalibrate them: 255-char ceiling + >255
+overflow moved to the STANDALONE path, in-process kept at 180 concats). Even the uword MAXLINES code cost
+~80 B of heap. So further X16FONTS progress needs the pools (and/or the in-process heap) MOVED to banked RAM
+— a moderate vm.p8 + gpc.p8 change (make in-process litbase/database access bank-aware). NOTE: this heap
+limit is an IN-PROCESS (testbench) artifact only — the interactive compiler + standalone output have the
+whole free RAM. See [[gpc-project]] [[gpc-engine-shrink]].
