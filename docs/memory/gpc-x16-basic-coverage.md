@@ -44,6 +44,11 @@ its value, so OP_CALLX can't carry them). Low priority — rarely hit ordinary p
 **Correctly omitted (these WORK via OP_PASSTHRU to ROM):** all FM/PSG sound, sprites, VERA bitmap
 graphics (SCREEN/LINE/RECT/...), VPOKE/TILE/VLOAD, BLOAD/BSAVE, tooling (LIST/MON/EXEC/BASLOAD/DOS).
 
-Reality check: X16FONTS.PRG (a 662-line BASLOAD font editor, full of $hex) failed on its FIRST code
-line (3) before the fix; after it, compiles through to line 45. It's a deep program and will surface
-more gaps — but the systematic lexer blockers are closed. See [[gpc-project]] [[gpc-engine-shrink]].
+Reality check: X16FONTS.PRG (a 492-line BASLOAD font editor: renumbered 1..492, full of $hex + TAB(/SPC(/
+GET) failed on its FIRST code line before any fix. After the 7 lexer fixes + MOD/TAB/SPC/GET it compiles
+through **line 129** and then hits err_code 4 (OUT OF MEMORY) — a CAPACITY ceiling, NOT a language gap.
+Diagnosed (via the $0403 err-cat / $0404-5 err-line mailbox): it overflows the **16 KB P-code buffer
+(CODE_CAP, gpc.p8 ~line 78, "2 x 8 KB banks")**. Ruled out the other E_MEM limits: only ~25 distinct vars
+in lines 1..128 (SCRATCH_SLOT=127) and 113 total GOTO/GOSUB (MAXFIX=128 forward-refs). So the remaining
+X16FONTS work is GROWING the P-code buffer (more banked RAM), a memory-layout change in [[gpc-project]]'s
+locked-design territory — not more feature/lexer work. See [[gpc-project]] [[gpc-engine-shrink]].
