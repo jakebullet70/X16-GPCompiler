@@ -1234,11 +1234,15 @@ _gsnoc:     ldy  p8b_vm.p8v_csp              ; callstack[csp] = pc ; csp++
             adc  P8ZP_SCRATCH_REG            ; top*5 -> X (index into for_step bytes)
             tax
             lda  p8b_vm.p8v_for_step,x       ; MFLPT exponent byte
-            beq  _fnasc                      ; 0.0 -> step >= 0 -> ascending
+            beq  _fnzero                     ; step == 0.0 -> sign(step)==0: stop only when nv == limit
             lda  p8b_vm.p8v_for_step+1,x     ; sign byte
             bpl  _fnasc                      ; positive -> ascending
             jsr  _fncmp                      ; descending: cont = nv >= limit <=> FCOMP != $ff
             cmp  #$ff
+            beq  _fnstop
+            bne  _fncont
+_fnzero:    jsr  _fncmp                      ; STEP 0: ROM loops until nv EXACTLY equals limit (FCOMP == 0)
+            cmp  #0
             beq  _fnstop
             bne  _fncont
 _fnasc:     jsr  _fncmp                      ; ascending: cont = nv <= limit <=> FCOMP != 1
@@ -1346,6 +1350,8 @@ _fncmp:     lda  P8ZP_SCRATCH_B1             ; A = FCOMP(FAC=nv, for_limit[top])
             ldy  P8ZP_SCRATCH_B1
             lda  p8b_vm.p8v_for_istep_msb,y       ; step sign -> ascending/descending
             bmi  _ifndn
+            ora  p8b_vm.p8v_for_istep_lsb,y       ; step >= 0: is it exactly 0? (msb here is 0)
+            beq  _ifnzero                         ; STEP 0 -> sign(step)==0: stop only when nv == limit
             sec                                   ; ascending: stop if limit < nv (signed)
             lda  p8b_vm.p8v_for_ilimit_lsb,y
             sbc  P8ZP_SCRATCH_W1
@@ -1355,6 +1361,13 @@ _fncmp:     lda  P8ZP_SCRATCH_B1             ; A = FCOMP(FAC=nv, for_limit[top])
             eor  #$80
 +           bmi  _ifnstop                         ; limit<nv -> nv>limit -> stop
             bpl  _ifncont
+_ifnzero:   lda  P8ZP_SCRATCH_W1                  ; STEP 0: loop until nv EXACTLY equals limit
+            cmp  p8b_vm.p8v_for_ilimit_lsb,y
+            bne  _ifncont
+            lda  P8ZP_SCRATCH_W1+1
+            cmp  p8b_vm.p8v_for_ilimit_msb,y
+            bne  _ifncont
+            beq  _ifnstop
 _ifndn:     sec                                   ; descending: stop if nv < limit (signed)
             lda  P8ZP_SCRATCH_W1
             sbc  p8b_vm.p8v_for_ilimit_lsb,y
