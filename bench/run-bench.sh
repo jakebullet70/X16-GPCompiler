@@ -19,7 +19,18 @@ C9='9000 POKE 0,0:TE=PEEK(43189)*256+PEEK(43190):POKE 0,BK:PRINT "R=";TE-TS'
 FS="$(mktemp -d)"; trap 'rm -rf "$FS"' EXIT
 cp build/vm_runtime.prg "$FS/gpc.runtime.bin"; cp build/vm_runtime_nosarr.prg "$FS/gpc.rt.nosarr.bin"
 
-run_prg(){ timeout 40 "$X16EMU" -echo raw -run -prg "$1" 2>&1 | tr -d '\r' | grep -aoE 'R= *[0-9]+' | head -1 | grep -oE '[0-9]+'; }
+# Capture the "R=<jiffies>" the program PRINTs. NOTE: x16emu's non-warp `-echo raw` echoes every VM-printed
+# char TWICE (a host-echo artifact -- "R=206" arrives as "RR==220066"; the boot banner is not doubled). The
+# plain grep below fails on that, so we fall back to de-doubling: take every 2nd char of the doubled digit
+# run after the doubled "RR==". (See docs/memory x16emu-echo-doubling.) Works whether or not doubling occurs.
+run_prg(){
+  local raw n d
+  raw="$(timeout 40 "$X16EMU" -echo raw -run -prg "$1" 2>&1 | tr -d '\r')"
+  n="$(printf '%s' "$raw" | grep -aoE 'R= *[0-9]+' | head -1 | grep -oE '[0-9]+')"
+  if [ -n "$n" ]; then printf '%s\n' "$n"; return; fi
+  d="$(printf '%s' "$raw" | sed 's/.*RR==//' | grep -aoE '^[0-9]+' | head -1)"
+  [ -n "$d" ] && awk -v x="$d" 'BEGIN{o="";for(i=1;i<=length(x);i+=2)o=o substr(x,i,1);print o}'
+}
 compile(){ python scripts/tokenize.py < "$1" > "$FS/source.prg"; rm -f "$FS/out.prg"; printf 'RUN %s\n' "$CE" | timeout 60 "$X16EMU" -testbench -warp -fsroot "$FS" -prg "$GPC" >/dev/null 2>&1 || true; [ -s "$FS/out.prg" ]; }
 
 printf '%-16s %10s %10s %9s %8s %8s\n' BENCHMARK UNCOMP_j COMP_j SPEEDUP UNC_sec CMP_sec

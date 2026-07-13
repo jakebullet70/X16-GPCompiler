@@ -62,8 +62,12 @@ vm {
     ; the VM keeps no private string heap and runs no collector of its own.
     ; --- interpreter dispatch state (module-level so the hand-asm jump-table loop in run() and the
     ;     per-opcode handler subs share them) ---
-    uword      pcbase            ; base address of the P-code blob
-    uword      pc                ; program counter: offset into the blob
+    uword      pcbase            ; base address of the P-code blob (kept for branch-target resolution)
+    uword @requirezp ip          ; instruction pointer: a LIVE zero-page pointer AT the current P-code byte
+                                 ; (O1: replaces the old pcbase+pc offset pair, killing the per-fetch and
+                                 ;  per-operand ~24-cyc `pcbase+pc` recompute -- fetch is now `lda (ip)`).
+    uword      ipsave            ; BSS shadow of ip, saved/restored around handlers that invoke ARBITRARY
+                                 ; ROM/ML code which may clobber zero page: SYS, OP_PASSTHRU, OP_CALLX(S).
     bool       halt              ; a handler sets this to end run() (OP_END / a fatal string error)
 
     uword[16]  sstack            ; string-value stack (holds descriptor addresses)
@@ -140,7 +144,7 @@ vm {
 
     sub run(uword base) {
         pcbase = base
-        pc = 0
+        ip = base                        ; live zp instruction pointer starts at the first P-code byte
         halt = false
         sp = 0
         csp = 0
@@ -180,35 +184,25 @@ vm {
         dataptr = database               ; READ starts at the first DATA item
         %asm {{
 _next:
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)         ; A = opcode at pcbase+pc
-            inc  p8b_vm.p8v_pc             ; pc++ (16-bit)
+            lda  (p8b_vm.p8v_ip)           ; A = opcode at ip  (O1: no more pcbase+pc recompute)
+            inc  p8b_vm.p8v_ip             ; ip++ (16-bit) past the opcode -> now points at its operand
             bne  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +
-            cmp  #95                       ; opcodes 0..94 valid; >=95 unknown -> ignore (when no-match)
-            bcs  _next
             asl  a                         ; *2 for the word table (0..94 -> 0..188)
-            tax
-            ; RTS-dispatch: push _after-1 so each handler's own final rts returns to _after.
-            ; This lets _optab point STRAIGHT at the handlers -- no per-opcode "jsr h / jmp
-            ; _after" trampoline (was ~89*6 bytes). The 3 inline ops (_t0/_t1/_t2) jmp instead
-            ; of rts, so they pull the pushed address off first.
-            lda  #>(_after-1)
-            pha
-            lda  #<(_after-1)
-            pha
-            jmp  (_optab,x)
+            tax                            ; (O2: the opcode bounds check is gone -- the compiler only
+                                           ;  ever emits opcodes 0..94, so >=95 can never occur)
+            ; O2 JSR-dispatch: `jsr _disp` (6 cyc) replaces the old 4-instruction RTS-cookie push
+            ; (10 cyc). _disp jmps to the handler; each handler's own final rts returns HERE (to the
+            ; halt test _after), so _optab still points STRAIGHT at the handlers and asm + prog8-sub
+            ; handlers alike keep a uniform plain rts -- no per-handler edit. The 3 inline ops
+            ; (_t0/_t1/_t2) jmp instead of rts, so they pull the pushed return address off first.
+            jsr  _disp
 _after:
             lda  p8b_vm.p8v_halt
             beq  _next
             jmp  _end
+_disp:      jmp  (_optab,x)                ; the JSR trampoline (65C02 has no "jsr (indirect)")
 _optab:
             ; opcodes 0/1/2 stay inline (jmp, not rts); 3..91 point straight at their handler subs
             .word _t0, _t1, _t2
@@ -231,7 +225,7 @@ _t0:                                    ; OP_END -> leave the interpreter loop
             pla                          ; drop the RTS-dispatch return addr (we jmp, not rts)
             pla
             jmp  _end
-_t1:                                    ; OP_JMP -> pc = target word at pcbase+pc
+_t1:                                    ; OP_JMP -> ip = pcbase + target-offset at ip
             pla
             pla
             jmp  _setpc
@@ -247,77 +241,58 @@ _t2:                                    ; OP_JZ -> sp--; if stack[sp]==0.0 take 
             tax
             lda  p8b_vm.p8v_stack,x     ; MFLPT exponent byte: $00 iff the value is 0.0
             beq  _setpc                 ; zero -> branch taken
-            lda  p8b_vm.p8v_pc          ; nonzero -> skip the 2-byte target operand
+            lda  p8b_vm.p8v_ip          ; nonzero -> skip the 2-byte target operand (ip += 2)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  _jzdone
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 _jzdone:
             jmp  _next
-_setpc:                                 ; pc = word at pcbase+pc  (shared by JMP and JZ-taken)
-            lda  p8b_vm.p8v_pcbase
+_setpc:                                 ; ip = pcbase + target-offset at ip  (shared by JMP and JZ-taken)
+            lda  (p8b_vm.p8v_ip)        ; target offset lo
             clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
+            adc  p8b_vm.p8v_pcbase
+            pha                         ; stash new ip lo (read BOTH operand bytes before overwriting ip)
             ldy  #1
-            lda  (P8ZP_SCRATCH_W1),y    ; target hi
-            pha
-            dey
-            lda  (P8ZP_SCRATCH_W1),y    ; target lo
-            sta  p8b_vm.p8v_pc
+            lda  (p8b_vm.p8v_ip),y      ; target offset hi
+            adc  p8b_vm.p8v_pcbase+1
+            sta  p8b_vm.p8v_ip+1        ; new ip hi
             pla
-            sta  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_ip          ; new ip lo
             jmp  _next
 _end:
         }}
     }
 
     ; OP_END / OP_JMP / OP_JZ (opcodes 0/1/2) are handled inline in run()'s asm dispatch
-    ; (_t0/_t1/_t2): END exits the loop, JMP/JZ set pc directly, JZ tests the MFLPT exponent
+    ; (_t0/_t1/_t2): END exits the loop, JMP/JZ set ip directly, JZ tests the MFLPT exponent
     ; byte instead of a ROM float-compare. No Prog8 handler subs are needed for them.
     asmsub op_pushi() {                      ; stack[sp] = (unsigned imm word) as float
         %asm {{
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)           ; imm lo
+            lda  (p8b_vm.p8v_ip)             ; imm lo
             pha
             ldy  #1
-            lda  (P8ZP_SCRATCH_W1),y         ; imm hi
+            lda  (p8b_vm.p8v_ip),y           ; imm hi
             tay
             pla                              ; A = lo, Y = hi
             jsr  floats.GIVUAYFAY            ; FAC = unsigned(A/Y) as float
             lda  p8b_vm.p8v_sp
             jsr  p8b_vm.p8s_faddr
             jsr  $fe66                       ; MOVMF  stack[sp] = FAC
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip               ; ip += 2 (past the imm16 operand)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           inc  p8b_vm.p8v_sp
             rts
         }}
     }
     asmsub op_loadv() {                      ; stack[sp] = var[slot]  (var = varsf + slot*5)
         %asm {{
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)           ; slot
+            lda  (p8b_vm.p8v_ip)             ; slot
             ldy  #0
             jsr  prog8_math.mul_word_5       ; A=lo, Y=hi of slot*5
             clc
@@ -332,12 +307,12 @@ _end:
             lda  p8b_vm.p8v_sp
             jsr  p8b_vm.p8s_faddr
             jsr  $fe66                       ; MOVMF  stack[sp] = FAC
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip               ; ip += 2 (past the imm16 slot operand)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           inc  p8b_vm.p8v_sp
             rts
         }}
@@ -345,14 +320,7 @@ _end:
     asmsub op_storv() {                      ; var[slot] = stack[sp]; sp--
         %asm {{
             dec  p8b_vm.p8v_sp
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)           ; slot
+            lda  (p8b_vm.p8v_ip)             ; slot
             ldy  #0
             jsr  prog8_math.mul_word_5
             clc
@@ -368,12 +336,12 @@ _end:
             ldx  P8ZP_SCRATCH_W2
             ldy  P8ZP_SCRATCH_W2+1
             jsr  $fe66                       ; MOVMF  var = FAC
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip               ; ip += 2 (past the imm16 slot operand)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           rts
         }}
     }
@@ -415,29 +383,26 @@ _end:
             rts
         }}
     }
-    ; P8ZP_SCRATCH_W1 = &operand = pcbase + pc.  The string handlers read their imm operand bytes
+    ; P8ZP_SCRATCH_W1 = &operand = ip.  The string handlers read their imm operand bytes
     ; via `lda (P8ZP_SCRATCH_W1)` / `ldy #n : lda (P8ZP_SCRATCH_W1),y` right after calling this --
     ; before any bstr/helper call, which may reuse W1.  Leaves X and Y untouched.
     asmsub opw() {
         %asm {{
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip
             sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
+            lda  p8b_vm.p8v_ip+1
             sta  P8ZP_SCRATCH_W1+1
             rts
         }}
     }
-    ; pc += A -- advance the program counter past the consumed operand bytes. Clobbers A.
+    ; ip += A -- advance the instruction pointer past the consumed operand bytes. Clobbers A.
     asmsub pcadd(ubyte n @A) {
         %asm {{
             clc
-            adc  p8b_vm.p8v_pc
-            sta  p8b_vm.p8v_pc
+            adc  p8b_vm.p8v_ip
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           rts
         }}
     }
@@ -657,39 +622,25 @@ _end:
     ;     Arithmetic wraps at 16 bits (the `%` opt-in). Coercion ops bridge to/from float. ---
     asmsub op_ipushi() {
         %asm {{
-            lda  p8b_vm.p8v_pcbase                ; W1 = pcbase + pc
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
             ldx  p8b_vm.p8v_sp
-            lda  (P8ZP_SCRATCH_W1)                ; imm lo
+            lda  (p8b_vm.p8v_ip)                  ; imm lo
             sta  p8b_vm.p8v_istack_lsb,x
             ldy  #1
-            lda  (P8ZP_SCRATCH_W1),y              ; imm hi
+            lda  (p8b_vm.p8v_ip),y                ; imm hi
             sta  p8b_vm.p8v_istack_msb,x
-            lda  p8b_vm.p8v_pc                    ; pc += 2
+            lda  p8b_vm.p8v_ip                    ; ip += 2
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           inc  p8b_vm.p8v_sp                    ; sp++
             rts
         }}
     }
     asmsub op_iloadv() {
         %asm {{
-            lda  p8b_vm.p8v_pcbase                ; W1 = pcbase + pc
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)                ; slot byte
+            lda  (p8b_vm.p8v_ip)                  ; slot byte
             ldy  #0                               ; W2 = ivarsf + slot*2
             asl  a
             bcc  +
@@ -706,12 +657,12 @@ _end:
             ldy  #1
             lda  (P8ZP_SCRATCH_W2),y              ; var hi
             sta  p8b_vm.p8v_istack_msb,x
-            lda  p8b_vm.p8v_pc                    ; pc += 2
+            lda  p8b_vm.p8v_ip                    ; ip += 2
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           inc  p8b_vm.p8v_sp                    ; sp++
             rts
         }}
@@ -719,14 +670,7 @@ _end:
     asmsub op_istorv() {
         %asm {{
             dec  p8b_vm.p8v_sp
-            lda  p8b_vm.p8v_pcbase                ; W1 = pcbase + pc
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)                ; slot byte
+            lda  (p8b_vm.p8v_ip)                  ; slot byte
             ldy  #0                               ; W2 = ivarsf + slot*2
             asl  a
             bcc  +
@@ -743,12 +687,12 @@ _end:
             lda  p8b_vm.p8v_istack_msb,x
             ldy  #1
             sta  (P8ZP_SCRATCH_W2),y
-            lda  p8b_vm.p8v_pc                    ; pc += 2
+            lda  p8b_vm.p8v_ip                    ; ip += 2
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           rts
         }}
     }
@@ -983,27 +927,23 @@ _ges:       sta  p8b_vm.p8v_istack_lsb-1,x
             lda  p8b_vm.p8v_istack_lsb,x
             ora  p8b_vm.p8v_istack_msb,x
             bne  _ijznt                           ; nonzero -> fall through, skip the 2-byte target
-            lda  p8b_vm.p8v_pcbase                ; zero -> pc = target word (LE at pcbase+pc)
+            lda  (p8b_vm.p8v_ip)                  ; zero -> ip = pcbase + target-offset at ip
             clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
+            adc  p8b_vm.p8v_pcbase
+            pha                                   ; stash new ip lo (read both operand bytes first)
             ldy  #1
-            lda  (P8ZP_SCRATCH_W1),y              ; target hi
-            pha
-            lda  (P8ZP_SCRATCH_W1)                ; target lo
-            sta  p8b_vm.p8v_pc
+            lda  (p8b_vm.p8v_ip),y                ; target offset hi
+            adc  p8b_vm.p8v_pcbase+1
+            sta  p8b_vm.p8v_ip+1
             pla
-            sta  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_ip
             rts
-_ijznt:     lda  p8b_vm.p8v_pc                    ; pc += 2
+_ijznt:     lda  p8b_vm.p8v_ip                    ; ip += 2
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           rts
         }}
     }
@@ -1080,68 +1020,56 @@ _ijznt:     lda  p8b_vm.p8v_pc                    ; pc += 2
     sub op_newline() {
                     emit_char(13)                         ; CR to screen, LF to host console
                 }
-    asmsub op_gosub() {                      ; push return addr, jump to the little-endian word operand
+    asmsub op_gosub() {                      ; push return addr (absolute ip), jump to the operand target-offset
         %asm {{
-            lda  p8b_vm.p8v_pcbase           ; W1 = pcbase + pc  (points at the 2-byte target operand)
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            ldy  #0                           ; target (lo,hi) -> W2
-            lda  (P8ZP_SCRATCH_W1),y
+            lda  (p8b_vm.p8v_ip)             ; target offset (lo,hi) -> W2
             sta  P8ZP_SCRATCH_W2
-            iny
-            lda  (P8ZP_SCRATCH_W1),y
+            ldy  #1
+            lda  (p8b_vm.p8v_ip),y
             sta  P8ZP_SCRATCH_W2+1
-            lda  p8b_vm.p8v_pc               ; pc += 2  (return address = byte after the operand)
+            lda  p8b_vm.p8v_ip              ; ip += 2  (return address = byte after the operand)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  _gsnoc
-            inc  p8b_vm.p8v_pc+1
-_gsnoc:     ldy  p8b_vm.p8v_csp              ; callstack[csp] = pc ; csp++
-            lda  p8b_vm.p8v_pc
+            inc  p8b_vm.p8v_ip+1
+_gsnoc:     ldy  p8b_vm.p8v_csp              ; callstack[csp] = ip (absolute) ; csp++
+            lda  p8b_vm.p8v_ip
             sta  p8b_vm.p8v_callstack_lsb,y
-            lda  p8b_vm.p8v_pc+1
+            lda  p8b_vm.p8v_ip+1
             sta  p8b_vm.p8v_callstack_msb,y
             inc  p8b_vm.p8v_csp
-            lda  P8ZP_SCRATCH_W2             ; pc = target
-            sta  p8b_vm.p8v_pc
+            lda  P8ZP_SCRATCH_W2             ; ip = pcbase + target-offset
+            clc
+            adc  p8b_vm.p8v_pcbase
+            sta  p8b_vm.p8v_ip
             lda  P8ZP_SCRATCH_W2+1
-            sta  p8b_vm.p8v_pc+1
+            adc  p8b_vm.p8v_pcbase+1
+            sta  p8b_vm.p8v_ip+1
             rts
         }}
     }
-    asmsub op_ret() {                        ; pop return addr off the GOSUB callstack
+    asmsub op_ret() {                        ; pop return addr (absolute ip) off the GOSUB callstack
         %asm {{
             dec  p8b_vm.p8v_csp
             ldy  p8b_vm.p8v_csp
             lda  p8b_vm.p8v_callstack_lsb,y
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             lda  p8b_vm.p8v_callstack_msb,y
-            sta  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_ip+1
             rts
         }}
     }
     asmsub op_forpush() {                    ; FOR var=start TO limit STEP step -- open a float loop frame
         %asm {{
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)           ; slot
+            lda  (p8b_vm.p8v_ip)             ; slot
             pha
-            lda  p8b_vm.p8v_pc               ; pc += 2 (body start)
+            lda  p8b_vm.p8v_ip               ; ip += 2 (body start)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           dec  p8b_vm.p8v_sp               ; sp -= 2 : limit at [sp], step at [sp+1]
             dec  p8b_vm.p8v_sp
             ldy  p8b_vm.p8v_forsp
@@ -1183,10 +1111,10 @@ _gsnoc:     ldy  p8b_vm.p8v_csp              ; callstack[csp] = pc ; csp++
             adc  #0
             tay
             jsr  $fe66                       ; MOVMF  for_step[forsp] = FAC
-            ldy  p8b_vm.p8v_forsp            ; for_top[forsp] = pc
-            lda  p8b_vm.p8v_pc
+            ldy  p8b_vm.p8v_forsp            ; for_top[forsp] = ip (absolute)
+            lda  p8b_vm.p8v_ip
             sta  p8b_vm.p8v_for_top_lsb,y
-            lda  p8b_vm.p8v_pc+1
+            lda  p8b_vm.p8v_ip+1
             sta  p8b_vm.p8v_for_top_msb,y
             inc  p8b_vm.p8v_forsp
             rts
@@ -1248,11 +1176,11 @@ _fnzero:    jsr  _fncmp                      ; STEP 0: ROM loops until nv EXACTL
 _fnasc:     jsr  _fncmp                      ; ascending: cont = nv <= limit <=> FCOMP != 1
             cmp  #1
             beq  _fnstop
-_fncont:    ldy  P8ZP_SCRATCH_B1             ; continue: pc = for_top[top]
+_fncont:    ldy  P8ZP_SCRATCH_B1             ; continue: ip = for_top[top] (absolute)
             lda  p8b_vm.p8v_for_top_lsb,y
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             lda  p8b_vm.p8v_for_top_msb,y
-            sta  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_ip+1
             rts
 _fnstop:    dec  p8b_vm.p8v_forsp            ; loop finished; pop the frame
             rts
@@ -1274,21 +1202,14 @@ _fncmp:     lda  P8ZP_SCRATCH_B1             ; A = FCOMP(FAC=nv, for_limit[top])
     }
     asmsub op_iforpush() {                        ; FOR I%=start TO limit STEP step -- open an integer frame
         %asm {{
-            lda  p8b_vm.p8v_pcbase                ; slot = @(pcbase+pc)
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)
+            lda  (p8b_vm.p8v_ip)                  ; slot = @(ip)
             pha                                   ; save slot
-            lda  p8b_vm.p8v_pc                    ; pc += 2 (body starts here)
+            lda  p8b_vm.p8v_ip                    ; ip += 2 (body starts here)
             clc
             adc  #2
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           dec  p8b_vm.p8v_sp                    ; sp-- (step index) ; sp-- (limit index)
             dec  p8b_vm.p8v_sp
             ldy  p8b_vm.p8v_forsp
@@ -1304,9 +1225,9 @@ _fncmp:     lda  P8ZP_SCRATCH_B1             ; A = FCOMP(FAC=nv, for_limit[top])
             sta  p8b_vm.p8v_for_istep_lsb,y
             lda  p8b_vm.p8v_istack_msb,x
             sta  p8b_vm.p8v_for_istep_msb,y
-            lda  p8b_vm.p8v_pc                    ; for_top[forsp] = pc
+            lda  p8b_vm.p8v_ip                    ; for_top[forsp] = ip (absolute)
             sta  p8b_vm.p8v_for_top_lsb,y
-            lda  p8b_vm.p8v_pc+1
+            lda  p8b_vm.p8v_ip+1
             sta  p8b_vm.p8v_for_top_msb,y
             inc  p8b_vm.p8v_forsp
             rts
@@ -1376,11 +1297,11 @@ _ifndn:     sec                                   ; descending: stop if nv < lim
             bvc  +
             eor  #$80
 +           bmi  _ifnstop                         ; nv<limit -> stop
-_ifncont:   ldy  P8ZP_SCRATCH_B1                  ; continue: pc = for_top[top]
+_ifncont:   ldy  P8ZP_SCRATCH_B1                  ; continue: ip = for_top[top] (absolute)
             lda  p8b_vm.p8v_for_top_lsb,y
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             lda  p8b_vm.p8v_for_top_msb,y
-            sta  p8b_vm.p8v_pc+1
+            sta  p8b_vm.p8v_ip+1
             rts
 _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
             rts
@@ -1391,7 +1312,7 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
         ; bodies are off-heap (program text) -> a scratch descriptor over them, which the collector
         ; ignores (never rooted, never moved), so the same P-code works in-process and standalone.
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; lo = operand[0]
             clc
             adc  p8b_vm.p8v_litbase
@@ -1403,12 +1324,12 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
             pla                                 ; A = lo
             jsr  p8b_vm.p8s_push_cstr           ; push_cstr(litbase + le16)
             lda  #2
-            jmp  p8b_vm.p8s_pcadd               ; pc += 2
+            jmp  p8b_vm.p8s_pcadd               ; ip += 2
         }}
     }
     asmsub op_loads() {                     ; push the variable's descriptor address
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             jsr  p8b_bstr.p8s_vdesc             ; A=lo, Y=hi of the var's descriptor
             ldx  p8b_vm.p8v_ssp
@@ -1423,7 +1344,7 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
     asmsub op_stors() {                     ; heap-copy / steal-temp assignment into a string var
         %asm {{
             dec  p8b_vm.p8v_ssp
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             sta  p8b_bstr.p8s_store_var.p8v_slot
             ldx  p8b_vm.p8v_ssp
@@ -1505,13 +1426,22 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
             sta  p8b_vm.p8v_sys_target
             lda  P8ZP_SCRATCH_W1+1
             sta  p8b_vm.p8v_sys_target+1
-            jmp  (p8b_vm.p8v_sys_target)       ; JSR-trick: target's rts returns to op_sys's caller
+            lda  p8b_vm.p8v_ip                 ; ip lives in zp; an arbitrary SYS ML routine may clobber
+            sta  p8b_vm.p8v_ipsave             ; zero page, so stash ip in BSS and restore after it returns
+            lda  p8b_vm.p8v_ip+1
+            sta  p8b_vm.p8v_ipsave+1
+            jsr  p8b_vm.p8s_sys_call           ; indirect JSR to target; its rts returns HERE (not to _after)
+            lda  p8b_vm.p8v_ipsave
+            sta  p8b_vm.p8v_ip
+            lda  p8b_vm.p8v_ipsave+1
+            sta  p8b_vm.p8v_ip+1
+            rts
         }}
     }
     sub op_dim() {                        ; DIM A(d0[,d1..]): allocate a numeric array
-                    ubyte adslot = @(pcbase + pc)          ; imm16 slot (low byte; slot < 256)
-                    ubyte adnd = @(pcbase + pc + 2)        ; ndims byte follows the 2-byte slot
-                    pc += 3
+                    ubyte adslot = @(ip)                   ; imm16 slot (low byte; slot < 256)
+                    ubyte adnd = @(ip + 2)                 ; ndims byte follows the 2-byte slot
+                    ip += 3
                     uword adtot = dim_setup(arr_dims, adslot, adnd, ARRHEAP_SIZE / 5)
                     if adtot != 0 and arr_top + adtot * 5 <= ARRHEAP_SIZE {
                         arr_base[adslot] = arr_top
@@ -1529,25 +1459,18 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
                 }
     asmsub op_aload() {                   ; A(i[,j..]): push element; 0.0 if any subscript out of range
         %asm {{
-            ; --- operands: slot @ pcbase+pc (low byte), nd @ pcbase+pc+2 ; then pc += 3 ---
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)               ; slot
+            ; --- operands: slot @ ip (low byte), nd @ ip+2 ; then ip += 3 ---
+            lda  (p8b_vm.p8v_ip)                 ; slot
             sta  p8b_vm.p8s_index_of.p8v_slot
             ldy  #2
-            lda  (P8ZP_SCRATCH_W1),y             ; nd
+            lda  (p8b_vm.p8v_ip),y               ; nd
             sta  p8b_vm.p8s_index_of.p8v_nd
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip
             clc
             adc  #3
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           ; --- aloff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
             lda  p8b_vm.p8v_arr_dims            ; index_of reads (never writes) slot/nd, so the
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr   ; param slots double as our slot/nd storage after the call
@@ -1615,25 +1538,18 @@ _aldone:    inc  p8b_vm.p8v_sp
     }
     asmsub op_astore() {                  ; A(i[,j..]) = v: store element; dropped if any subscript out of range
         %asm {{
-            ; --- operands: slot, nd ; pc += 3 ---
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)
+            ; --- operands: slot, nd ; ip += 3 ---
+            lda  (p8b_vm.p8v_ip)
             sta  p8b_vm.p8s_index_of.p8v_slot
             ldy  #2
-            lda  (P8ZP_SCRATCH_W1),y
+            lda  (p8b_vm.p8v_ip),y
             sta  p8b_vm.p8s_index_of.p8v_nd
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip
             clc
             adc  #3
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           dec  p8b_vm.p8v_sp                  ; sp-- : value now at stack[sp], subscripts below it
             ; --- asoff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
             lda  p8b_vm.p8v_arr_dims
@@ -1691,9 +1607,9 @@ _asdone:    rts
         }}
     }
     sub op_idim() {                       ; DIM A%(d0[,d1..]): allocate an integer array (2 bytes/element)
-                    ubyte idslot = @(pcbase + pc)
-                    ubyte idnd = @(pcbase + pc + 2)
-                    pc += 3
+                    ubyte idslot = @(ip)
+                    ubyte idnd = @(ip + 2)
+                    ip += 3
                     uword idtot = dim_setup(iarr_dims, idslot, idnd, IARRHEAP_SIZE / 2)
                     if idtot != 0 and iarr_top + idtot * 2 <= IARRHEAP_SIZE {
                         iarr_base[idslot] = iarr_top
@@ -1707,24 +1623,17 @@ _asdone:    rts
                 }
     asmsub op_iaload() {                  ; A%(i[,j..]): push int element; 0 if any subscript out of range
         %asm {{
-            lda  p8b_vm.p8v_pcbase              ; --- operands slot@pc, nd@pc+2 ; pc += 3 ---
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)
+            lda  (p8b_vm.p8v_ip)                ; --- operands slot@ip, nd@ip+2 ; ip += 3 ---
             sta  p8b_vm.p8s_index_of.p8v_slot
             ldy  #2
-            lda  (P8ZP_SCRATCH_W1),y
+            lda  (p8b_vm.p8v_ip),y
             sta  p8b_vm.p8s_index_of.p8v_nd
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip
             clc
             adc  #3
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           lda  p8b_vm.p8v_iarr_dims           ; iloff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
             lda  p8b_vm.p8v_iarr_dims+1
@@ -1788,24 +1697,17 @@ _ildone:    inc  p8b_vm.p8v_sp
     }
     asmsub op_iastore() {                 ; A%(i[,j..]) = v: store int element; dropped if out of range
         %asm {{
-            lda  p8b_vm.p8v_pcbase              ; --- operands slot@pc, nd@pc+2 ; pc += 3 ---
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)
+            lda  (p8b_vm.p8v_ip)                ; --- operands slot@ip, nd@ip+2 ; ip += 3 ---
             sta  p8b_vm.p8s_index_of.p8v_slot
             ldy  #2
-            lda  (P8ZP_SCRATCH_W1),y
+            lda  (p8b_vm.p8v_ip),y
             sta  p8b_vm.p8s_index_of.p8v_nd
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip
             clc
             adc  #3
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           dec  p8b_vm.p8v_sp                  ; sp-- : value at istack[sp], subscripts below it
             lda  p8b_vm.p8v_iarr_dims           ; isoff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
@@ -1864,19 +1766,19 @@ _isdone:    rts
         }}
     }
     sub op_inputv() {
-                    ubyte ivslot = @(pcbase + pc)
-                    pc += 2
+                    ubyte ivslot = @(ip)
+                    ip += 2
                     read_line()
                     pokef(varsf + (ivslot as uword) * 5, floats.parse(&inbuf))
                 }
     asmsub op_inputs() {
         ; slot parked in shtmp across read_line (which must not see var_from_mem's params set yet).
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             sta  p8b_vm.p8v_shtmp
             lda  #2
-            jsr  p8b_vm.p8s_pcadd               ; pc += 2
+            jsr  p8b_vm.p8s_pcadd               ; ip += 2
             jsr  p8b_vm.p8s_read_line           ; read one line into inbuf
             lda  p8b_vm.p8v_shtmp
             sta  p8b_bstr.p8s_var_from_mem.p8v_slot
@@ -1891,45 +1793,31 @@ _isdone:    rts
             jmp  p8b_bstr.p8s_var_from_mem      ; heap-copy into the var
         }}
     }
-    asmsub op_pushf() {                      ; stack[sp] = 5-byte float immediate at pcbase+pc
+    asmsub op_pushf() {                      ; stack[sp] = 5-byte float immediate at ip
         %asm {{
-            lda  p8b_vm.p8v_pcbase
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  P8ZP_SCRATCH_W1
-            ldy  P8ZP_SCRATCH_W1+1
-            jsr  $fe63                       ; MOVFM  FAC = immediate float
+            lda  p8b_vm.p8v_ip
+            ldy  p8b_vm.p8v_ip+1
+            jsr  $fe63                       ; MOVFM  FAC = immediate float (source ptr = ip)
             lda  p8b_vm.p8v_sp
             jsr  p8b_vm.p8s_faddr
             jsr  $fe66                       ; MOVMF  stack[sp] = FAC
-            lda  p8b_vm.p8v_pc
+            lda  p8b_vm.p8v_ip               ; ip += 5 (past the 5-byte float immediate)
             clc
             adc  #5
-            sta  p8b_vm.p8v_pc
+            sta  p8b_vm.p8v_ip
             bcc  +
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 +           inc  p8b_vm.p8v_sp
             rts
         }}
     }
     asmsub op_callfn() {                     ; stack[sp-1] = FN(stack[sp-1]) -- dispatch fnid to a ROM float fn
         %asm {{
-            lda  p8b_vm.p8v_pcbase           ; fnid = @(pcbase+pc)
-            clc
-            adc  p8b_vm.p8v_pc
-            sta  P8ZP_SCRATCH_W1
-            lda  p8b_vm.p8v_pcbase+1
-            adc  p8b_vm.p8v_pc+1
-            sta  P8ZP_SCRATCH_W1+1
-            lda  (P8ZP_SCRATCH_W1)
+            lda  (p8b_vm.p8v_ip)             ; fnid = @(ip)
             pha                              ; stash fnid
-            inc  p8b_vm.p8v_pc               ; pc++
+            inc  p8b_vm.p8v_ip               ; ip++
             bne  _cfnopc
-            inc  p8b_vm.p8v_pc+1
+            inc  p8b_vm.p8v_ip+1
 _cfnopc:    lda  p8b_vm.p8v_sp               ; FAC = stack[sp-1]  (the argument)
             dec  a
             jsr  p8b_vm.p8s_faddr
@@ -1965,11 +1853,11 @@ _cffnhi:    .byte >$fe84, >$fe2d, >$fe4e, >$fe30, >$fe57, >$fe42, >$fe3f, >$fe45
         ; snd stays valid at sstack[ssp] (ssp is fixed after the single dec), so it's re-read for the
         ; trailing free_temp; we park it in shtmp only to survive the dlen/dptr/to_cbuf/parse calls.
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; snid
             pha
             lda  #1
-            jsr  p8b_vm.p8s_pcadd               ; pc++
+            jsr  p8b_vm.p8s_pcadd               ; ip++
             dec  p8b_vm.p8v_ssp
             ldx  p8b_vm.p8v_ssp                 ; snd = sstack[ssp]
             lda  p8b_vm.p8v_sstack_lsb,x
@@ -2017,11 +1905,11 @@ _snstore:   lda  p8b_vm.p8v_sp
     }
     asmsub op_numstr() {                  ; CHR$/STR$: pop number, push a string temp
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; nsid
             pha
             lda  #1
-            jsr  p8b_vm.p8s_pcadd               ; pc++
+            jsr  p8b_vm.p8s_pcadd               ; ip++
             dec  p8b_vm.p8v_sp
             pla                                 ; A = nsid
             beq  _nschr                         ; NS_CHR (0)
@@ -2175,17 +2063,17 @@ _mdset:     sta  p8b_bstr.p8s_substr_temp.p8v_start
         }}
     }
     sub op_read() {                       ; READ into a numeric var: parse the item
-                    ubyte rdslot = @(pcbase + pc)
-                    pc += 2
+                    ubyte rdslot = @(ip)
+                    ip += 2
                     pokef(varsf + (rdslot as uword) * 5, floats.parse(data_next()))
                 }
     asmsub op_reads() {                   ; READ into a string var: heap-copy the item
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             pha
             lda  #2
-            jsr  p8b_vm.p8s_pcadd               ; pc += 2
+            jsr  p8b_vm.p8s_pcadd               ; ip += 2
             jsr  p8b_vm.p8s_data_next           ; A=lo, Y=hi -> DATA-pool text (stable)
             sta  p8b_bstr.p8s_var_from_mem.p8v_src
             sty  p8b_bstr.p8s_var_from_mem.p8v_src+1
@@ -2202,14 +2090,14 @@ _mdset:     sta  p8b_bstr.p8s_substr_temp.p8v_start
     asmsub op_sdim() {                    ; DIM A$(...): allocate a BASIC string array
         ; shtmp = slot(lo)/ndims(hi) parked across dim_setup + sarr_alloc; shtmp2 = element total.
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             sta  p8b_vm.p8v_shtmp
             ldy  #2
             lda  (P8ZP_SCRATCH_W1),y            ; ndims
             sta  p8b_vm.p8v_shtmp+1
             lda  #3
-            jsr  p8b_vm.p8s_pcadd               ; pc += 3
+            jsr  p8b_vm.p8s_pcadd               ; ip += 3
             lda  p8b_vm.p8v_sarr_dims           ; dim_setup(sarr_dims, slot, nd, SARR_MAXELEM)
             sta  p8b_vm.p8s_dim_setup.p8v_dims_ptr
             lda  p8b_vm.p8v_sarr_dims+1
@@ -2255,14 +2143,14 @@ _sdfail:    ldy  p8b_vm.p8v_shtmp               ; sarr_len[slot] = 0 -> unusable
     asmsub op_saload() {                  ; A$(i[,j..]): push the element's descriptor ("" if out of range)
         ; shtmp = slot(lo)/nd(hi); shtmp2 = element offset ($ffff if any subscript out of range).
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             sta  p8b_vm.p8v_shtmp
             ldy  #2
             lda  (P8ZP_SCRATCH_W1),y            ; nd
             sta  p8b_vm.p8v_shtmp+1
             lda  #3
-            jsr  p8b_vm.p8s_pcadd               ; pc += 3
+            jsr  p8b_vm.p8s_pcadd               ; ip += 3
             lda  p8b_vm.p8v_sarr_dims           ; index_of(sarr_dims, slot, nd, sp-nd, sarr_len[slot])
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
             lda  p8b_vm.p8v_sarr_dims+1
@@ -2310,14 +2198,14 @@ _slempty:   jmp  p8b_vm.p8s_push_empty          ; out of range reads as ""
     asmsub op_sastore() {                 ; A$(i[,j..])=v$: store the element (dropped if out of range)
         ; ssval stays at sstack[ssp] (ssp fixed after the dec) so it's re-read for store/free.
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; slot
             sta  p8b_vm.p8v_shtmp
             ldy  #2
             lda  (P8ZP_SCRATCH_W1),y            ; nd
             sta  p8b_vm.p8v_shtmp+1
             lda  #3
-            jsr  p8b_vm.p8s_pcadd               ; pc += 3
+            jsr  p8b_vm.p8s_pcadd               ; ip += 3
             dec  p8b_vm.p8v_ssp                 ; ssval = sstack[ssp] (pushed after the subscripts)
             lda  p8b_vm.p8v_sarr_dims           ; index_of(sarr_dims, slot, nd, sp-nd, sarr_len[slot])
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
@@ -2382,11 +2270,11 @@ _ssdrop:    ldx  p8b_vm.p8v_ssp                 ; free_temp_if_top(ssval)
         ; sca=sstack[ssp], scb=sstack[ssp+1] after ssp-=2; ssp is then fixed, so both are re-read for the
         ; top-first frees. bcompare overwrites its own ad/bd params, hence the re-read rather than reuse.
         %asm {{
-            jsr  p8b_vm.p8s_opw                 ; W1 = pcbase+pc
+            jsr  p8b_vm.p8s_opw                 ; W1 = ip
             lda  (P8ZP_SCRATCH_W1)              ; scid
             pha
             lda  #1
-            jsr  p8b_vm.p8s_pcadd               ; pc++
+            jsr  p8b_vm.p8s_pcadd               ; ip++
             dec  p8b_vm.p8v_ssp
             dec  p8b_vm.p8v_ssp                 ; ssp -= 2
             ldx  p8b_vm.p8v_ssp
@@ -2640,13 +2528,13 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
     ; splice in the variable's current value as ASCII decimal, so a statement like `VPOKE 0,A,V` reaches
     ; the ROM as `VPOKE 0,4660,66`. Markers are only honoured OUTSIDE quoted strings.
     sub op_passthru() {
-        ubyte plen = @(pcbase + pc)
+        ubyte plen = @(ip)
         passbuf[0] = $3a                          ; ':' -- CHRGET pre-increments past it to the first token
         ubyte w = 1                               ; passbuf write index (byte-sized; bounded < 254 below)
         ubyte i = 0
         bool inq = false
         while i < plen and w < 254 {
-            ubyte ch = @(pcbase + pc + 1 + i)
+            ubyte ch = @(ip + 1 + i)
             i++
             if inq {
                 passbuf[w] = ch
@@ -2658,7 +2546,7 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
                 w++
                 inq = true
             } else if ch == $01 {
-                ubyte slot = @(pcbase + pc + 1 + i)   ; variable marker -> splice its value as ASCII decimal
+                ubyte slot = @(ip + 1 + i)   ; variable marker -> splice its value as ASCII decimal
                 i++
                 uword ds = floats.tostr(peekf(varsf + (slot as uword) * 5))
                 if @(ds) == ' '
@@ -2674,8 +2562,12 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
             }
         }
         passbuf[w] = 0                            ; end-of-line: gone3 runs exactly this one statement
-        pc += (plen as uword) + 1                 ; step past the length byte + the (marker-encoded) bytes
+        ip += (plen as uword) + 1                 ; step past the length byte + the (marker-encoded) bytes
         %asm {{
+            lda  p8b_vm.p8v_ip                     ; ip is in zp; gone3 (arbitrary ROM/ML) may clobber it,
+            sta  p8b_vm.p8v_ipsave                 ; so stash it in BSS across the ROM call and restore below
+            lda  p8b_vm.p8v_ip+1
+            sta  p8b_vm.p8v_ipsave+1
             lda  #<p8b_vm.p8v_passbuf
             sta  $ee                              ; TXTPTR lo
             lda  #>p8b_vm.p8v_passbuf
@@ -2694,6 +2586,10 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
             sta  $01                              ; restore ROM bank
             pla
             sta  $00                              ; restore RAM bank
+            lda  p8b_vm.p8v_ipsave                 ; restore ip (gone3 may have clobbered zero page)
+            sta  p8b_vm.p8v_ip
+            lda  p8b_vm.p8v_ipsave+1
+            sta  p8b_vm.p8v_ip+1
         }}
     }
 
@@ -2710,9 +2606,9 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
     ; last arg), and format them as ASCII decimal into  $CE subtok [ '(' arg0 ',' arg1 ... ')' ] $00.
     ; Shared by op_callx (numeric result) and op_callxs (string result).
     sub xbuild() {
-        ubyte xsub = @(pcbase + pc)
-        ubyte xn   = @(pcbase + pc + 1)
-        pc += 2
+        ubyte xsub = @(ip)
+        ubyte xn   = @(ip + 1)
+        ip += 2
         ubyte k = xn
         while k != 0 {
             k--
@@ -2756,6 +2652,10 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
         xbuild()
         xdest = &stack[sp]                                ; the result goes back where the args were
         %asm {{
+            lda  p8b_vm.p8v_ip                            ; save ip across frmevl (arbitrary ROM, clobbers zp)
+            sta  p8b_vm.p8v_ipsave
+            lda  p8b_vm.p8v_ip+1
+            sta  p8b_vm.p8v_ipsave+1
             lda  #<p8b_vm.p8v_xbuf
             sta  $ee                                      ; TXTPTR lo -> xbuf (frmevl parses from here)
             lda  #>p8b_vm.p8v_xbuf
@@ -2776,6 +2676,10 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
             sta  $01                                      ; restore ROM bank
             pla
             sta  $00                                      ; restore RAM bank
+            lda  p8b_vm.p8v_ipsave                        ; restore ip (frmevl may have clobbered zero page)
+            sta  p8b_vm.p8v_ip
+            lda  p8b_vm.p8v_ipsave+1
+            sta  p8b_vm.p8v_ip+1
         }}
         sp++                                              ; the result now occupies the cell at xdest
     }
@@ -2790,6 +2694,10 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
     sub op_callxs() {
         xbuild()
         %asm {{
+            lda  p8b_vm.p8v_ip                            ; save ip across frmevl (arbitrary ROM, clobbers zp)
+            sta  p8b_vm.p8v_ipsave
+            lda  p8b_vm.p8v_ip+1
+            sta  p8b_vm.p8v_ipsave+1
             lda  #<p8b_vm.p8v_xbuf
             sta  $ee                                      ; TXTPTR lo -> xbuf
             lda  #>p8b_vm.p8v_xbuf
@@ -2811,6 +2719,10 @@ _gcchar:    jsr  p8b_bstr.p8s_chr_temp          ; chr_temp(A=byte) -> A=lo, Y=hi
             sta  $01                                      ; restore ROM bank
             pla
             sta  $00                                      ; restore RAM bank
+            lda  p8b_vm.p8v_ipsave                        ; restore ip (frmevl may have clobbered zero page)
+            sta  p8b_vm.p8v_ip
+            lda  p8b_vm.p8v_ipsave+1
+            sta  p8b_vm.p8v_ip+1
         }}
         ubyte k = 0                                       ; copy the result body off-heap (into xbuf) before
         while k < xslen {                                 ; mem_to_temp's getspa can reuse the freed space

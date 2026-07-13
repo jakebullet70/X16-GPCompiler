@@ -28,6 +28,44 @@ Averaged over the identical-source (float) tests, compiling gives **~1.5×**. Wh
 use native integers, it jumps to **5.6×** over stock BASIC (and **4.1×** over the same program
 compiled with float variables).
 
+## VM dispatch tuning (O1 + O2)
+
+The **Compiled** jiffies in the table above are the VM *before* this tuning pass. Two runtime-only changes
+to the P-code interpreter (`src/runtime/vm.p8`) — no compiler or P-code-format change, the corpus compiles
+byte-for-byte the same P-code — cut the per-opcode dispatch cost:
+
+- **O1 — instruction pointer in zero page.** The old VM stored the program counter as an absolute base
+  `pcbase` plus a `pc` offset, and recomputed `pcbase+pc` with a ~24-cycle add sequence on *every* dispatch
+  fetch and again inside *every* operand-carrying handler. O1 replaces the pair with a single live zero-page pointer
+  `ip` (`lda (ip)` to fetch, `inc ip` to advance), deleting both recomputes. It also *shrank* the runtime
+  (the PCODE_BASE headroom went from ~34 to ~320 bytes).
+- **O2 — JSR-dispatch + no bounds check.** The dispatch loop replaced the 4-instruction RTS-cookie push
+  with a `jsr _disp` / `jmp (_optab,x)` trampoline — every handler keeps a uniform plain `rts`, so both the
+  hand-asm and the Prog8-`sub` handlers work unchanged — and dropped the per-opcode `cmp #95` opcode-range
+  check (the compiler only ever emits opcodes 0..94).
+
+Measured on the same emulated 60 Hz jiffy clock (lower is faster):
+
+| Benchmark        | Before (compiled) | After O1+O2 | Faster |
+|------------------|------------------:|------------:|-------:|
+| `01_forloop`     |        206 j      |    199 j    |  3.4%  |
+| `02_floatmath`   |        299 j      |    280 j    |  6.4%  |
+| `03_nested`      |        548 j      |    509 j    |  7.1%  |
+| `04_sieve`       |        305 j      |    276 j    |  9.5%  |
+| `05_string`      |        151 j      |    142 j    |  6.0%  |
+| `06_peek`        |        119 j      |    112 j    |  5.9%  |
+| `07_intmath`     |        491 j      |    456 j    |  7.1%  |
+| **`07_intmath.int`** |   **119 j**   |  **89 j**   | **25%** |
+
+Stock-float code (`02`–`07`) gains 6–10%: it is dominated by the ROM float library (`FADD`/`FMULT`/`MOVFM`),
+which the dispatch tuning does not touch, so the win is only the fetch/decode fraction. **Native-integer
+code is 25% faster** — with no ROM-float floor, per-opcode dispatch *is* the cost, so removing it shows
+through directly. The `07_intmath.int` showcase is now **7.5× over stock BASIC** (was 5.6×).
+
+A third planned stage (O3 — caching the float top-of-stack in FAC1 to skip `MOVFM`/`MOVMF` round-trips) was
+assessed and **skipped**: its ceiling is ~3–5% (Amdahl-bounded by the very same ROM float calls) at
+disproportionate correctness risk (FAC state must be spilled correctly across ~70 handlers).
+
 ## How to read this
 
 GPC is a **P-code (bytecode) compiler**, not a native-code compiler. It compiles each BASIC line

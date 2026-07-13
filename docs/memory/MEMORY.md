@@ -17,3 +17,4 @@
 - [GPC FOR STEP 0 semantics](gpc-for-step0-semantics.md) — NEXT ends iff sign(loopvar-limit)==sign(step); STEP 0 loops until EXACT equality (`FOR I=0 TO -1 STEP 0` idiom). Fixed op_fornext/op_ifornext.
 - [Blitz C64 benchmark yardstick](blitz-c64-benchmark-yardstick.md) — Blitz ~2.6x vs GPC ~1.5x; array-indexing (sieve 1.0x→3.1x) + VM dispatch are GPC's biggest gaps; VICE x64sc method recipe
 - [Memory is git-tracked](memory-is-git-tracked.md) — this memory folder is a junction into the repo (docs/memory); notes auto-version with the project
+- [x16emu -echo doubling](x16emu-echo-doubling.md) — non-warp `-echo raw` prints every VM char TWICE; breaks bench/run-bench.sh's R= grep (silent ERR); de-double by every-2nd-char
