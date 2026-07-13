@@ -66,6 +66,34 @@ A third planned stage (O3 — caching the float top-of-stack in FAC1 to skip `MO
 assessed and **skipped**: its ceiling is ~3–5% (Amdahl-bounded by the very same ROM float calls) at
 disproportionate correctness risk (FAC state must be spilled correctly across ~70 handlers).
 
+## Array-index fast path (1-D)
+
+The four numeric array handlers (`op_aload`/`op_astore`/`op_iaload`/`op_iastore`) previously routed *every*
+element access — even a plain `A(I)` — through the generic N-dimensional `index_of` subroutine: a 5-argument
+call that fetches the per-dimension size table, does a Horner-form row-major computation with a full 16-bit
+`multiply_words`, and bounds-checks each subscript. For the overwhelmingly common **1-D** case the compiler
+already knows there is exactly one subscript, so the runtime now takes an inline fast path: the element count
+`arr_len[slot]` *is* the dim-0 size, so the offset is simply the subscript, with one unsigned-16-bit bounds
+check and a jump straight into the existing address-compute+copy tail — no `index_of` call, no marshalling, no
+`peekw` of the dim table, no `off*sz` multiply. (Runtime-only; the P-code and compiler are unchanged.)
+
+Measured on a fitting integer array doing 30 000 in-range accesses (`08_arridx.int`: `A%(50)=I%` +
+`A%(50)+A%(25)` in a 10 000-iteration loop):
+
+| Benchmark        | Before (generic) | After (1-D fast path) | Faster |
+|------------------|-----------------:|----------------------:|-------:|
+| `08_arridx.int`  |       455 j      |        313 j          | **31%**|
+
+That is ~630 CPU cycles saved per element access. The `04_sieve` rows in the table above do **not** move,
+for a reason worth recording: `DIM F(2000)` needs 2001×5 = 10 005 bytes but GPC's float array heap
+(`ARRHEAP_SIZE`) is only 2 048 bytes, so `op_dim` marks the array unusable and every `F()` access is
+out-of-range — the "sieve" never actually sieves. (The int sieve is the same: `F%(2000)` = 4 002 B vs a
+1 024 B int heap.) The 1-D fast path short-circuits that unusable-array case as cheaply as the generic path
+did (via the `arr_len==0` test), so there is no regression — but there are no in-range accesses on the sieve
+for it to accelerate. **Closing the Blitz sieve gap is therefore an array-heap *capacity* problem, not an
+indexing-speed one** (see the C64 comparison below); the fast path is the indexing half, available for any
+program whose arrays fit today (≤ ~409 float / ≤ 512 int elements).
+
 ## How to read this
 
 GPC is a **P-code (bytecode) compiler**, not a native-code compiler. It compiles each BASIC line

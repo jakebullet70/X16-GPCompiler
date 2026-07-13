@@ -12,8 +12,10 @@ Ran the same 7 float benchmarks (`bench/c64/b1..b7.bas`, ports of `bench/01..07`
 
 **Why:** Blitz is threaded/native-style (resolves var/array addresses at compile time, emits near-metal code); GPC is a P-code VM (removes interpreter line-rescan but keeps a dispatch loop + still calls ROM for arithmetic/indexing).
 
-**The two rows that expose GPC's biggest opportunities:**
-1. **Array indexing** — sieve: GPC **1.0×** (array access all goes through ROM in both modes) vs Blitz **3.1×** (compiles inline element-address = base+index·elsize, skipping ROM var-search + subscript FRMEVL). This is the single highest-value GPC optimization and hits the exact workload GPC can't currently accelerate.
+**CORRECTION (2026-07: the sieve comparison was invalid).** GPC's array access does NOT go through ROM — it uses GPC's own `op_aload`/`index_of` heap handlers. The real reason `04_sieve` shows 1.0× is that **`DIM F(2000)` doesn't fit GPC's array heap** (`ARRHEAP_SIZE`=2048 B; needs 2001×5=10005 B), so `op_dim` marks it unusable (`arr_len=0`) and EVERY access is out-of-range — the sieve never sieves, it runs a degenerate all-`i` loop. Same for the int sieve (`F%(2000)`=4002 B vs 1024 B `IARRHEAP_SIZE`). So the Blitz "3.1× sieve" was C64 actually sieving (38 KB BASIC RAM) vs GPC failing to allocate. **The Blitz sieve gap is array-heap CAPACITY, not indexing speed.** See [[gpc-array-heap-capacity]]. A 1-D array-index fast path WAS added (branch `perf/vm-speed`; skips `index_of`'s call/marshal/`peekw`/multiply for single-subscript access, ~31% faster on fitting arrays — `08_arridx.int` 455→313 j), but it can't help the sieve until the array fits.
+
+**The original (now-qualified) claim:**
+1. **Array indexing** — sieve: GPC **1.0×** vs Blitz **3.1×**. The 1-D fast path is the indexing half (real 31% win where arrays fit); the sieve specifically needs the heap-capacity fix first (see correction above).
 2. **VM dispatch** — Blitz's blanket ~2.6× vs GPC ~1.5× is mostly per-opcode fetch/decode/branch cost. This is the already-selected (paused) "Optimize VM dispatch" task in `src/runtime/vm.p8 run()`; the C64 numbers quantify its ceiling.
 
 GPC still beats Blitz on integer-heavy code via native `%` types (5.6× on X16; Blitz has no integer path). Related: [[gpc-runtime-asm-conversion]], [[gpc-engine-shrink]], [[blitz-x16-prior-attempt]].

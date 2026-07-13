@@ -1471,7 +1471,37 @@ _ifnstop:   dec  p8b_vm.p8v_forsp                 ; loop finished; pop the frame
             sta  p8b_vm.p8v_ip
             bcc  +
             inc  p8b_vm.p8v_ip+1
-+           ; --- aloff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
++           ; O(1) 1-D fast path: skip index_of (its call, 5-param marshal, Horner multiply, dims
+            ; peekw) -- for nd==1 the element count arr_len[slot] IS the dim-0 size, so aloff = the
+            ; single subscript, bounds-checked against arr_len[slot]. Subscript stays a float on the
+            ; numeric stack (converted via stack_word exactly as index_of does), so semantics match.
+            lda  p8b_vm.p8s_index_of.p8v_nd
+            cmp  #1
+            bne  _algen
+            ldy  p8b_vm.p8s_index_of.p8v_slot   ; unusable/undimensioned array (len==0) -> OOB WITHOUT
+            lda  p8b_vm.p8v_arr_len_lsb,y       ; reading the subscript, matching index_of's `total==0`
+            ora  p8b_vm.p8v_arr_len_msb,y       ; short-circuit -- else stack_word makes this path SLOWER
+            bne  _alfits                        ; than generic on OOB-heavy code (e.g. array too big for heap)
+            dec  p8b_vm.p8v_sp
+            jmp  _alzero
+_alfits:    lda  p8b_vm.p8v_sp
+            sec
+            sbc  #1                             ; A = sp-1 (the sole subscript's stack index)
+            jsr  p8b_vm.p8s_stack_word          ; W1 = (stack[sp-1] as uword) = subscript
+            dec  p8b_vm.p8v_sp                  ; pop the subscript (_aldone re-pushes the element)
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  P8ZP_SCRATCH_W1+1              ; subscript >= arr_len[slot] (unsigned 16-bit) -> oob
+            cmp  p8b_vm.p8v_arr_len_msb,y
+            bcc  _alf_in
+            bne  _alf_oob
+            lda  P8ZP_SCRATCH_W1
+            cmp  p8b_vm.p8v_arr_len_lsb,y
+            bcc  _alf_in
+_alf_oob:   jmp  _alzero                        ; out of range: element reads 0.0
+_alf_in:    lda  P8ZP_SCRATCH_W1               ; A=lo, Y=hi of aloff -> shared address+copy tail
+            ldy  P8ZP_SCRATCH_W1+1
+            jmp  _alok
+_algen:     ; --- generic N-D: aloff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
             lda  p8b_vm.p8v_arr_dims            ; index_of reads (never writes) slot/nd, so the
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr   ; param slots double as our slot/nd storage after the call
             lda  p8b_vm.p8v_arr_dims+1
@@ -1551,7 +1581,39 @@ _aldone:    inc  p8b_vm.p8v_sp
             bcc  +
             inc  p8b_vm.p8v_ip+1
 +           dec  p8b_vm.p8v_sp                  ; sp-- : value now at stack[sp], subscripts below it
-            ; --- asoff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
+            ; O(1) 1-D fast path (see op_aload): nd==1 -> asoff = the single subscript at stack[sp-1],
+            ; bounds-checked against arr_len[slot]; the value stays at stack[sp] (= B1 = value slot).
+            lda  p8b_vm.p8s_index_of.p8v_nd
+            cmp  #1
+            bne  _asgen
+            ldy  p8b_vm.p8s_index_of.p8v_slot   ; unusable array (len==0) -> drop store WITHOUT reading
+            lda  p8b_vm.p8v_arr_len_lsb,y       ; the subscript (matches index_of's `total==0` short-circuit)
+            ora  p8b_vm.p8v_arr_len_msb,y
+            bne  _asfits
+            dec  p8b_vm.p8v_sp                  ; sp = final (value+subscript consumed); drop the store
+            rts
+_asfits:    lda  p8b_vm.p8v_sp
+            sec
+            sbc  #1                             ; A = sp-1 (subscript index)
+            jsr  p8b_vm.p8s_stack_word          ; W1 = (stack[sp-1] as uword) = subscript
+            lda  p8b_vm.p8v_sp                  ; sp unchanged by stack_word; still = value slot
+            sta  P8ZP_SCRATCH_B1               ; B1 = value slot (set AFTER stack_word)
+            sec
+            sbc  #1
+            sta  p8b_vm.p8v_sp                  ; sp = subscript slot (final: value+subscript consumed)
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  P8ZP_SCRATCH_W1+1              ; subscript >= arr_len[slot] (unsigned) -> drop store
+            cmp  p8b_vm.p8v_arr_len_msb,y
+            bcc  _asf_in
+            bne  _asf_drop
+            lda  P8ZP_SCRATCH_W1
+            cmp  p8b_vm.p8v_arr_len_lsb,y
+            bcc  _asf_in
+_asf_drop:  rts                                ; out of range: store dropped
+_asf_in:    lda  P8ZP_SCRATCH_W1               ; A=lo, Y=hi of asoff -> shared address+copy tail
+            ldy  P8ZP_SCRATCH_W1+1
+            jmp  _asok
+_asgen:     ; --- generic N-D: asoff = index_of(arr_dims, slot, nd, sp-nd, arr_len[slot]) ---
             lda  p8b_vm.p8v_arr_dims
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
             lda  p8b_vm.p8v_arr_dims+1
@@ -1634,7 +1696,35 @@ _asdone:    rts
             sta  p8b_vm.p8v_ip
             bcc  +
             inc  p8b_vm.p8v_ip+1
-+           lda  p8b_vm.p8v_iarr_dims           ; iloff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
++           ; O(1) 1-D fast path (see op_aload): nd==1 -> iloff = the single subscript at stack[sp-1]
+            ; (a float on the numeric stack, even for A%()), bounds-checked against iarr_len[slot].
+            lda  p8b_vm.p8s_index_of.p8v_nd
+            cmp  #1
+            bne  _ilgen
+            ldy  p8b_vm.p8s_index_of.p8v_slot   ; unusable array (len==0) -> OOB WITHOUT reading the
+            lda  p8b_vm.p8v_iarr_len_lsb,y      ; subscript (matches index_of's `total==0` short-circuit)
+            ora  p8b_vm.p8v_iarr_len_msb,y
+            bne  _ilfits
+            dec  p8b_vm.p8v_sp
+            jmp  _ilzero
+_ilfits:    lda  p8b_vm.p8v_sp
+            sec
+            sbc  #1
+            jsr  p8b_vm.p8s_stack_word          ; W1 = (stack[sp-1] as uword) = subscript
+            dec  p8b_vm.p8v_sp                  ; pop the subscript (_ildone re-pushes the element)
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  P8ZP_SCRATCH_W1+1              ; subscript >= iarr_len[slot] (unsigned) -> oob
+            cmp  p8b_vm.p8v_iarr_len_msb,y
+            bcc  _ilf_in
+            bne  _ilf_oob
+            lda  P8ZP_SCRATCH_W1
+            cmp  p8b_vm.p8v_iarr_len_lsb,y
+            bcc  _ilf_in
+_ilf_oob:   jmp  _ilzero                        ; out of range: element reads 0
+_ilf_in:    lda  P8ZP_SCRATCH_W1               ; A=lo, Y=hi of iloff -> shared address+read tail
+            ldy  P8ZP_SCRATCH_W1+1
+            jmp  _ilok
+_ilgen:     lda  p8b_vm.p8v_iarr_dims           ; iloff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
             lda  p8b_vm.p8v_iarr_dims+1
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1
@@ -1709,7 +1799,39 @@ _ildone:    inc  p8b_vm.p8v_sp
             bcc  +
             inc  p8b_vm.p8v_ip+1
 +           dec  p8b_vm.p8v_sp                  ; sp-- : value at istack[sp], subscripts below it
-            lda  p8b_vm.p8v_iarr_dims           ; isoff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
+            ; O(1) 1-D fast path (see op_aload): nd==1 -> isoff = the single subscript at stack[sp-1]
+            ; (a float on the numeric stack); the value stays at istack[sp] (= B1 = value slot).
+            lda  p8b_vm.p8s_index_of.p8v_nd
+            cmp  #1
+            bne  _isgen
+            ldy  p8b_vm.p8s_index_of.p8v_slot   ; unusable array (len==0) -> drop store WITHOUT reading
+            lda  p8b_vm.p8v_iarr_len_lsb,y      ; the subscript (matches index_of's `total==0` short-circuit)
+            ora  p8b_vm.p8v_iarr_len_msb,y
+            bne  _isfits
+            dec  p8b_vm.p8v_sp                  ; sp = final (value+subscript consumed); drop the store
+            rts
+_isfits:    lda  p8b_vm.p8v_sp
+            sec
+            sbc  #1
+            jsr  p8b_vm.p8s_stack_word          ; W1 = (stack[sp-1] as uword) = subscript
+            lda  p8b_vm.p8v_sp                  ; sp unchanged by stack_word; still = value slot
+            sta  P8ZP_SCRATCH_B1               ; B1 = value slot (set AFTER stack_word)
+            sec
+            sbc  #1
+            sta  p8b_vm.p8v_sp                  ; sp = subscript slot (final)
+            ldy  p8b_vm.p8s_index_of.p8v_slot
+            lda  P8ZP_SCRATCH_W1+1              ; subscript >= iarr_len[slot] (unsigned) -> drop store
+            cmp  p8b_vm.p8v_iarr_len_msb,y
+            bcc  _isf_in
+            bne  _isf_drop
+            lda  P8ZP_SCRATCH_W1
+            cmp  p8b_vm.p8v_iarr_len_lsb,y
+            bcc  _isf_in
+_isf_drop:  rts                                ; out of range: store dropped
+_isf_in:    lda  P8ZP_SCRATCH_W1               ; A=lo, Y=hi of isoff -> shared address+write tail
+            ldy  P8ZP_SCRATCH_W1+1
+            jmp  _isok
+_isgen:     lda  p8b_vm.p8v_iarr_dims           ; isoff = index_of(iarr_dims, slot, nd, sp-nd, iarr_len[slot])
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr
             lda  p8b_vm.p8v_iarr_dims+1
             sta  p8b_vm.p8s_index_of.p8v_dims_ptr+1

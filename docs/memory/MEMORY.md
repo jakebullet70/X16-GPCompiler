@@ -15,6 +15,8 @@
 - [GPC X16 BASIC coverage](gpc-x16-basic-coverage.md) — what GPC compiles vs real X16 BASIC; 7 lexer blockers + MOD/TAB/SPC/plain-GET FIXED; **X16FONTS (492-line proof case) now compiles end-to-end** via banked-pool relocation (litpool+datapool → POOLS_BANK 12, vm.p8 untouched); only niche fns left (FRE/POS/USR/POINTER/STRPTR/pi)
 - [GPC IF semantics](gpc-if-semantics.md) — false IF skips the whole LINE (CBM V2); verified against ref/x16-rom ROM source
 - [GPC FOR STEP 0 semantics](gpc-for-step0-semantics.md) — NEXT ends iff sign(loopvar-limit)==sign(step); STEP 0 loops until EXACT equality (`FOR I=0 TO -1 STEP 0` idiom). Fixed op_fornext/op_ifornext.
-- [Blitz C64 benchmark yardstick](blitz-c64-benchmark-yardstick.md) — Blitz ~2.6x vs GPC ~1.5x; array-indexing (sieve 1.0x→3.1x) + VM dispatch are GPC's biggest gaps; VICE x64sc method recipe
+- [Blitz C64 benchmark yardstick](blitz-c64-benchmark-yardstick.md) — Blitz ~2.6x vs GPC ~1.5x; VM dispatch gap real, but the "sieve 1.0x" was DEGENERATE (array too big for heap), not slow indexing — see corrections
+- [GPC array-heap capacity](gpc-array-heap-capacity.md) — array heaps are tiny (2048 B float / 1024 B int); DIM > ~409 float / 512 int elems silently becomes unusable (all OOB→0). THIS is the Blitz-sieve blocker, not indexing
+- [GPC array-index fast path](gpc-array-index-fastpath.md) — perf/vm-speed: 1-D access skips generic index_of; ~31% faster on fitting arrays; total==0 short-circuit avoids an OOB regression
 - [Memory is git-tracked](memory-is-git-tracked.md) — this memory folder is a junction into the repo (docs/memory); notes auto-version with the project
 - [x16emu -echo doubling](x16emu-echo-doubling.md) — non-warp `-echo raw` prints every VM char TWICE; breaks bench/run-bench.sh's R= grep (silent ERR); de-double by every-2nd-char
